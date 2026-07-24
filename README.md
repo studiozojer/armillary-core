@@ -11,7 +11,7 @@
 Ratified 2026-07-24; the whole standard speaks these four nouns:
 
 - **operator** — a composed identity: its files, graph, and protocols. Lives at `operators/<name>/` in a workspace. Model-agnostic.
-- **model** — the engine piloting an operator in a given session. Recorded as provenance per turn; never part of identity.
+- **model** — what pilots an operator in a given session. Recorded as provenance per turn; never part of identity. Distinct from an **engine**: an engine is a harness implementing this standard, a model is the weights it calls.
 - **instance** — an operator (or the bare dispatcher) instantiated in a live session window: the *running* thing.
 - **log** — an instance's durable, typed, append-only record. All views — the context window, a client transcript, a summary — are **projections** of it.
 
