@@ -1,0 +1,7 @@
+[[models]]
+name = "tycho"
+path = "models/tycho"
+
+[[agents]]
+name = "kepler"
+path = "models/kepler"

@@ -1,0 +1,30 @@
+[router]
+contains = ["CLAUDE.md"]
+
+[[operators]]
+name = "tycho"
+path = "operators/tycho"
+
+[[operators]]
+name = "kepler"
+path = "operators/kepler"
+
+[[commons]]
+name = "zojercommons"
+path = "zojercommons"
+
+# [[protocols]]
+# name = "board"
+# source = "commons/practices/board/practice.md"
+# load = "boot"
+
+[[protocols]]
+name = "board"
+source = "zojercommons/practices/board/practice.md"
+load = "boot"
+
+[[protocols]]
+name = "athanor"
+source = "zojercommons/athanor/briefing.md"
+load = "on-demand"
+when = "resume athanor work"

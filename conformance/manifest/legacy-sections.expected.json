@@ -1,0 +1,9 @@
+{
+  "operators": [
+    { "name": "tycho", "path": "models/tycho" },
+    { "name": "kepler", "path": "models/kepler" }
+  ],
+  "commons": [],
+  "repos": [],
+  "protocols": []
+}

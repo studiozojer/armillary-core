@@ -1,0 +1,103 @@
+# instances — the instance/log model
+
+**The log is the truth; everything else is a projection over it.** An instance's
+window, a client's transcript, a summary, "the session" itself — each is a view
+computed from a typed, append-only event log, never a container that owns state.
+This sentence is the standard's first ratified decision (2026-07-23) and every rule
+below serves it.
+
+RFC-2119 keywords. Rules are numbered for citation; each carries a short rationale
+or provenance pointer. Reasoning lives in `zojercommons/projects/harness/research/`.
+
+## 1 · The log
+
+- **I-1** Every instance writes to exactly one durable, append-only, typed event
+  **log** (its *stream*). Events are never edited or deleted; correction is a new
+  event. *(All five surveyed harnesses converged here independently.)*
+- **I-2** Every event MUST carry, explicitly: `stream` (its stream identifier —
+  even though storage location may imply it), `id` (an identity that is NOT its
+  position in a file), `seq` (monotonic **within its stream** — the scope is named
+  so a future continuous log is a re-scoping, not a rewrite), `ts`, `actor`
+  (structured `{role, instance}`, not a free string), `type`, `version` (schema),
+  and `data`. Events SHOULD carry a size/cost field. *(The four door-keeping
+  invariants, ratified 2026-07-23; ycc's missing `session_id` is the cautionary
+  specimen.)*
+- **I-3** `thread` is a first-class event field and MAY span streams. Threads are
+  concurrent, not alternatives: a thread-view is a projection of the log, and
+  re-entering a thread never makes other threads counterfactual. *(field-not-queue;
+  the athanor is the same object at a longer timescale.)*
+- **I-4** Events are **durable** or **transient**. A fact is durable and
+  cursor-advancing; a hint is transient, never persisted, and MUST NOT advance any
+  resume cursor. Transient payloads MUST be snapshots, not increments, so lossy
+  delivery is safe. Nothing load-bearing is ever destroyed — only de-referenced.
+  *(One rule serving three surveyed problems: session record, resume cursor,
+  eviction.)*
+- **I-5** A failed log write MUST surface as an error to the writer. In-memory and
+  on-disk state MUST NOT silently diverge. *(ycc `Log.Record` appends in memory on
+  disk failure — fatal once the window projects over the log.)*
+
+## 2 · Projections
+
+- **P-1** The model-visible context window is a projection of the log (in the
+  reference shape: an ordered pointer list into stored events). Editing the
+  projection MUST NOT destroy log content; **evicted is not deleted**.
+- **P-2** Every message the system injects into the model's context MUST be
+  recorded as an event *first*. No synthesized-from-nothing context. *(ycc's
+  unrecorded truncation nudge is the counterexample; it cost them synthesis
+  machinery and replay fidelity.)*
+- **P-3** Any reducer/fold that derives state from the log MUST be **total** over
+  durable event types — every durable type has a case — and live state MUST read
+  from the reducer path, not run beside it. Conformance includes a totality check.
+  *(ycc's reducer silently missing three event types it emits: sessions reopening
+  in the wrong mode. Derivation-as-linter, made law.)*
+- **P-4** Rich event typing MUST survive as far toward the model boundary as the
+  provider channel allows, and the flattening layer (typed events → provider
+  messages) MUST be a separate, pure stage from projection. *(The typed→flat
+  collapse is where ycc spends ~60% of its replay code; keep type until
+  materialization.)*
+
+## 3 · Attach, resume, lifecycle
+
+- **A-1** The attach primitive is `subscribe(stream, from_seq)`: replay durable
+  events past the cursor, then tail live. Every client — TUI, app, web — uses the
+  same primitive. A live-only stream MUST NOT be the resumable source of truth.
+  *(opencode #25657: events emitted during a disconnect gap, lost forever.)*
+- **A-2** Subscribers are bounded; a slow client blocks or drops only itself,
+  never the writer.
+- **A-3** Resume re-instantiates from the log: durable events since the current
+  compaction/epoch baseline, plus references. An instance-stopped marker is
+  informational and MUST NOT bar resume; reaping an idle instance is not stopping
+  it. *(ycc's reap ≠ stop discipline, adopted.)*
+- **A-4** One writer per stream (v0 law). Multi-writer requires an explicit claim
+  protocol — deferred, not improvised. Parallelism lives across worktrees/streams.
+- **A-5** A server MUST refuse to serve a non-loopback interface without
+  authentication. Failing open is not a mode.
+
+## 4 · Sovereign events
+
+- **S-1** The standard defines event types whose **type confers authority the
+  piloting model cannot overwrite** — beginning with the **machine-verdict**: an
+  exit code, test result, or other machine-produced outcome, recorded as its own
+  typed event and rendered to the model as typed context, never as free text the
+  model may summarize into its own claim of success. *(Claims 1+2 fused — the
+  survey's sharpest unbuilt ground. The agent must not talk over an exit code.)*
+- **S-2** Loop-control rules MAY key on a machine-verdict's **result status** —
+  not merely on whether a tool was invoked. *(letta gates on invocation only;
+  extending to status is the build path the survey named.)*
+- **S-3** Enforceable beats advisory: a protocol that must bind a weak pilot is
+  reified as a gate or loop-control that **fails closed**, with the model's only
+  channel being the result handed back. Prose in the prompt is advisory by
+  definition and MUST NOT be the sole mechanism for anything load-bearing.
+  Threshold-fired protocols (consolidation, horizon folds, an occupant's declared
+  molt-clock) run **around** the model; the piloting model does not get to argue
+  them down in the moment. *(The single generalizable law of the Layer B survey —
+  and MAST measures the prompt-only ceiling.)*
+
+## 5 · Explicitly deferred
+
+Named so their absence reads as a choice: transport binding (Connect-RPC vs
+SSE-split — parked pending a second technical reader); multi-writer claim/move;
+branching (`parent` is a reserved seam, not a feature); context paging and
+compaction rules (stage 2 — the compaction research is banked in the harness
+project); cross-stream materialized indexes (adopt the ontology, never
+recompute-everything-by-globbing).

@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://armillary.dev/schema/event.schema.json",
+  "title": "armillary durable event envelope (v0.1)",
+  "description": "The envelope every durable event MUST carry (constitution/instances.md I-2/I-3). Transient events reuse the shape with seq=0 and are never persisted. `data` is typed per event `type`; per-type payload schemas are a later version.",
+  "type": "object",
+  "required": ["stream", "id", "seq", "ts", "actor", "type", "version", "data"],
+  "properties": {
+    "stream": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stream identifier, explicit on every event even when storage implies it (invariant i)."
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Event identity — MUST NOT be position-in-file (invariant ii)."
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotonic within its stream (invariant iii — scope is the stream, not 'the session'). 0 = transient, never advances a cursor."
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Wall-clock timestamp, RFC 3339."
+    },
+    "actor": {
+      "type": "object",
+      "required": ["role"],
+      "properties": {
+        "role": {
+          "type": "string",
+          "enum": ["user", "operator", "system", "tool", "machine"]
+        },
+        "instance": { "type": "string" }
+      },
+      "description": "Structured {role, instance} — never a free-form string."
+    },
+    "type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Event type. Sovereign types (e.g. machine_verdict) confer authority the model cannot overwrite (instances.md S-1)."
+    },
+    "thread": {
+      "type": "string",
+      "description": "First-class, optional, MAY span streams (invariant iv). Threads are concurrent, not alternatives."
+    },
+    "parent": {
+      "type": "string",
+      "description": "Reserved fork seam. Not a feature in v0.1."
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Envelope schema version."
+    },
+    "cost": {
+      "type": "object",
+      "properties": {
+        "bytes": { "type": "integer", "minimum": 0 },
+        "tokens": { "type": "integer", "minimum": 0 }
+      },
+      "description": "SHOULD carry size/cost so budgets and eviction can be computed without re-reading payloads."
+    },
+    "data": {
+      "description": "Payload, typed per event type."
+    }
+  }
+}

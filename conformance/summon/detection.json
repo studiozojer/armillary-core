@@ -1,0 +1,11 @@
+{
+  "operators": ["tycho", "leavitt", "kepler", "dodona"],
+  "cases": [
+    { "message": "@tycho check xyz", "expected": ["tycho"] },
+    { "message": "hello there", "expected": [] },
+    { "message": "@bogus do a thing", "expected": [] },
+    { "message": "@Tycho and @kepler", "expected": ["tycho", "kepler"] },
+    { "message": "@tycho @tycho", "expected": ["tycho"] },
+    { "message": "mail me at a@tychonic.io", "expected": [] }
+  ]
+}
