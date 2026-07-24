@@ -1,0 +1,10 @@
+# editor / OS state — never part of the standard or its implementation
+.obsidian/
+.DS_Store
+**/.DS_Store
+.idea/
+.vscode/
+
+# Rust
+target/
+**/*.rs.bk
