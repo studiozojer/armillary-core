@@ -6,7 +6,11 @@ Runnable fixtures. An implementation **proves** it runs the armillary by produci
 
 ## Suites
 
-- **`manifest/`** — manifest parsing (constitution/composition.md C-1..C-4). Input: TOML manifest text. Operation: parse to a composition. Output shape: `{operators: [{name, path}], commons: [...], repos: [...], protocols: [{name, source, load, when?}]}`. Covers: active vs commented entries, legacy `[[models]]`/`[[agents]]` normalization, `when` propagation.
+- **`manifest/`** — manifest parsing (constitution/composition.md C-1..C-4). Input: TOML manifest text. Operation: parse to a composition. Output shape: `{operators: [{name, path}], commons: [...], repos: [...], protocols: [{name, source, load, when?}]}`. Covers: active vs commented entries, legacy `[[models]]`/`[[agents]]` normalization, `when` propagation, and overlay merge (C-6).
+
+  **Two-file fixtures.** A fixture named `<stem>.toml` MAY be accompanied by `<stem>.local.toml`, in which case the operation is *parse both and merge* (C-6) rather than parse one. A runner discovers the overlay by stem; `*.local.toml` is never itself a base fixture.
+
+  **Error fixtures.** A fixture carrying `<stem>.expected-error.json` instead of `<stem>.expected.json` MUST fail, and the emitted error must deep-equal that file. Shape: `{error, section?, name?}`, where `error` is a stable machine-readable code (`name_collision`, `parse_error`, `io_error`). Prose messages are for humans and may change freely; only the code and identifying fields are part of the contract.
 - **`summon/`** — summon detection (constitution/composition.md B-1/B-3). Input: `{message, operators}`. Operation: detect summons. Output: ordered, deduped, canonical-cased operator names. Covers: word boundaries, unknown names, case folding, dedup.
 
 ## Status

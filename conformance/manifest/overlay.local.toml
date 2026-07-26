@@ -1,0 +1,7 @@
+[[operators]]
+name = "kepler"
+path = "operators/kepler"
+
+[[repos]]
+name = "jianyi"
+path = "repos/jianyi"

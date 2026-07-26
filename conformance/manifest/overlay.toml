@@ -1,0 +1,8 @@
+[[operators]]
+name = "tycho"
+path = "operators/tycho"
+
+[[protocols]]
+name = "board"
+source = "commons/practices/board/practice.md"
+load = "boot"

@@ -1,0 +1,15 @@
+{
+  "operators": [
+    { "name": "tycho", "path": "operators/tycho" },
+    { "name": "kepler", "path": "operators/kepler" }
+  ],
+  "commons": [],
+  "repos": [{ "name": "jianyi", "path": "repos/jianyi" }],
+  "protocols": [
+    {
+      "name": "board",
+      "source": "commons/practices/board/practice.md",
+      "load": "boot"
+    }
+  ]
+}

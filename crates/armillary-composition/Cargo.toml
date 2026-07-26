@@ -1,0 +1,15 @@
+[package]
+name = "armillary-composition"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Parses an armillary workspace manifest. The conformance target for constitution/composition.md."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
