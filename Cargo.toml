@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/armillary-composition"]
+members = ["crates/armillary-composition", "crates/armillary-engine"]
 
 [workspace.package]
 edition = "2021"
