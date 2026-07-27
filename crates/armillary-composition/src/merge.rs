@@ -1,7 +1,7 @@
 use crate::{Composition, CompositionError, Module, Protocol};
 use std::collections::HashSet;
 
-trait Named {
+pub(crate) trait Named {
     fn name(&self) -> &str;
 }
 
@@ -15,6 +15,33 @@ impl Named for Protocol {
     fn name(&self) -> &str {
         &self.name
     }
+}
+
+/// C-6 applies *within* a manifest too, not only across the pair.
+///
+/// The original implementation seeded `seen` from base without checking base
+/// against itself, so two `[[operators]] name='tycho'` in one file merged to two
+/// operators in silence while the identical mistake across two files was fatal.
+///
+/// The C-2 migration path generates exactly this by construction: `[[models]]`
+/// and `[[operators]]` both declaring tycho concatenate unchecked, which is the
+/// precise mid-rename state C-2 exists to support — and the compat symlink makes
+/// both paths the same directory, so the dispatcher would boot one operator
+/// twice with no diagnostic.
+pub(crate) fn check_unique<T: Named>(
+    section: &'static str,
+    entries: &[T],
+) -> Result<(), CompositionError> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for entry in entries {
+        if !seen.insert(entry.name()) {
+            return Err(CompositionError::DuplicateName {
+                section,
+                name: entry.name().to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn union<T: Named>(
@@ -42,6 +69,16 @@ fn union<T: Named>(
 /// An ambiguous composition is not a composition: a boot that quietly picks one
 /// of two candidates is a boot that cannot be trusted about what it loaded.
 pub fn merge(base: Composition, overlay: Composition) -> Result<Composition, CompositionError> {
+    // Each side must be internally consistent before they can be combined —
+    // otherwise "declared in both manifests" would be the message for a fault
+    // that lives entirely in one.
+    for side in [&base, &overlay] {
+        check_unique("operators", &side.operators)?;
+        check_unique("commons", &side.commons)?;
+        check_unique("repos", &side.repos)?;
+        check_unique("protocols", &side.protocols)?;
+    }
+
     Ok(Composition {
         operators: union("operators", base.operators, overlay.operators)?,
         commons: union("commons", base.commons, overlay.commons)?,

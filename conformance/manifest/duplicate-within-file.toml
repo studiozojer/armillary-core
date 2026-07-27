@@ -1,0 +1,7 @@
+[[operators]]
+name = "tycho"
+path = "operators/tycho"
+
+[[models]]
+name = "tycho"
+path = "models/tycho"

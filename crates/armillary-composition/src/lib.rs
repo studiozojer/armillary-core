@@ -34,6 +34,15 @@ pub enum CompositionError {
         section: &'static str,
         name: String,
     },
+    /// The same name twice inside ONE manifest. Distinct from `NameCollision`
+    /// because the prose differs and so does the fix — and because the C-2
+    /// legacy path (`[[models]]` plus `[[operators]]`) produces this shape
+    /// without the author writing anything twice.
+    #[error("duplicate name in [[{section}]]: '{name}' is declared twice in the same manifest")]
+    DuplicateName {
+        section: &'static str,
+        name: String,
+    },
 }
 
 /// The machine-readable shape a conformance runner compares against a
@@ -54,6 +63,11 @@ impl CompositionError {
         match self {
             CompositionError::NameCollision { section, name } => ConformanceError {
                 error: "name_collision",
+                section: Some(section),
+                name: Some(name.clone()),
+            },
+            CompositionError::DuplicateName { section, name } => ConformanceError {
+                error: "duplicate_name",
                 section: Some(section),
                 name: Some(name.clone()),
             },
@@ -82,7 +96,19 @@ pub fn parse_manifest_str(text: &str) -> Result<Composition, CompositionError> {
         path: PathBuf::from("<str>"),
         source,
     })?;
-    Ok(raw.into())
+    let composition: Composition = raw.into();
+    check_internally_unique(&composition)?;
+    Ok(composition)
+}
+
+/// C-6 within a single manifest. Runs at every entry point, so a duplicate is
+/// caught whether the manifest arrives as text, as a file, or as an overlay.
+fn check_internally_unique(c: &Composition) -> Result<(), CompositionError> {
+    merge::check_unique("operators", &c.operators)?;
+    merge::check_unique("commons", &c.commons)?;
+    merge::check_unique("repos", &c.repos)?;
+    merge::check_unique("protocols", &c.protocols)?;
+    Ok(())
 }
 
 /// Read a workspace's manifests and produce its composition.
@@ -111,7 +137,9 @@ fn read_optional_manifest(path: &Path) -> Result<Composition, CompositionError> 
         path: path.to_path_buf(),
         source,
     })?;
-    Ok(raw.into())
+    let composition: Composition = raw.into();
+    check_internally_unique(&composition)?;
+    Ok(composition)
 }
 
 #[cfg(test)]
@@ -154,6 +182,39 @@ mod tests {
         )
         .expect("an unknown protocol field must not be an error");
         assert_eq!(c.protocols[0].extra.get("kind").unwrap().as_str(), Some("lens"));
+    }
+
+    #[test]
+    fn duplicate_within_one_manifest_is_an_error() {
+        // C-6 was half-implemented: the cross-file case was fatal while the
+        // identical mistake inside one file passed in silence.
+        let err = parse_manifest_str(
+            "[[operators]]\nname='tycho'\npath='a'\n\n[[operators]]\nname='tycho'\npath='b'\n",
+        )
+        .expect_err("two declarations of one name in one manifest is ambiguous");
+        assert_eq!(err.as_conformance_error().error, "duplicate_name");
+    }
+
+    #[test]
+    fn the_legacy_migration_path_cannot_boot_an_operator_twice() {
+        // The sharp case: nobody writes a name twice. They add [[operators]]
+        // during the rename and forget to delete [[models]] — the exact
+        // mid-migration state C-2 exists to support — and the compat symlink
+        // makes both paths the same directory.
+        let err = parse_manifest_str(
+            "[[operators]]\nname='tycho'\npath='operators/tycho'\n\n             [[models]]\nname='tycho'\npath='models/tycho'\n",
+        )
+        .expect_err("legacy plus canonical declaring one operator is ambiguous");
+        assert_eq!(err.as_conformance_error().error, "duplicate_name");
+    }
+
+    #[test]
+    fn distinct_names_across_legacy_sections_still_merge() {
+        let c = parse_manifest_str(
+            "[[operators]]\nname='tycho'\npath='operators/tycho'\n\n             [[models]]\nname='kepler'\npath='models/kepler'\n",
+        )
+        .expect("different names are not a duplicate");
+        assert_eq!(c.operators.len(), 2);
     }
 
     #[test]

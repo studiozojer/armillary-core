@@ -1,4 +1,4 @@
-use crate::{blocking, hash::sha256_hex, state::SharedState};
+use crate::{blocking, guard, hash::sha256_hex, state::SharedState};
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
 use serde_json::json;
@@ -61,19 +61,33 @@ fn build(root: &std::path::Path) -> Result<serde_json::Value, (StatusCode, Strin
     let protocol_sources: Vec<ProtocolSource> = composition
         .protocols
         .iter()
-        .map(|p| match std::fs::read(root.join(&p.source)) {
-            Ok(bytes) => ProtocolSource {
-                name: p.name.clone(),
-                path: p.source.clone(),
-                present: true,
-                sha256: Some(sha256_hex(&bytes)),
-            },
-            Err(_) => ProtocolSource {
-                name: p.name.clone(),
-                path: p.source.clone(),
-                present: false,
-                sha256: None,
-            },
+        .map(|p| {
+            // Through the guard, not `root.join`. A manifest carrying an
+            // absolute `source` would otherwise be read verbatim, because
+            // `Path::join` with an absolute argument DISCARDS the root — the
+            // exact footgun guard.rs names as its first defense. Not reachable
+            // by a stranger today (the manifest is owner-authored), but this is
+            // the route that B-2/B-4 will grow into returning protocol BODIES,
+            // and an unguarded join gets copied forward.
+            //
+            // C-4 already blesses the reporting: a source that cannot be
+            // resolved is absent, not an error.
+            match guard::resolve(root, &p.source).and_then(|path| {
+                std::fs::read(&path).map_err(|_| guard::GuardError::NotFound)
+            }) {
+                Ok(bytes) => ProtocolSource {
+                    name: p.name.clone(),
+                    path: p.source.clone(),
+                    present: true,
+                    sha256: Some(sha256_hex(&bytes)),
+                },
+                Err(_) => ProtocolSource {
+                    name: p.name.clone(),
+                    path: p.source.clone(),
+                    present: false,
+                    sha256: None,
+                },
+            }
         })
         .collect();
 
