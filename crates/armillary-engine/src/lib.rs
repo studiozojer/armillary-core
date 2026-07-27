@@ -4,6 +4,7 @@
 //! plumbing, so this is the plumbing — born without the loop, and useful on its
 //! own as an Explorer while the loop does not exist. Organs accrete onto it.
 
+pub mod blocking;
 pub mod guard;
 pub mod hash;
 pub mod routes;
