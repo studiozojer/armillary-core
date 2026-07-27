@@ -23,11 +23,22 @@ struct Entry {
 pub struct TreeResponse {
     path: String,
     entries: Vec<Entry>,
+    /// How many entries the directory actually holds, before the cap.
+    total: usize,
+    /// True when `entries` is a prefix of `total`. The client has to be told —
+    /// a silently short list reads exactly like a complete one, which is the
+    /// same defect as a fixture glob that matches nothing and reports success.
+    truncated: bool,
 }
+
+/// A directory listing is a thing a phone renders. Unbounded, one response can
+/// carry every entry of a build-index store — 1,147 in this workspace's largest
+/// — and the cost lands on the client rather than here.
+const MAX_ENTRIES: usize = 500;
 
 /// All filesystem work for one listing, synchronous and self-contained so it can
 /// be handed to a thread that is allowed to block.
-fn list(root: &Path, path: &str) -> Result<Vec<Entry>, (StatusCode, String)> {
+fn list(root: &Path, path: &str) -> Result<(Vec<Entry>, usize), (StatusCode, String)> {
     let resolved = guard::resolve(root, path).map_err(|e| (e.status(), e.code().to_string()))?;
 
     let read = std::fs::read_dir(&resolved)
@@ -65,7 +76,11 @@ fn list(root: &Path, path: &str) -> Result<Vec<Entry>, (StatusCode, String)> {
             .then_with(|| a.name.cmp(&b.name))
     });
 
-    Ok(entries)
+    // Sorted before truncating, so the prefix is stable and meaningful rather
+    // than whatever the filesystem happened to return first.
+    let total = entries.len();
+    entries.truncate(MAX_ENTRIES);
+    Ok((entries, total))
 }
 
 pub async fn tree(
@@ -74,9 +89,11 @@ pub async fn tree(
 ) -> Result<Json<TreeResponse>, (StatusCode, String)> {
     let root = state.root.clone();
     let path = q.path.clone();
-    let entries = blocking::run(move || list(&root, &path)).await?;
+    let (entries, total) = blocking::run(move || list(&root, &path)).await?;
 
     Ok(Json(TreeResponse {
+        truncated: entries.len() < total,
+        total,
         path: q.path,
         entries,
     }))

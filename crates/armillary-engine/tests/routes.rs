@@ -105,6 +105,46 @@ async fn tree_lists_directories_first_and_hides_noise() {
 }
 
 #[tokio::test]
+async fn tree_caps_a_large_directory_and_says_so() {
+    // A silently short list reads exactly like a complete one. The client has
+    // to be told, or the phone shows 500 of 1,147 entries and looks correct.
+    let router = app_over(|root| {
+        std::fs::create_dir(root.join("many")).unwrap();
+        for i in 0..600 {
+            std::fs::write(root.join(format!("many/f{i:04}.md")), "x").unwrap();
+        }
+    });
+
+    let (status, json) = get_json(router, "/tree?path=many").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["entries"].as_array().unwrap().len(), 500);
+    assert_eq!(json["total"], 600);
+    assert_eq!(json["truncated"], true);
+}
+
+#[tokio::test]
+async fn tree_reports_a_small_directory_as_complete() {
+    let router = app_over(|root| {
+        std::fs::create_dir(root.join("few")).unwrap();
+        std::fs::write(root.join("few/a.md"), "x").unwrap();
+    });
+    let (_, json) = get_json(router, "/tree?path=few").await;
+    assert_eq!(json["total"], 1);
+    assert_eq!(json["truncated"], false);
+}
+
+#[tokio::test]
+async fn swift_build_directories_are_denied() {
+    // `.build` — with the dot — is where this workspace's thousand-entry
+    // directories live. `build` alone missed every one of them.
+    let router = app_over(|root| {
+        std::fs::create_dir_all(root.join(".build/records")).unwrap();
+    });
+    let (status, _) = get_json(router, "/tree?path=.build").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn tree_refuses_traversal_with_403() {
     let (status, _) = get_json(app_over(|_| {}), "/tree?path=../..").await;
     assert_eq!(status, StatusCode::FORBIDDEN);

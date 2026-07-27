@@ -103,7 +103,22 @@ fn is_credential(name_lower: &str) -> bool {
 fn is_noise(name_lower: &str) -> bool {
     matches!(
         name_lower,
-        "node_modules" | "target" | "build" | "dist" | ".next" | ".expo" | "deriveddata" | ".venv"
+        "node_modules"
+            | "target"
+            | "build"
+            // Swift Package Manager's is `.build`, with the dot — and it is
+            // where this workspace's thousand-entry directories actually live
+            // (index-store records under daoUI, KairosCore, Mercurial). Listing
+            // `build` and not `.build` is the same failure as a credential
+            // denylist assembled by remembering names.
+            | ".build"
+            | "dist"
+            | ".next"
+            | ".expo"
+            | "deriveddata"
+            | ".venv"
+            | ".gradle"
+            | "pods"
     )
 }
 
