@@ -27,14 +27,23 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    // D7: the tailnet edge is the privacy boundary, and binding is what makes
-    // that true rather than assumed. Refusing here turns the decision into a
-    // property of the program instead of something each deploy must remember.
+    // constitution/instances.md A-5: a server must refuse to serve without
+    // authentication on any interface that is not loopback or a device-
+    // authenticating overlay — and where the overlay exception is claimed, it
+    // must bind ONE specific overlay address rather than a wildcard, so the
+    // exception lives in the bind where it is checkable rather than in a
+    // comment. This refusal is that clause.
+    //
+    // (An earlier version of this comment cited "D7", a decision-sheet number
+    // from the sprint-1 design doc, as though it were normative. It resolved
+    // nowhere in this repo, and A-5 — which does exist — was being violated
+    // while the phantom rule was cited as justification.)
     if args.bind.is_unspecified() {
         return Err(format!(
-            "refusing to bind {} — the engine serves unauthenticated reads of the whole \
-             workspace, so it must bind loopback or a specific tailnet address (D7). \
-             Find yours with: tailscale ip -4",
+            "refusing to bind {} — this serves unauthenticated reads of the whole \
+             workspace, and constitution/instances.md A-5 permits that only on loopback \
+             or on ONE specific address of a device-authenticating overlay, never a \
+             wildcard. Find yours with: tailscale ip -4",
             args.bind
         )
         .into());

@@ -23,7 +23,10 @@ struct ProtocolSource {
 /// once read commented-out examples as a live composition — a TOML parser makes
 /// that structurally impossible, since comments are not data.
 ///
-/// D10 rides along: every manifest read and every protocol body resolved is
+/// Content hashes ride along — a sprint-1 design decision (D10 in
+/// `zojercommons/projects/harness/specs/2026-07-24-sprint-1-explorer-spine-design.md`,
+/// which is a decision sheet, NOT a rule of this standard). Every manifest read
+/// and every protocol body resolved is
 /// hashed. Nothing consumes the hashes yet. They cost one sha256 over a file
 /// already in memory, and they mean that the day an event log exists, "which
 /// bytes were in that window" is answerable without retrofitting anything.

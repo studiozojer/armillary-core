@@ -60,7 +60,7 @@ async fn composition_is_byte_derived_and_hashed() {
     assert_eq!(json["operators"].as_array().unwrap().len(), 1);
     assert_eq!(json["operators"][0]["name"], "tycho");
 
-    // D10: the manifest it actually parsed is hashed.
+    // The manifest it actually parsed is hashed (sprint-1 design sheet D10).
     let manifests = json["manifests"].as_array().unwrap();
     assert_eq!(manifests.len(), 1);
     assert_eq!(manifests[0]["path"], "modules.toml");

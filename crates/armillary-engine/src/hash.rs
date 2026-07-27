@@ -1,6 +1,11 @@
 use sha2::{Digest, Sha256};
 
-/// D12: SHA-256, lowercase hex, unprefixed.
+/// SHA-256, lowercase hex, unprefixed.
+///
+/// A sprint-1 design decision (D12 in the design sheet at
+/// `zojercommons/projects/harness/specs/`), not a rule of the standard — the
+/// constitution says nothing about hash algorithms. Cited by origin so the
+/// reference resolves somewhere.
 ///
 /// Always over raw bytes. Hashing a decoded string would make the hash describe
 /// the decoder rather than the file — and the point of emitting it at all is
