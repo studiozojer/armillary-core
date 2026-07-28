@@ -440,3 +440,21 @@ async fn a_non_numeric_from_is_400_bad_from() {
     let body = client.read_body_text().await;
     assert_eq!(body, "bad_from");
 }
+
+#[tokio::test]
+async fn from_u64_max_falls_out_as_an_ordinary_empty_replay_not_a_panic() {
+    // `from + 1` overflows at this boundary; the handler must not let an
+    // adversarial cursor value panic the request task.
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let (addr, sessions) = spawn(&data_dir).await;
+    append(&sessions, "s1", "one");
+
+    let mut client =
+        SseClient::connect(addr, &format!("/streams/s1/events?from={}", u64::MAX)).await;
+    assert!(client.status_line.contains("200"), "{}", client.status_line);
+
+    let (event, data) = client.next_frame().await;
+    assert_eq!(event, "caught-up");
+    let json: serde_json::Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(json["headSeq"], 1);
+}

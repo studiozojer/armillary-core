@@ -112,7 +112,9 @@ pub async fn subscribe(
     // (2) the replay batch, via `blocking::run` (filesystem work).
     let sessions = state.sessions.clone();
     let replay_stream = stream.clone();
-    let replay_from = from + 1;
+    // `saturating_add`: an adversarial `from=18446744073709551615` (u64::MAX)
+    // must fall out as an ordinary empty replay, not panic the request task.
+    let replay_from = from.saturating_add(1);
     let (earliest_seq, head_seq, replay) = blocking::run(move || {
         replay_snapshot(sessions.store(), &replay_stream, replay_from)
             .map_err(SessionError::into_response)
