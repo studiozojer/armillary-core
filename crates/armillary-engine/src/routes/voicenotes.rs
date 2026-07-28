@@ -55,9 +55,16 @@ fn parse_frontmatter(text: &str) -> BTreeMap<String, String> {
     if lines.next().map(str::trim) != Some("---") {
         return out;
     }
+    // A block is only frontmatter if it closes. Without this, a file that
+    // opens with `---` (a markdown horizontal rule is exactly that spelling)
+    // but never closes it scans to EOF and absorbs body prose — so an
+    // ordinary hand-written document sharing the transcript directory, with
+    // a line shaped `Source: see below`, misreads as a transcript.
+    let mut closed = false;
     for line in lines {
         let trimmed = line.trim();
         if trimmed == "---" {
+            closed = true;
             break;
         }
         let Some((key, value)) = trimmed.split_once(':') else {
@@ -69,7 +76,20 @@ fn parse_frontmatter(text: &str) -> BTreeMap<String, String> {
         }
         out.insert(key.trim().to_string(), value.to_string());
     }
-    out
+    if closed {
+        out
+    } else {
+        BTreeMap::new()
+    }
+}
+
+/// A trailing (or leading) `/` on a manifest-declared directory is an
+/// authoring detail, not content. Left in, it doubles the separator every
+/// time the directory is joined with a filename (`local/inbox//done.m4a`),
+/// which matches nothing — done once here, at the point the value is read,
+/// so every later join and every response field sees the same clean string.
+fn trim_slashes(s: &str) -> String {
+    s.trim_matches('/').to_string()
 }
 
 /// The declared locations, read out of the manifest rather than hardcoded.
@@ -92,8 +112,8 @@ fn declared(root: &Path) -> Result<(String, Vec<String>), (StatusCode, String)> 
         .extra
         .get("audio")
         .and_then(|v| v.as_str())
-        .ok_or((StatusCode::NOT_FOUND, "not_composed".to_string()))?
-        .to_string();
+        .map(trim_slashes)
+        .ok_or((StatusCode::NOT_FOUND, "not_composed".to_string()))?;
 
     let transcripts = protocol
         .extra
@@ -102,7 +122,7 @@ fn declared(root: &Path) -> Result<(String, Vec<String>), (StatusCode, String)> 
         .map(|items| {
             items
                 .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
+                .filter_map(|v| v.as_str().map(trim_slashes))
                 .collect()
         })
         .unwrap_or_default();
@@ -110,11 +130,24 @@ fn declared(root: &Path) -> Result<(String, Vec<String>), (StatusCode, String)> 
     Ok((audio, transcripts))
 }
 
+/// Trimmed and lowercased, for comparison only — never stored and never
+/// returned. `guard.rs` already treats case-insensitivity as a property of
+/// the filesystem to be assumed rather than detected; a join performed off
+/// to the side of the guard does not get to disagree with that.
+fn normalize_for_match(s: &str) -> String {
+    s.trim_matches('/').to_lowercase()
+}
+
 fn build(root: &Path) -> Result<VoicenoteIndex, (StatusCode, String)> {
     let (audio_root, transcript_roots) = declared(root)?;
 
-    // source path -> transcript. Built first, so the audio pass is a lookup.
+    // source path -> transcript, keyed by the raw `source:` string exactly as
+    // transcribe.py wrote it — that is what an `audio_absent` entry reports
+    // back verbatim. `match_index` below is the same set of entries again,
+    // keyed by a normalized form, and exists only to find a match; a client
+    // never sees it.
     let mut by_source: BTreeMap<String, Transcript> = BTreeMap::new();
+    let mut match_index: BTreeMap<String, String> = BTreeMap::new();
     for dir in &transcript_roots {
         let Ok(resolved) = guard::resolve(root, dir) else {
             continue; // C-4: a declared location that is not here is absent, not an error.
@@ -136,6 +169,7 @@ fn build(root: &Path) -> Result<VoicenoteIndex, (StatusCode, String)> {
                 continue; // Not a transcript, or one that cannot be linked.
             };
             let name = item.file_name().to_string_lossy().to_string();
+            match_index.insert(normalize_for_match(source), source.clone());
             by_source.insert(
                 source.clone(),
                 Transcript {
@@ -167,8 +201,11 @@ fn build(root: &Path) -> Result<VoicenoteIndex, (StatusCode, String)> {
                     continue;
                 }
                 let rel = format!("{audio_root}/{name}");
-                let transcript = by_source.get(&rel).cloned();
-                seen.push(rel.clone());
+                let matched_source = match_index.get(&normalize_for_match(&rel)).cloned();
+                let transcript = matched_source.as_ref().and_then(|s| by_source.get(s)).cloned();
+                if let Some(source) = &matched_source {
+                    seen.push(source.clone());
+                }
                 entries.push(AudioEntry {
                     audio: rel,
                     bytes: Some(meta.len()),
@@ -281,6 +318,22 @@ transcripts = ["commons/voicenotes"]
     }
 
     #[test]
+    fn unterminated_frontmatter_yields_nothing_rather_than_absorbing_the_body() {
+        // A markdown horizontal rule opens exactly like a frontmatter block.
+        // Without a closing `---`, everything after it — including a body
+        // line shaped like a field — must not be read as frontmatter.
+        let fm = parse_frontmatter("---\ntitle: \"A\"\nSource: see below\nmore prose, never closed\n");
+        assert!(fm.is_empty());
+    }
+
+    #[test]
+    fn a_body_line_shaped_like_a_field_after_a_closed_block_is_not_absorbed() {
+        let fm = parse_frontmatter("---\ntitle: \"A\"\n---\nsource: not real frontmatter\n");
+        assert_eq!(fm.len(), 1);
+        assert_eq!(fm.get("title").map(String::as_str), Some("A"));
+    }
+
+    #[test]
     fn derives_all_three_states() {
         let root = farm();
         let index = build(root.path()).unwrap();
@@ -315,6 +368,65 @@ transcripts = ["commons/voicenotes"]
         assert_eq!(t.path, "commons/voicenotes/2026-07-22-done.md");
         assert_eq!(t.transcribed_by.as_deref(), Some("@tycho"));
         assert_eq!(t.recorded.as_deref(), Some("2026-07-22"));
+    }
+
+    #[test]
+    fn a_trailing_slash_on_a_declared_directory_still_matches() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("modules.toml"),
+            r#"
+[[protocols]]
+name = "voicenotes"
+source = "commons/practices/voicenotes/practice.md"
+load = "on-demand"
+audio = "local/inbox/"
+transcripts = ["commons/voicenotes/"]
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.path().join("local/inbox")).unwrap();
+        fs::write(root.path().join("local/inbox/done.m4a"), b"audio").unwrap();
+        fs::create_dir_all(root.path().join("commons/voicenotes")).unwrap();
+        fs::write(
+            root.path().join("commons/voicenotes/done.md"),
+            "---\nsource: \"local/inbox/done.m4a\"\n---\nbody\n",
+        )
+        .unwrap();
+
+        let index = build(root.path()).unwrap();
+        let entry = index.entries.iter().find(|e| e.audio.ends_with("done.m4a")).unwrap();
+        assert_eq!(entry.state, "transcribed");
+        assert!(!entry.audio.contains("//"), "audio path doubled a separator: {}", entry.audio);
+    }
+
+    #[test]
+    fn a_source_differing_only_in_case_from_the_listed_filename_still_matches() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("modules.toml"),
+            r#"
+[[protocols]]
+name = "voicenotes"
+source = "commons/practices/voicenotes/practice.md"
+load = "on-demand"
+audio = "local/inbox"
+transcripts = ["commons/voicenotes"]
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.path().join("local/inbox")).unwrap();
+        fs::write(root.path().join("local/inbox/done.m4a"), b"audio").unwrap();
+        fs::create_dir_all(root.path().join("commons/voicenotes")).unwrap();
+        fs::write(
+            root.path().join("commons/voicenotes/done.md"),
+            "---\nsource: \"Local/Inbox/Done.m4a\"\n---\nbody\n",
+        )
+        .unwrap();
+
+        let index = build(root.path()).unwrap();
+        let entry = index.entries.iter().find(|e| e.audio.ends_with("done.m4a")).unwrap();
+        assert_eq!(entry.state, "transcribed");
     }
 
     #[test]
