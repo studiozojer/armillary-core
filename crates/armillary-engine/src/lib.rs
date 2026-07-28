@@ -26,5 +26,6 @@ pub fn app(state: AppState) -> Router {
         .route("/voicenotes", get(routes::voicenotes::voicenotes))
         .route("/instances", get(routes::instances::list).post(routes::instances::create))
         .route("/instances/{id}", get(routes::instances::attach))
+        .route("/streams/{stream}/events", get(routes::subscribe::subscribe))
         .with_state(shared)
 }
