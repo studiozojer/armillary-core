@@ -20,7 +20,14 @@
 //!    `seq <= last_replayed` — the dedup that closes the window opened by
 //!    doing (1) before (2): an event appended in that window lands in BOTH
 //!    the replay batch and the live channel, and this is where the second
-//!    copy is dropped. A transient (`seq == 0`) always passes through.
+//!    copy is dropped. A transient (`seq == 0`) always passes through. This
+//!    also means a transient broadcast during that same window (before the
+//!    tail starts polling — i.e. anywhere from `subscribe_live` through the
+//!    end of emitting `caught-up`) is simply delivered *later*, once the
+//!    tail starts draining, rather than lost or reordered ahead of the
+//!    replay: safe precisely because I-4 requires a transient's payload be a
+//!    snapshot, not an increment, so a delayed delivery carries the same
+//!    information a prompt one would have.
 //! 5. Tail forever; on `RecvError::Lagged`, END the stream (A-2: the slow
 //!    client drops itself — its cursor plus a fresh replay on reconnect
 //!    heals whatever the channel dropped, so ending here is not data loss,
@@ -39,6 +46,7 @@ use axum::{
 use futures_util::stream::{self, Stream, StreamExt};
 use serde::Deserialize;
 use std::convert::Infallible;
+use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
 #[derive(Deserialize)]
@@ -68,6 +76,39 @@ fn replay_snapshot(
     let head_seq = store.head_seq(stream)?;
     let replay = store.read_from(stream, replay_from)?;
     Ok((earliest_seq, head_seq, replay))
+}
+
+/// The tail half of subscribe: drains `rx` forever, skipping any DURABLE
+/// event (`seq != 0`) with `seq <= last_replayed` — the dedup that closes
+/// the window opened by running `subscribe_live` (buffering begins) before
+/// the durable replay read (what `last_replayed` summarizes): an event
+/// appended in that window lands in BOTH the replay batch and the broadcast
+/// channel, and this is where the second copy is dropped rather than
+/// re-delivered. A transient (`seq == 0`) always passes through untouched.
+/// Ends the stream on `RecvError::Lagged` (A-2: the slow client drops
+/// itself here — its cursor plus a fresh replay on reconnect heals whatever
+/// the channel dropped) or `RecvError::Closed`.
+///
+/// Kept separate from `envelope_event`'s `Event`-rendering step, and
+/// yielding the domain type (`EventEnvelope`) rather than `axum::Event`, on
+/// purpose: `Event` has no public accessor to read a name/payload back out
+/// once built, so a dedup expressed over `EventEnvelope` is what makes this
+/// the race-closing logic — not the whole handler — unit-testable directly,
+/// without going through axum's wire format or a real socket at all.
+fn tail_envelopes(
+    rx: broadcast::Receiver<EventEnvelope>,
+    last_replayed: u64,
+) -> impl Stream<Item = EventEnvelope> {
+    stream::unfold((rx, last_replayed), |(mut rx, last_replayed)| async move {
+        loop {
+            match rx.recv().await {
+                Ok(ev) if ev.seq != 0 && ev.seq <= last_replayed => continue,
+                Ok(ev) => return Some((ev, (rx, last_replayed))),
+                Err(RecvError::Lagged(_)) => return None,
+                Err(RecvError::Closed) => return None,
+            }
+        }
+    })
 }
 
 pub async fn subscribe(
@@ -143,24 +184,97 @@ pub async fn subscribe(
         .event("caught-up")
         .data(caught_up.to_string())));
 
-    // (4) + (5): tail forever, skipping any durable event this subscriber
-    // already saw in replay (`seq <= last_replayed` — the dedup that closes
-    // the race); a transient (`seq == 0`) always passes through. On
-    // `RecvError::Lagged`, end the stream — A-2: the slow client drops
-    // itself here, and its cursor plus a fresh replay on reconnect heals
-    // whatever the channel dropped, so this is not data loss, it's where the
-    // loss gets healed. `RecvError::Closed` cannot happen while `Sessions`
-    // holds the sender, but is handled the same way defensively.
-    let tail = stream::unfold((rx, last_replayed), |(mut rx, last_replayed)| async move {
-        loop {
-            match rx.recv().await {
-                Ok(ev) if ev.seq != 0 && ev.seq <= last_replayed => continue,
-                Ok(ev) => return Some((Ok(envelope_event(&ev)), (rx, last_replayed))),
-                Err(RecvError::Lagged(_)) => return None,
-                Err(RecvError::Closed) => return None,
-            }
-        }
-    });
+    // (4) + (5): the dedup-then-tail-forever half — see `tail_envelopes`.
+    let tail = tail_envelopes(rx, last_replayed).map(|ev| Ok(envelope_event(&ev)));
 
     Ok(Sse::new(stream::iter(prefix).chain(tail)).keep_alive(KeepAlive::default()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log::envelope::{Actor, Role};
+    use futures_util::StreamExt;
+
+    fn envelope(seq: u64, event_type: &str) -> EventEnvelope {
+        EventEnvelope {
+            stream: "s1".to_string(),
+            id: format!("id-{seq}"),
+            seq,
+            ts: "2026-07-27T00:00:00Z".to_string(),
+            actor: Actor {
+                role: Role::User,
+                instance: None,
+            },
+            event_type: event_type.to_string(),
+            thread: None,
+            parent: None,
+            version: 1,
+            cost: None,
+            data: serde_json::json!({}),
+        }
+    }
+
+    /// The exact scenario the dedup exists for: the replay batch already
+    /// covered seq 1..=4 (`last_replayed = 4`), but — because
+    /// `subscribe_live` starts buffering before that durable read even runs
+    /// — the broadcast channel ALSO holds 3 and 4, delivered a second time
+    /// by the writer's `append`. `tail_envelopes` must drop the two
+    /// already-replayed duplicates, deliver the genuinely-new seq 5, and let
+    /// a transient (seq 0) pass through untouched, in arrival order.
+    #[tokio::test]
+    async fn skips_durable_duplicates_already_covered_by_replay_but_passes_new_ones_and_transients()
+    {
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(envelope(3, "user_message")).unwrap();
+        tx.send(envelope(4, "user_message")).unwrap();
+        tx.send(envelope(5, "user_message")).unwrap();
+        tx.send(envelope(0, "typing")).unwrap();
+        // Dropping the sender does not truncate what's already buffered —
+        // `recv` still drains 5 and the transient before it sees `Closed`
+        // and the stream ends, which is what lets a plain `collect` work
+        // here without a separate "stop after N" signal.
+        drop(tx);
+
+        let out: Vec<EventEnvelope> = tail_envelopes(rx, 4).collect().await;
+
+        let seqs: Vec<u64> = out.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![5, 0],
+            "3 and 4 must be skipped as already-replayed duplicates; 5 and the transient pass"
+        );
+        assert_eq!(out[1].event_type, "typing", "the transient passes through untouched");
+    }
+
+    #[tokio::test]
+    async fn a_transient_is_never_skipped_even_at_seq_zero_against_a_zero_last_replayed() {
+        // Guards against a subtly wrong condition like `seq < last_replayed`
+        // that would happen to also pass 0 through when last_replayed is 0 —
+        // this pins that the pass-through is because `seq == 0`, not because
+        // of what `last_replayed` happens to be.
+        let (tx, rx) = broadcast::channel(4);
+        tx.send(envelope(0, "typing")).unwrap();
+        drop(tx);
+
+        let out: Vec<EventEnvelope> = tail_envelopes(rx, 0).collect().await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].seq, 0);
+    }
+
+    #[tokio::test]
+    async fn ends_the_stream_on_lagged_rather_than_skipping_past_it() {
+        let (tx, rx) = broadcast::channel(2);
+        // Overflow the tiny buffer before anything ever polls `rx`, so the
+        // first `recv` sees `Lagged`, not the events themselves.
+        for seq in 1..=5u64 {
+            tx.send(envelope(seq, "user_message")).unwrap();
+        }
+
+        let out: Vec<EventEnvelope> = tail_envelopes(rx, 0).collect().await;
+        assert!(
+            out.is_empty(),
+            "A-2: Lagged ends the stream immediately rather than replaying what's left"
+        );
+    }
 }

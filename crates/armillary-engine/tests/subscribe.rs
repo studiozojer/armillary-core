@@ -270,8 +270,24 @@ async fn from_zero_replays_three_then_caught_up() {
     assert_eq!(json["headSeq"], 3);
 }
 
+/// NOT a test of the replay/tail race itself — `subscribe` is one
+/// straight-line `async fn` that fully completes `subscribe_live`, the
+/// blocking replay read, and building the whole replay+`caught-up` prefix
+/// BEFORE the SSE response's headers are ever written. So by the time this
+/// test observes `client.status_line` (which only arrives once the header
+/// block is on the wire), `subscribe_live` and the durable read have both
+/// unconditionally already run — appending event 4 "during" this test can
+/// never land inside the durable read's window, only after it. This test
+/// therefore only pins the tail-after-replay path: event 4 arrives exactly
+/// once, on the tail, after `caught-up`. It intentionally does NOT exercise
+/// the dedup rule (`seq <= last_replayed`) — that an event landing in BOTH
+/// the replay batch and the broadcast channel is delivered exactly once —
+/// which is covered instead by the unit test
+/// `routes::subscribe::tests::skips_durable_duplicates_already_covered_by_replay_but_passes_new_ones_and_transients`
+/// in `src/routes/subscribe.rs`, where the replay/broadcast overlap can
+/// actually be constructed directly rather than raced over a real socket.
 #[tokio::test]
-async fn the_race_a_fourth_event_appended_during_replay_arrives_exactly_once() {
+async fn a_fourth_event_appended_after_the_request_lands_arrives_on_the_tail_exactly_once() {
     let data_dir = tempfile::tempdir().unwrap().keep();
     let (addr, sessions) = spawn(&data_dir).await;
     append(&sessions, "s1", "one");
@@ -281,11 +297,9 @@ async fn the_race_a_fourth_event_appended_during_replay_arrives_exactly_once() {
     let mut client = SseClient::connect(addr, "/streams/s1/events?from=0").await;
     assert!(client.status_line.contains("200"));
 
-    // Deliberately racing the handler: append event 4 immediately after the
-    // request landed, before this test reads a single frame back. Whether
-    // the handler's `subscribe_live` already ran or not by this instant is
-    // exactly the race constitution A-1 has to close — event 4 must land in
-    // the frame sequence exactly once either way.
+    // By this point `subscribe_live` and the durable replay read have both
+    // already completed (see the doc comment above) — this append can only
+    // ever reach the tail, never the replay batch.
     append(&sessions, "s1", "four");
 
     let mut seen_seqs = Vec::new();
@@ -298,23 +312,12 @@ async fn the_race_a_fourth_event_appended_during_replay_arrives_exactly_once() {
             other => panic!("unexpected frame: {other}"),
         }
     }
-    assert!(
-        seen_seqs.contains(&1) && seen_seqs.contains(&2) && seen_seqs.contains(&3),
-        "seq 1..=3 must all replay: {seen_seqs:?}"
-    );
+    assert_eq!(seen_seqs, vec![1, 2, 3], "seq 1..=3 replay in order, seq 4 not among them");
 
-    // Seq 4 may have replayed (if the append landed before the durable read)
-    // or may arrive on the tail afterward (if it landed after) — either way,
-    // exactly once, never zero, never two.
-    let seq4_in_replay = seen_seqs.iter().filter(|&&s| s == 4).count();
-    assert!(seq4_in_replay <= 1, "seq 4 duplicated in replay: {seen_seqs:?}");
-
-    if seq4_in_replay == 0 {
-        let (event, data) = client.next_frame().await;
-        assert_eq!(event, "envelope");
-        let json: serde_json::Value = serde_json::from_str(&data).unwrap();
-        assert_eq!(json["seq"], 4);
-    }
+    let (event, data) = client.next_frame().await;
+    assert_eq!(event, "envelope", "seq 4 arrives on the tail, after caught-up");
+    let json: serde_json::Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(json["seq"], 4);
 }
 
 #[tokio::test]
