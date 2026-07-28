@@ -144,6 +144,16 @@ pub async fn send(
 /// S-3 (enforceable beats advisory): this is the client's side of the
 /// enforcement mechanism, not a request the model gets to weigh in on — see
 /// `Sessions::interrupt`'s doc for the halt itself.
+///
+/// One race is inherent, not a bug: if this lands after the provider has
+/// already finished producing its outcome but before `loop_::run_turn` has
+/// appended the durable `assistant_message` (the turn slot is still claimed
+/// until then — `EndTurnGuard` clears it on return, which is after that
+/// append), the signal reaches nobody listening. This still answers 204 —
+/// the client asked for a stop and one is not owed a distinct answer for
+/// "too late" — and the record it produces is simply honest: the turn had
+/// already completed, so the durable `assistant_message` shows a completed
+/// turn, not an interrupted one.
 pub async fn interrupt(
     State(state): State<SharedState>,
     Path(id): Path<String>,
