@@ -6,13 +6,26 @@
 //! and then opened **whatever that resolved to**. On a case-insensitive
 //! filesystem, in a workspace that deliberately routes real content through
 //! symlinks, "a different thing" is the normal case rather than the edge case.
-//! That single inversion produced three independent one-request bypasses:
-//! `.ENV` reached `.env`, a symlink named `config.local` reached `.env`, and a
-//! hard link reached it under any name at all.
+//! That single inversion produced two independent one-request bypasses,
+//! closed by this ordering: `.ENV` reached `.env`, and a symlink named
+//! `config.local` reached `.env`.
 //!
 //! So: cheap rejections on the request first (absolute paths, `..`), then
 //! resolve, then **judge the canonical path** — because the canonical path is
 //! the thing that will actually be opened.
+//!
+//! What this ordering does **not** close: a hard link. `canonicalize`
+//! resolves symlinks by following their target, but a hard link has no
+//! target to resolve — it is a second directory entry pointing at the same
+//! inode, indistinguishable from an ordinary file once opened. A hard link
+//! named `notes.md` pointing at `.env` still canonicalizes to a path judged
+//! on the name `notes.md`, and serves `.env`'s bytes. The extension allowlist
+//! added since (`is_openable`) narrows this — a link named `config.local`,
+//! with no allowlisted extension, no longer opens — but a link named with an
+//! allowlisted extension still serves whatever it points at. Closing that
+//! would mean comparing inode numbers against known-sensitive files, or
+//! refusing to open any file with a link count above one; neither is done
+//! here.
 //!
 //! Matching is case-insensitive everywhere. That is a property of the
 //! filesystem to be assumed, not detected: a service that is safe only on a
@@ -230,9 +243,11 @@ pub fn resolve(root: &Path, user_path: &str) -> Result<PathBuf, GuardError> {
         .strip_prefix(&root_canonical)
         .map_err(|_| GuardError::Escaped)?;
 
-    // Judge what will actually be opened, not what was asked for. A symlink,
-    // a hard link, or a differently-cased spelling all arrive here as the same
-    // canonical path.
+    // Judge what will actually be opened, not what was asked for. A symlink
+    // or a differently-cased spelling both resolve to the same canonical path
+    // as their target, so this judges the target's real name either way. A
+    // hard link does not: it has no target to resolve to, so this judges the
+    // link's own name — see the module doc for what that leaves open.
     for component in inside.components() {
         if let Component::Normal(name) = component {
             if let Some(refusal) = judge(&name.to_string_lossy()) {
