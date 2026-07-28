@@ -5,6 +5,9 @@
 .idea/
 .vscode/
 
+# skills
+.superpowers/brainstorm
+
 # Rust
 target/
 **/*.rs.bk
