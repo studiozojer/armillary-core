@@ -1,0 +1,328 @@
+use crate::{blocking, guard, state::SharedState};
+use axum::{extract::State, http::StatusCode, Json};
+use serde::Serialize;
+use std::collections::BTreeMap;
+use std::path::Path;
+
+/// Frontmatter is read with a cap rather than in full: a transcript body is
+/// unbounded prose and none of it is wanted here.
+const MAX_FRONTMATTER_BYTES: usize = 8 * 1024;
+
+#[derive(Serialize, Clone)]
+pub struct Transcript {
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recorded: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_min: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcribed_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct AudioEntry {
+    audio: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<u64>,
+    /// "transcribed" | "untranscribed" | "audio_absent"
+    state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcript: Option<Transcript>,
+}
+
+#[derive(Serialize)]
+pub struct VoicenoteIndex {
+    audio_root: String,
+    /// Present so a client can say *where* it looked when the answer is empty.
+    transcript_roots: Vec<String>,
+    entries: Vec<AudioEntry>,
+}
+
+/// Read the leading `---` block as flat key/value pairs.
+///
+/// Deliberately not a YAML parser. The frontmatter this reads is emitted by one
+/// tool (`practices/voicenotes/transcribe.py`) in one flat shape, and pulling in
+/// a YAML dependency to read six string fields would buy generality nobody
+/// asked for. A file whose frontmatter this cannot read is skipped, which is the
+/// same posture C-4 takes toward a protocol source that is not present.
+fn parse_frontmatter(text: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut lines = text.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return out;
+    }
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            break;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if value.is_empty() {
+            continue;
+        }
+        out.insert(key.trim().to_string(), value.to_string());
+    }
+    out
+}
+
+/// The declared locations, read out of the manifest rather than hardcoded.
+///
+/// `Protocol.extra` already carries unknown keys (C-5 forbids
+/// `deny_unknown_fields`), so declaring `audio` and `transcripts` on the
+/// voicenotes protocol needs no schema change and no constitution change. That
+/// is the whole reason this shape was chosen: the manifest can already say it.
+fn declared(root: &Path) -> Result<(String, Vec<String>), (StatusCode, String)> {
+    let composition = armillary_composition::parse_workspace(root)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let protocol = composition
+        .protocols
+        .iter()
+        .find(|p| p.name == "voicenotes")
+        .ok_or((StatusCode::NOT_FOUND, "not_composed".to_string()))?;
+
+    let audio = protocol
+        .extra
+        .get("audio")
+        .and_then(|v| v.as_str())
+        .ok_or((StatusCode::NOT_FOUND, "not_composed".to_string()))?
+        .to_string();
+
+    let transcripts = protocol
+        .extra
+        .get("transcripts")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok((audio, transcripts))
+}
+
+fn build(root: &Path) -> Result<VoicenoteIndex, (StatusCode, String)> {
+    let (audio_root, transcript_roots) = declared(root)?;
+
+    // source path -> transcript. Built first, so the audio pass is a lookup.
+    let mut by_source: BTreeMap<String, Transcript> = BTreeMap::new();
+    for dir in &transcript_roots {
+        let Ok(resolved) = guard::resolve(root, dir) else {
+            continue; // C-4: a declared location that is not here is absent, not an error.
+        };
+        let Ok(read) = std::fs::read_dir(&resolved) else {
+            continue;
+        };
+        for item in read.flatten() {
+            let path = item.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_FRONTMATTER_BYTES)]);
+            let fm = parse_frontmatter(&head);
+            let Some(source) = fm.get("source") else {
+                continue; // Not a transcript, or one that cannot be linked.
+            };
+            let name = item.file_name().to_string_lossy().to_string();
+            by_source.insert(
+                source.clone(),
+                Transcript {
+                    path: format!("{dir}/{name}"),
+                    title: fm.get("title").cloned(),
+                    recorded: fm.get("recorded").cloned(),
+                    duration_min: fm.get("duration_min").cloned(),
+                    transcribed_by: fm.get("transcribed_by").cloned(),
+                    model: fm.get("model").cloned(),
+                },
+            );
+        }
+    }
+
+    let mut entries: Vec<AudioEntry> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+
+    if let Ok(resolved) = guard::resolve(root, &audio_root) {
+        if let Ok(read) = std::fs::read_dir(&resolved) {
+            for item in read.flatten() {
+                let name = item.file_name().to_string_lossy().to_string();
+                if guard::is_hidden_from_listings(&name) {
+                    continue;
+                }
+                let Ok(meta) = item.path().metadata() else {
+                    continue;
+                };
+                if meta.is_dir() {
+                    continue;
+                }
+                let rel = format!("{audio_root}/{name}");
+                let transcript = by_source.get(&rel).cloned();
+                seen.push(rel.clone());
+                entries.push(AudioEntry {
+                    audio: rel,
+                    bytes: Some(meta.len()),
+                    state: if transcript.is_some() {
+                        "transcribed".to_string()
+                    } else {
+                        "untranscribed".to_string()
+                    },
+                    transcript,
+                });
+            }
+        }
+    }
+
+    // A transcript naming audio that never reached this machine. Not an error
+    // and not noise: local/inbox is untracked and machine-local while the
+    // transcript is committed, so on a second machine this is EVERY memo. The
+    // state is the difference between "not yet transcribed" and "transcribed
+    // elsewhere", which are invisible to each other without it.
+    for (source, transcript) in by_source {
+        if seen.contains(&source) {
+            continue;
+        }
+        entries.push(AudioEntry {
+            audio: source,
+            bytes: None,
+            state: "audio_absent".to_string(),
+            transcript: Some(transcript),
+        });
+    }
+
+    entries.sort_by_key(|a| a.audio.to_lowercase());
+
+    Ok(VoicenoteIndex {
+        audio_root,
+        transcript_roots,
+        entries,
+    })
+}
+
+/// Derived on every request, never stored. An index file would be a second
+/// source of truth, and it would drift the first time a transcript was written
+/// by anything that did not know to update it — which is every hand-run of
+/// transcribe.py. The `source:` field in the transcript's own frontmatter is
+/// already the edge; this route only inverts it.
+pub async fn voicenotes(
+    State(state): State<SharedState>,
+) -> Result<Json<VoicenoteIndex>, (StatusCode, String)> {
+    let root = state.root.clone();
+    let index = blocking::run(move || build(&root)).await?;
+    Ok(Json(index))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Mirrors the real topology: audio that is untracked and machine-local,
+    /// transcripts that are committed and travel — so the two can be present
+    /// independently of each other.
+    fn farm() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("modules.toml"),
+            r#"
+[[protocols]]
+name = "voicenotes"
+source = "commons/practices/voicenotes/practice.md"
+load = "on-demand"
+audio = "local/inbox"
+transcripts = ["commons/voicenotes"]
+"#,
+        )
+        .unwrap();
+
+        fs::create_dir_all(root.path().join("local/inbox")).unwrap();
+        fs::write(root.path().join("local/inbox/done.m4a"), b"audio").unwrap();
+        fs::write(root.path().join("local/inbox/pending.m4a"), b"audio").unwrap();
+
+        fs::create_dir_all(root.path().join("commons/voicenotes")).unwrap();
+        fs::write(
+            root.path().join("commons/voicenotes/2026-07-22-done.md"),
+            "---\ntitle: \"Done — raw transcript\"\nrecorded: 2026-07-22\nsource: \"local/inbox/done.m4a\"\nduration_min: 2.4\ntranscribed_by: \"@tycho\"\nmodel: \"faster-whisper large-v3\"\n---\n\nbody\n",
+        )
+        .unwrap();
+        // A transcript whose audio never reached this machine — the third state.
+        fs::write(
+            root.path().join("commons/voicenotes/2026-07-23-elsewhere.md"),
+            "---\ntitle: \"Elsewhere\"\nsource: \"local/inbox/elsewhere.m4a\"\n---\n\nbody\n",
+        )
+        .unwrap();
+        // Malformed: no frontmatter at all. Must be skipped, not fatal.
+        fs::write(root.path().join("commons/voicenotes/notes.md"), "just prose\n").unwrap();
+
+        root
+    }
+
+    #[test]
+    fn parses_the_frontmatter_block_only() {
+        let fm = parse_frontmatter("---\ntitle: \"A\"\nsource: \"x.m4a\"\n---\nbody: not frontmatter\n");
+        assert_eq!(fm.get("title").map(String::as_str), Some("A"));
+        assert_eq!(fm.get("source").map(String::as_str), Some("x.m4a"));
+        assert!(!fm.contains_key("body"));
+    }
+
+    #[test]
+    fn a_file_without_frontmatter_yields_nothing_rather_than_failing() {
+        assert!(parse_frontmatter("just prose\n").is_empty());
+    }
+
+    #[test]
+    fn derives_all_three_states() {
+        let root = farm();
+        let index = build(root.path()).unwrap();
+
+        let state_of = |audio: &str| {
+            index
+                .entries
+                .iter()
+                .find(|e| e.audio.ends_with(audio))
+                .unwrap_or_else(|| panic!("{audio} missing from index"))
+                .state
+                .clone()
+        };
+
+        assert_eq!(state_of("done.m4a"), "transcribed");
+        assert_eq!(state_of("pending.m4a"), "untranscribed");
+        assert_eq!(state_of("elsewhere.m4a"), "audio_absent");
+    }
+
+    #[test]
+    fn one_malformed_transcript_does_not_empty_the_index() {
+        let root = farm();
+        assert_eq!(build(root.path()).unwrap().entries.len(), 3);
+    }
+
+    #[test]
+    fn transcript_metadata_rides_along() {
+        let root = farm();
+        let index = build(root.path()).unwrap();
+        let done = index.entries.iter().find(|e| e.audio.ends_with("done.m4a")).unwrap();
+        let t = done.transcript.as_ref().unwrap();
+        assert_eq!(t.path, "commons/voicenotes/2026-07-22-done.md");
+        assert_eq!(t.transcribed_by.as_deref(), Some("@tycho"));
+        assert_eq!(t.recorded.as_deref(), Some("2026-07-22"));
+    }
+
+    #[test]
+    fn a_workspace_that_does_not_declare_voicenotes_has_no_index() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("modules.toml"), "").unwrap();
+        // Presence-gated, like every other protocol: undeclared means the
+        // feature is absent, which is a working state and not an error.
+        assert!(build(root.path()).is_err());
+    }
+}

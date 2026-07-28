@@ -21,5 +21,6 @@ pub fn app(state: AppState) -> Router {
         .route("/composition", get(routes::composition::composition))
         .route("/tree", get(routes::tree::tree))
         .route("/file", get(routes::file::file))
+        .route("/voicenotes", get(routes::voicenotes::voicenotes))
         .with_state(shared)
 }

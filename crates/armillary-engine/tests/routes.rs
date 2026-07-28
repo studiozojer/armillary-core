@@ -252,6 +252,13 @@ async fn credential_is_refused_as_a_credential_not_as_an_unknown_type() {
 }
 
 #[tokio::test]
+async fn voicenotes_is_404_when_the_protocol_is_not_declared() {
+    // The default fixture declares no voicenotes protocol at all.
+    let (status, _) = get_json(app_over(|_| {}), "/voicenotes").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn unopenable_type_is_415_and_still_lists() {
     let setup = |root: &PathBuf| {
         std::fs::create_dir_all(root.join("local/inbox")).unwrap();
