@@ -8,3 +8,6 @@
 # Rust
 target/
 **/*.rs.bk
+
+# Isolated concurrent streams — one branch, one worktree, one window.
+.worktrees/
