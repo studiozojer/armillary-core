@@ -138,10 +138,11 @@ pub(crate) fn resolve_boot_path(root: &Path, rel: &str) -> Result<PathBuf, Proje
 /// requires strict user/assistant alternation; a raw flattening can produce
 /// same-role neighbors (e.g. two `user_message` events back to back, or a
 /// `dispatch` narrative line — itself `User`-role — right after a real user
-/// message). Whether the *first* message is `User` is left alone: real logs
-/// always open on a user message, and enforcing that here would be P-4
-/// reaching past its own stage into a concern (what the provider layer
-/// requires of message 0) that Task 10 owns.
+/// message). Whether the *first* message is `User` is left alone HERE: real
+/// logs always open on a user message, so this merge pass has no opinion on
+/// it — that is `ensure_opens_on_user`'s job, run once over this function's
+/// output (see its doc for why message 0 is not always `User` once eviction
+/// is in play).
 fn merge_consecutive(raw: Vec<ProviderMessage>) -> Vec<ProviderMessage> {
     let mut merged: Vec<ProviderMessage> = Vec::with_capacity(raw.len());
     for msg in raw {
@@ -154,6 +155,40 @@ fn merge_consecutive(raw: Vec<ProviderMessage>) -> Vec<ProviderMessage> {
         }
     }
     merged
+}
+
+/// The evict seam: Anthropic requires the message list to open on `User` and
+/// to alternate strictly. A real log always opens on a user message, so
+/// ordinarily nothing here needs to act (`merge_consecutive`'s doc leaves
+/// "is message 0 `User`?" alone for exactly that reason). But `context_evict`
+/// (P-1) can legitimately remove the log's first `user_message` from THIS
+/// projection — evicting the earliest turn is not a special case, it's the
+/// same mechanism as evicting any other event — and when it does, whatever
+/// was originally message 1 (an `Assistant` message, or an assistant-shaped
+/// narrative line) becomes message 0. Handed to the provider as-is, that is
+/// an `Assistant`-opening turn, which the API rejects outright — every
+/// subsequent turn on that stream would then fail `provider_api_400` with no
+/// way for the client to recover, since nothing about *this* turn caused it.
+///
+/// The fix is to prepend an honest placeholder `User` message rather than to
+/// special-case eviction in pass two above: it keeps alternation valid, and
+/// it makes the eviction visible to the model instead of silently editing
+/// history out from under it.
+fn ensure_opens_on_user(mut messages: Vec<ProviderMessage>) -> Vec<ProviderMessage> {
+    let opens_on_assistant = matches!(
+        messages.first(),
+        Some(ProviderMessage { role: ProviderRole::Assistant, .. })
+    );
+    if opens_on_assistant {
+        messages.insert(
+            0,
+            ProviderMessage {
+                role: ProviderRole::User,
+                content: "[earlier user message removed from context]".to_string(),
+            },
+        );
+    }
+    messages
 }
 
 fn text_field(data: &serde_json::Value, key: &str) -> String {
@@ -337,7 +372,7 @@ pub fn project_context(
 
     Ok(ModelTurn {
         system,
-        messages: merge_consecutive(raw),
+        messages: ensure_opens_on_user(merge_consecutive(raw)),
     })
 }
 
@@ -487,6 +522,33 @@ mod tests {
     }
 
     #[test]
+    fn evicting_the_first_user_message_prepends_an_honest_placeholder_and_stays_valid() {
+        // The evict-seam finding: without the fix, evicting the log's only
+        // user_message leaves the projection opening on Assistant, which
+        // the Anthropic API rejects — every future turn on this stream
+        // would then fail provider_api_400 with no way out.
+        let dir = tempfile::tempdir().unwrap();
+        let bytes: &[u8] = b"# system prompt";
+        std::fs::write(dir.path().join("boot.md"), bytes).unwrap();
+        let sha = sha256_hex(bytes);
+
+        let events = vec![
+            ev(1, "b1", "boot", json!({"path": "boot.md", "sha256": sha})),
+            ev(2, "u1", "user_message", json!({"text": "hi"})),
+            ev(3, "a1", "assistant_message", json!({"text": "hello"})),
+            ev(4, "e1", "context_evict", json!({"target": "u1"})),
+        ];
+
+        let turn = project_context(&events, dir.path()).unwrap();
+
+        assert_eq!(turn.messages.len(), 2);
+        assert_eq!(turn.messages[0].role, ProviderRole::User);
+        assert_eq!(turn.messages[0].content, "[earlier user message removed from context]");
+        assert_eq!(turn.messages[1].role, ProviderRole::Assistant);
+        assert_eq!(turn.messages[1].content, "hello");
+    }
+
+    #[test]
     fn evicted_user_message_is_absent_and_context_evict_contributes_nothing() {
         let events = vec![
             ev(1, "u1", "user_message", json!({"text": "will be evicted"})),
@@ -502,16 +564,25 @@ mod tests {
 
     #[test]
     fn interrupted_assistant_message_gets_trailing_marker() {
-        let events = vec![ev(
-            1,
-            "a1",
-            "assistant_message",
-            json!({"text": "partial", "interrupted": true}),
-        )];
+        // A real log always opens on user_message (a bare assistant_message
+        // with nothing before it only arises via eviction, covered by
+        // `evicting_the_first_user_message_prepends_an_honest_placeholder_and_stays_valid`
+        // above) — included here so this fixture isn't the artificial,
+        // seam-triggering shape the interrupted-marker behavior itself has
+        // nothing to do with.
+        let events = vec![
+            ev(1, "u1", "user_message", json!({"text": "go"})),
+            ev(
+                2,
+                "a1",
+                "assistant_message",
+                json!({"text": "partial", "interrupted": true}),
+            ),
+        ];
 
         let turn = project_context(&events, Path::new(".")).unwrap();
 
-        assert_eq!(turn.messages[0].content, "partial\n[generation stopped by user]");
+        assert_eq!(turn.messages[1].content, "partial\n[generation stopped by user]");
     }
 
     #[test]
