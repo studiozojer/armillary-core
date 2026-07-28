@@ -7,6 +7,7 @@
 pub mod blocking;
 pub mod guard;
 pub mod hash;
+pub mod log;
 pub mod routes;
 pub mod state;
 
