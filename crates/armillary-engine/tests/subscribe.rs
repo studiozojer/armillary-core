@@ -16,6 +16,7 @@ use armillary_engine::{
     app,
     log::envelope::{Actor, EventEnvelope, Role},
     log::store::LogStore,
+    provider::KeylessProvider,
     sessions::{NewEvent, Sessions},
     state::{AppState, ModelConfig},
 };
@@ -68,6 +69,7 @@ async fn spawn(data_dir: &std::path::Path) -> (SocketAddr, Arc<Sessions>) {
         root: root.canonicalize().unwrap(),
         sessions: sessions.clone(),
         model: model_config(),
+        provider: Arc::new(KeylessProvider),
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

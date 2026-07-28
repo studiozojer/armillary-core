@@ -3,6 +3,7 @@
 use armillary_engine::{
     app,
     log::store::LogStore,
+    provider::KeylessProvider,
     sessions::Sessions,
     state::{AppState, ModelConfig},
 };
@@ -41,6 +42,7 @@ fn app_over(setup: impl FnOnce(&PathBuf)) -> axum::Router {
         root: root.canonicalize().unwrap(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
+        provider: Arc::new(KeylessProvider),
     })
 }
 
@@ -62,6 +64,7 @@ fn app_with_data_dir_under_root(setup: impl FnOnce(&PathBuf)) -> axum::Router {
         root,
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
+        provider: Arc::new(KeylessProvider),
     })
 }
 

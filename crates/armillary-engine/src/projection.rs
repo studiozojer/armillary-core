@@ -117,7 +117,12 @@ const HANDLED_TYPES: &[&str] = &[
 /// `root` — an absolute or `..`-laden `data.path` is not a different kind of
 /// error, it is the same `BootUnreadable` a missing file produces, since
 /// neither is ever a legitimate boot source.
-fn resolve_boot_path(root: &Path, rel: &str) -> Result<PathBuf, ProjectionError> {
+///
+/// `pub(crate)` (not private): the loop (`loop_.rs`) re-records a fresh
+/// `boot` event on `BootDrift` by re-reading the SAME path this function
+/// resolved the first time — it reuses this resolution rather than
+/// re-deriving root-containment logic at a second call site.
+pub(crate) fn resolve_boot_path(root: &Path, rel: &str) -> Result<PathBuf, ProjectionError> {
     let unreadable = || ProjectionError::BootUnreadable {
         path: rel.to_string(),
     };
@@ -177,6 +182,18 @@ pub fn project_context(
         }
     }
 
+    // "Last one wins" (see the `"boot"` arm below) extends to VALIDITY, not
+    // just content: only the last non-evicted `boot` event's hash is ever
+    // checked against disk. Without this, a `boot` event that drifted and
+    // was later superseded by a fresh, correct one (Task 11's re-record-on-
+    // `BootDrift` recovery) would keep failing every future projection
+    // forever — the stale predecessor is water under the bridge once a
+    // later boot has replaced it as "the" system prompt.
+    let last_boot_id: Option<&str> = events
+        .iter()
+        .rfind(|ev| ev.event_type == "boot" && !evicted.contains(ev.id.as_str()))
+        .map(|ev| ev.id.as_str());
+
     let mut system: Option<String> = None;
     let mut raw: Vec<ProviderMessage> = Vec::new();
 
@@ -209,6 +226,11 @@ pub fn project_context(
             // stream), and P-1 treats the log as append-only truth — the
             // *projection* of "current system prompt" is properly a fold
             // that keeps overwriting, not a first-write-wins cache.
+            "boot" if Some(ev.id.as_str()) != last_boot_id => {
+                // Superseded by a later boot event — see `last_boot_id`'s
+                // doc above. Contributes nothing, same as `instance_created`.
+            }
+
             "boot" => {
                 let path = text_field(&ev.data, "path");
                 let expected_sha = text_field(&ev.data, "sha256");
@@ -401,6 +423,43 @@ mod tests {
         let turn = project_context(&events, dir.path()).unwrap();
 
         assert_eq!(turn.system.as_deref(), Some("# second boot, supersedes the first"));
+    }
+
+    #[test]
+    fn a_stale_drifted_boot_event_superseded_by_a_later_valid_one_does_not_error() {
+        // "Last one wins" (the test above) extends to VALIDITY, not just
+        // content: Task 11's recovery on `BootDrift` re-records a FRESH
+        // `boot` event rather than editing history, so the drifted `b1`
+        // stays in the log forever. If every historical boot event were
+        // still validated, `b1`'s permanent mismatch would fail EVERY
+        // future projection despite `b2` having already fixed things — this
+        // pins that only the last standing boot event's hash is checked.
+        let dir = tempfile::tempdir().unwrap();
+        let correct_bytes: &[u8] = b"# current boot content";
+        std::fs::write(dir.path().join("boot.md"), correct_bytes).unwrap();
+
+        let events = vec![
+            ev(
+                1,
+                "b1",
+                "boot",
+                // Same path, deliberately wrong hash — simulates a boot
+                // event nobody ever re-records the FILE for, just a fresh
+                // event superseding it.
+                json!({"path": "boot.md", "sha256": "0".repeat(64)}),
+            ),
+            ev(2, "u1", "user_message", json!({"text": "hi"})),
+            ev(
+                3,
+                "b2",
+                "boot",
+                json!({"path": "boot.md", "sha256": sha256_hex(correct_bytes)}),
+            ),
+        ];
+
+        let turn = project_context(&events, dir.path()).expect("the stale b1 must not fail this projection");
+
+        assert_eq!(turn.system.as_deref(), Some("# current boot content"));
     }
 
     #[test]

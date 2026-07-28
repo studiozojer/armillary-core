@@ -1,6 +1,7 @@
 use armillary_engine::{
     app,
     log::store::LogStore,
+    provider::{AnthropicProvider, KeylessProvider, ModelProvider},
     sessions::Sessions,
     state::{AppState, ModelConfig},
 };
@@ -101,6 +102,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
     };
 
+    // The engine boots and serves the Explorer regardless of whether a model
+    // is wired in: `KeylessProvider` fails every turn with a named error
+    // (`no_api_key`) rather than refusing to start. Which provider is active
+    // is announced (without ever printing the key itself — see
+    // `ModelConfig`'s and `AnthropicProvider`'s redacting `Debug` impls).
+    let provider: Arc<dyn ModelProvider> = match &model.api_key {
+        Some(api_key) => {
+            eprintln!("provider: AnthropicProvider (model {})", model.model);
+            Arc::new(AnthropicProvider {
+                model: model.model.clone(),
+                api_key: api_key.clone(),
+            })
+        }
+        None => {
+            eprintln!(
+                "provider: KeylessProvider — no ANTHROPIC_API_KEY set; the Explorer works, \
+                 but every send will fail with no_api_key"
+            );
+            Arc::new(KeylessProvider)
+        }
+    };
+
     let addr = SocketAddr::new(args.bind, args.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!(
@@ -115,6 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             root,
             sessions,
             model,
+            provider,
         }),
     )
     .await?;

@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::Mutex;
 use std::time::SystemTime;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 /// Capacity of each stream's live broadcast channel (A-2: a subscriber that
 /// falls this far behind drops itself via `RecvError::Lagged` rather than
@@ -30,19 +30,27 @@ pub struct NewEvent {
     pub data: serde_json::Value,
 }
 
-/// Placeholder for the loop's turn-ownership handle (Task 10+). `Sessions`
-/// only needs a place to hold it — never to interpret it — so it stays
-/// opaque here rather than pulling a dependency this crate doesn't have yet.
-#[allow(dead_code)]
-pub struct TurnHandle;
+/// The loop's turn-ownership handle (Task 11). A-4 extended to the loop: one
+/// turn in flight per stream, enforced by `Sessions::begin_turn` refusing a
+/// second claim while this is `Some` in `StreamState`. `cancel` is kept alive
+/// here for the turn's whole duration (Task 10's documented semantics: the
+/// provider treats a dropped sender the same as an explicit `true`, but this
+/// handle holds the sender so `interrupt` has somewhere to send `true` *to*,
+/// rather than relying on drop-as-cancel by accident). `generation` is the one
+/// uuid minted per turn — not read by `Sessions` itself, just carried so a
+/// caller can find out which generation is currently in flight for a stream.
+pub struct TurnHandle {
+    pub cancel: watch::Sender<bool>,
+    #[allow(dead_code)] // read by callers via a future accessor; not yet needed internally
+    pub generation: String,
+}
 
 /// Per-stream live state.
 struct StreamState {
     tx: broadcast::Sender<EventEnvelope>,
-    /// Unused until the loop lands (Task 10+); the field exists now so A-4's
-    /// one-writer-per-stream claim has somewhere to be recorded without a
-    /// second registry appearing later.
-    #[allow(dead_code)]
+    /// `Some` for exactly the lifetime of one turn (A-4 extended to the
+    /// loop) — installed by `begin_turn`, cleared by `end_turn`. `interrupt`
+    /// is a no-op when this is `None`: no turn running is still 204.
     turn: Option<TurnHandle>,
 }
 
@@ -57,11 +65,15 @@ impl StreamState {
 
 /// Errors `Sessions`/the instance routes can surface. `Log` wraps a durable
 /// write failure (I-5); `UnknownInstance` is raised by route-level lookups
-/// (attach) against a stream nothing ever created.
+/// (attach) against a stream nothing ever created. `TurnInProgress` is A-4
+/// extended to the loop (a second `send` while one turn is in flight);
+/// `UnknownEvent` is `evict`'s target-not-found case.
 #[derive(Debug)]
 pub enum SessionError {
     UnknownInstance,
     Log(io::Error),
+    TurnInProgress,
+    UnknownEvent,
 }
 
 impl From<io::Error> for SessionError {
@@ -82,6 +94,14 @@ impl SessionError {
             SessionError::Log(e) => {
                 eprintln!("log_write_failed: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "log_write_failed".to_string())
+            }
+            // A-4: a second turn while one is in flight is a conflict, not a
+            // server error — the caller can retry once the first completes.
+            SessionError::TurnInProgress => {
+                (StatusCode::CONFLICT, "turn_in_progress".to_string())
+            }
+            SessionError::UnknownEvent => {
+                (StatusCode::NOT_FOUND, "unknown_event".to_string())
             }
         }
     }
@@ -181,6 +201,48 @@ impl Sessions {
             .entry(stream.to_string())
             .or_insert_with(StreamState::new);
         state.tx.subscribe()
+    }
+
+    /// Claims the turn slot for `stream`, installing `handle`. Fails with
+    /// `SessionError::TurnInProgress` (409, A-4) if one is already claimed —
+    /// checked and set under the same lock `append` uses, so two concurrent
+    /// `send`s against the same stream can never both win this race.
+    pub fn begin_turn(&self, stream: &str, handle: TurnHandle) -> Result<(), SessionError> {
+        let mut inner = self.inner.lock().unwrap();
+        let state = inner
+            .entry(stream.to_string())
+            .or_insert_with(StreamState::new);
+        if state.turn.is_some() {
+            return Err(SessionError::TurnInProgress);
+        }
+        state.turn = Some(handle);
+        Ok(())
+    }
+
+    /// Clears the turn slot unconditionally. Called once — always, success,
+    /// interruption, or failure alike (the loop's `EndTurnGuard` is what
+    /// makes "always" hold even across a panic) — so `interrupt` after
+    /// completion finds nothing and is a 204 no-op, and a subsequent `send`
+    /// is never blocked by a turn that has already ended.
+    pub fn end_turn(&self, stream: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(state) = inner.get_mut(stream) {
+            state.turn = None;
+        }
+    }
+
+    /// Sends the interrupt signal if a turn is currently claimed for
+    /// `stream`; otherwise does nothing. Always safe to call — the route
+    /// this backs returns 204 either way (interrupt is idempotent).
+    pub fn interrupt(&self, stream: &str) {
+        let inner = self.inner.lock().unwrap();
+        if let Some(state) = inner.get(stream) {
+            if let Some(handle) = &state.turn {
+                // No receiver left (the turn already ended) is not an error
+                // here — the same idempotence `interrupt`'s caller relies on.
+                let _ = handle.cancel.send(true);
+            }
+        }
     }
 }
 
@@ -316,5 +378,72 @@ mod tests {
 
         assert_eq!(rx.recv().await.unwrap().event_type, "typing");
         assert_eq!(sessions.store().head_seq("s1").unwrap(), 0, "never stored");
+    }
+
+    fn handle(generation: &str) -> (TurnHandle, watch::Receiver<bool>) {
+        let (tx, rx) = watch::channel(false);
+        (
+            TurnHandle {
+                cancel: tx,
+                generation: generation.to_string(),
+            },
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn begin_turn_then_begin_turn_again_is_turn_in_progress() {
+        let (_dir, sessions) = sessions();
+        let (h1, _rx1) = handle("g1");
+        sessions.begin_turn("s1", h1).unwrap();
+
+        let (h2, _rx2) = handle("g2");
+        let err = sessions.begin_turn("s1", h2).unwrap_err();
+        assert!(matches!(err, SessionError::TurnInProgress));
+    }
+
+    #[tokio::test]
+    async fn end_turn_clears_the_slot_so_begin_turn_can_claim_it_again() {
+        let (_dir, sessions) = sessions();
+        let (h1, _rx1) = handle("g1");
+        sessions.begin_turn("s1", h1).unwrap();
+        sessions.end_turn("s1");
+
+        let (h2, _rx2) = handle("g2");
+        assert!(sessions.begin_turn("s1", h2).is_ok());
+    }
+
+    #[tokio::test]
+    async fn interrupt_with_no_turn_running_is_a_silent_no_op() {
+        let (_dir, sessions) = sessions();
+        // No panic, no error return type at all — the route this backs is
+        // unconditionally 204 whether or not a turn is running.
+        sessions.interrupt("s1");
+    }
+
+    #[tokio::test]
+    async fn interrupt_sends_true_on_the_claimed_handles_watch() {
+        let (_dir, sessions) = sessions();
+        let (h1, mut rx1) = handle("g1");
+        sessions.begin_turn("s1", h1).unwrap();
+
+        sessions.interrupt("s1");
+
+        assert!(rx1.changed().await.is_ok());
+        assert!(*rx1.borrow());
+    }
+
+    #[tokio::test]
+    async fn interrupt_after_end_turn_is_a_no_op_not_a_reused_stale_handle() {
+        let (_dir, sessions) = sessions();
+        let (h1, mut rx1) = handle("g1");
+        sessions.begin_turn("s1", h1).unwrap();
+        sessions.end_turn("s1");
+
+        sessions.interrupt("s1");
+
+        // The old handle's cancel sender was dropped along with the cleared
+        // slot, so its receiver observes closure, never a stray `true`.
+        assert!(rx1.changed().await.is_err());
     }
 }

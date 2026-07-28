@@ -7,6 +7,7 @@
 pub mod blocking;
 pub mod guard;
 pub mod hash;
+pub mod loop_;
 pub mod log;
 pub mod projection;
 pub mod provider;
@@ -14,7 +15,10 @@ pub mod routes;
 pub mod sessions;
 pub mod state;
 
-use axum::{routing::get, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 use state::{AppState, SharedState};
 use std::sync::Arc;
 
@@ -28,6 +32,9 @@ pub fn app(state: AppState) -> Router {
         .route("/voicenotes", get(routes::voicenotes::voicenotes))
         .route("/instances", get(routes::instances::list).post(routes::instances::create))
         .route("/instances/{id}", get(routes::instances::attach))
+        .route("/instances/{id}/send", post(routes::session_ops::send))
+        .route("/instances/{id}/interrupt", post(routes::session_ops::interrupt))
+        .route("/instances/{id}/evict", post(routes::session_ops::evict))
         .route("/streams/{stream}/events", get(routes::subscribe::subscribe))
         .with_state(shared)
 }
