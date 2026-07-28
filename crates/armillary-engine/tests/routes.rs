@@ -169,10 +169,13 @@ async fn file_returns_text_with_its_hash() {
 
 #[tokio::test]
 async fn file_over_the_cap_is_413() {
+    // `.md` so the openable check (now checked first — see
+    // `unopenable_type_is_415_and_still_lists` below) doesn't mask the size
+    // check this test exists to exercise.
     let router = app_over(|root| {
-        std::fs::write(root.join("big.bin"), vec![b'a'; ONE_MIB + 1]).unwrap();
+        std::fs::write(root.join("big.md"), vec![b'a'; ONE_MIB + 1]).unwrap();
     });
-    let (status, _) = get_json(router, "/file?path=big.bin").await;
+    let (status, _) = get_json(router, "/file?path=big.md").await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
@@ -197,4 +200,38 @@ async fn dotenv_is_refused_even_when_guessed_directly() {
         StatusCode::FORBIDDEN,
         "the denylist must hold for a path no listing ever revealed"
     );
+}
+
+#[tokio::test]
+async fn credential_is_refused_as_a_credential_not_as_an_unknown_type() {
+    // Rule ordering, and it is the one that would silently regress: the
+    // denylist must be consulted before the allowlist, so `Secrets.xcconfig`
+    // reads as "never served" (403) rather than "can't open this type" (415).
+    // The two say different things to whoever is looking at the screen.
+    let router = app_over(|root| {
+        std::fs::create_dir_all(root.join("repos/app")).unwrap();
+        std::fs::write(root.join("repos/app/Secrets.xcconfig"), "KEY=live").unwrap();
+    });
+    let (status, _) = get_json(router, "/file?path=repos/app/Secrets.xcconfig").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn unopenable_type_is_415_and_still_lists() {
+    let setup = |root: &PathBuf| {
+        std::fs::create_dir_all(root.join("local/inbox")).unwrap();
+        std::fs::write(root.join("local/inbox/memo.m4a"), [0u8; 4]).unwrap();
+    };
+
+    let (status, _) = get_json(app_over(setup), "/file?path=local/inbox/memo.m4a").await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    // The allowlist governs opening, not listing. A browser that hides what it
+    // cannot open is lying about the filesystem one level down.
+    let (_, listing) = get_json(app_over(setup), "/tree?path=local/inbox").await;
+    assert!(listing["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["name"] == "memo.m4a"));
 }
