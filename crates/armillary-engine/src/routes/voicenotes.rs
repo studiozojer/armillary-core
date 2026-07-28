@@ -8,6 +8,34 @@ use std::path::Path;
 /// unbounded prose and none of it is wanted here.
 const MAX_FRONTMATTER_BYTES: usize = 8 * 1024;
 
+/// Extensions the audio-directory listing pass will report as candidates.
+///
+/// Deliberately the same set the app uses to decide a path is audio, so the
+/// client and this engine cannot disagree about what counts as a memo — a
+/// wider engine-side set would report a file the app itself refuses to play.
+/// The cost, accepted rather than overlooked: a memo saved in a format
+/// outside this list goes invisible from `/voicenotes` entirely, rather than
+/// surfacing as `untranscribed`. What this closes: on the real inbox,
+/// `.DS_Store` and a `.kairosbackup` file were both reported as
+/// `untranscribed` memos before this filter existed — noise on disk is not a
+/// voice note just because it shares a directory with some.
+const AUDIO_EXTENSIONS: [&str; 5] = ["m4a", "mp3", "wav", "m4b", "aac"];
+
+/// True when a listed file's extension is one this engine treats as audio.
+/// Matched case-insensitively, like every other name comparison in this
+/// engine (see `guard.rs`). Governs the directory-listing pass only — a
+/// transcript's own `source:` field is trusted regardless of extension,
+/// because a transcript naming a file this engine would not have listed is
+/// still a transcript.
+fn is_audio(name: &str) -> bool {
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => {
+            AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str())
+        }
+        _ => false,
+    }
+}
+
 #[derive(Serialize, Clone)]
 pub struct Transcript {
     path: String,
@@ -194,6 +222,9 @@ fn build(root: &Path) -> Result<VoicenoteIndex, (StatusCode, String)> {
                 if guard::is_hidden_from_listings(&name) {
                     continue;
                 }
+                if !is_audio(&name) {
+                    continue;
+                }
                 let Ok(meta) = item.path().metadata() else {
                     continue;
                 };
@@ -368,6 +399,59 @@ transcripts = ["commons/voicenotes"]
         assert_eq!(t.path, "commons/voicenotes/2026-07-22-done.md");
         assert_eq!(t.transcribed_by.as_deref(), Some("@tycho"));
         assert_eq!(t.recorded.as_deref(), Some("2026-07-22"));
+    }
+
+    #[test]
+    fn non_audio_noise_in_the_audio_directory_is_absent_not_untranscribed() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("modules.toml"),
+            r#"
+[[protocols]]
+name = "voicenotes"
+source = "commons/practices/voicenotes/practice.md"
+load = "on-demand"
+audio = "local/inbox"
+transcripts = ["commons/voicenotes"]
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.path().join("local/inbox")).unwrap();
+        fs::write(root.path().join("local/inbox/pending.m4a"), b"audio").unwrap();
+        // The real case that surfaced this: .DS_Store is not a voice memo.
+        fs::write(root.path().join("local/inbox/.DS_Store"), b"noise").unwrap();
+        fs::create_dir_all(root.path().join("commons/voicenotes")).unwrap();
+
+        let index = build(root.path()).unwrap();
+        assert!(
+            index.entries.iter().all(|e| !e.audio.ends_with(".DS_Store")),
+            ".DS_Store must not appear in entries at all: {:?}",
+            index.entries.iter().map(|e| &e.audio).collect::<Vec<_>>()
+        );
+        assert!(index.entries.iter().any(|e| e.audio.ends_with("pending.m4a")));
+    }
+
+    #[test]
+    fn an_uppercase_audio_extension_is_still_included() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("modules.toml"),
+            r#"
+[[protocols]]
+name = "voicenotes"
+source = "commons/practices/voicenotes/practice.md"
+load = "on-demand"
+audio = "local/inbox"
+transcripts = ["commons/voicenotes"]
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.path().join("local/inbox")).unwrap();
+        fs::write(root.path().join("local/inbox/MEMO.M4A"), b"audio").unwrap();
+        fs::create_dir_all(root.path().join("commons/voicenotes")).unwrap();
+
+        let index = build(root.path()).unwrap();
+        assert!(index.entries.iter().any(|e| e.audio.ends_with("MEMO.M4A")));
     }
 
     #[test]
