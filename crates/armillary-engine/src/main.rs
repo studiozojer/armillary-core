@@ -13,7 +13,7 @@ use std::sync::Arc;
 #[derive(Parser, Debug)]
 #[command(
     name = "armillary-engine",
-    about = "read-only files service for a composed armillary workspace"
+    about = "files service + chat loop (v0, single-provider) for a composed armillary workspace"
 )]
 struct Args {
     /// Workspace root — the directory holding modules.toml.

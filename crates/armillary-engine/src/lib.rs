@@ -1,8 +1,13 @@
-//! The armillary engine: a read-only files service over a composed workspace.
+//! The armillary engine: a read-only files service over a composed workspace,
+//! plus a chat loop (`loop_.rs`) over sessions logged under it.
 //!
-//! Deliberately loopless. A harness is roughly 5% loop and 95% edge-of-the-world
-//! plumbing, so this is the plumbing — born without the loop, and useful on its
-//! own as an Explorer while the loop does not exist. Organs accrete onto it.
+//! A harness is roughly 5% loop and 95% edge-of-the-world plumbing. This
+//! crate was born loopless — useful on its own as an Explorer before the
+//! loop existed — but the loop has since landed: `POST /instances/{id}/send`
+//! runs one turn against a single model provider, chat-only, v0 (no
+//! dispatch to other operators, no tool use yet). The Explorer surfaces
+//! (`/tree`, `/file`, `/composition`) remain exactly what they were; the
+//! loop is the organ that accreted onto them.
 
 pub mod blocking;
 pub mod guard;
