@@ -7,7 +7,7 @@ use armillary_engine::{
 };
 use clap::Parser;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -107,6 +107,70 @@ fn bind_permitted(addr: IpAddr) -> Result<(), String> {
     ))
 }
 
+/// Resolves the Anthropic API key, in priority order: (1) `env_val` — the
+/// `ANTHROPIC_API_KEY` environment variable's value, if the caller found one
+/// set and it is non-empty; (2) `key_file` — read, trimmed of surrounding
+/// whitespace (including a trailing newline), used if non-empty. Neither
+/// present → `None`, i.e. keyless, exactly as before this fallback existed.
+///
+/// This resolution order is an ENGINE-LOCAL ERGONOMICS DECISION — a
+/// convenience for running the engine day to day without exporting an env
+/// var in every shell — not a constitution rule; nothing in `constitution/`
+/// requires or forbids a key-file fallback, and a different engine need not
+/// have one. The file's home, `~/.config/armillary/anthropic-key`, is
+/// deliberately outside any directory this engine ever serves reads from
+/// (contrast a workspace-local `.env`, which `guard.rs` refuses to serve —
+/// see `dotenv_is_refused_even_when_guessed_directly` — precisely because a
+/// secret sitting inside the served/composed tree is one `/file` request
+/// away from leaking). A per-machine dotfile under the user's home config
+/// directory instead matches this studio's standing convention for
+/// machine-local secrets (`modules.local.toml`, `CLAUDE.local.md`):
+/// configuration that varies by machine, is never committed, and lives
+/// outside any tree this process composes or serves.
+///
+/// Takes `key_file` as a parameter — rather than resolving
+/// `~/.config/armillary/anthropic-key` inline — so tests can point it at a
+/// tempdir; `main()` below constructs the real path.
+///
+/// Never panics and never crashes boot: an unreadable file (e.g.
+/// permissions) is treated the same as an absent one, aside from a stderr
+/// warning naming the *path* (never the key, since none could be read) —
+/// the Explorer must serve regardless of a key file's state.
+fn resolve_api_key(env_val: Option<String>, key_file: &Path) -> Option<String> {
+    if let Some(v) = env_val {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+
+    match std::fs::read_to_string(key_file) {
+        Ok(contents) => {
+            let trimmed = contents.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            eprintln!(
+                "warning: could not read {} — continuing keyless: {e}",
+                key_file.display()
+            );
+            None
+        }
+    }
+}
+
+/// The per-machine key file's real path: `$HOME/.config/armillary/anthropic-key`.
+/// Built from `HOME` directly (`std::env::var_os`, no path-lookup crate) —
+/// see `resolve_api_key`'s doc for why this file's home was chosen.
+fn default_key_file() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+        .join(".config/armillary/anthropic-key")
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -141,20 +205,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     })?;
     let sessions = Arc::new(Sessions::new(store));
+
+    // Never a flag, never logged — see the struct doc on `ModelConfig` and
+    // `resolve_api_key`'s doc for the env-then-file priority.
+    let env_val = std::env::var("ANTHROPIC_API_KEY").ok();
+    let key_file = default_key_file();
+    let env_present = env_val.as_deref().is_some_and(|v| !v.is_empty());
+    let api_key = resolve_api_key(env_val, &key_file);
+
     let model = ModelConfig {
         model: args.model.clone(),
-        // Never a flag, never logged — see the struct doc on `ModelConfig`.
-        api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
+        api_key,
     };
 
     // The engine boots and serves the Explorer regardless of whether a model
     // is wired in: `KeylessProvider` fails every turn with a named error
-    // (`no_api_key`) rather than refusing to start. Which provider is active
-    // is announced (without ever printing the key itself — see
-    // `ModelConfig`'s and `AnthropicProvider`'s redacting `Debug` impls).
+    // (`no_api_key`) rather than refusing to start. Which provider is active,
+    // and where its key came from, is announced — without ever printing the
+    // key itself — see `ModelConfig`'s and `AnthropicProvider`'s redacting
+    // `Debug` impls, and `resolve_api_key`'s doc for why only the source
+    // (env vs. file), never the value, is nameable here.
     let provider: Arc<dyn ModelProvider> = match &model.api_key {
         Some(api_key) => {
-            eprintln!("provider: AnthropicProvider (model {})", model.model);
+            let source = if env_present {
+                "key from env".to_string()
+            } else {
+                format!("key from {}", key_file.display())
+            };
+            eprintln!("provider: anthropic (model {}, {source})", model.model);
             Arc::new(AnthropicProvider {
                 model: model.model.clone(),
                 api_key: api_key.clone(),
@@ -162,8 +240,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => {
             eprintln!(
-                "provider: KeylessProvider — no ANTHROPIC_API_KEY set; the Explorer works, \
-                 but every send will fail with no_api_key"
+                "provider: keyless — no ANTHROPIC_API_KEY set and no usable key at {}; \
+                 the Explorer works, but every send will fail with no_api_key",
+                key_file.display()
             );
             Arc::new(KeylessProvider)
         }
@@ -239,5 +318,79 @@ mod tests {
                 "{addr} should be refused"
             );
         }
+    }
+
+    // resolve_api_key: env-vs-file priority, trimming, and the never-crash
+    // posture on an unreadable file.
+
+    fn write_key_file(dir: &std::path::Path, contents: &str) -> PathBuf {
+        let path = dir.join("anthropic-key");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn env_wins_over_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_key_file(dir.path(), "file-key\n");
+        let got = resolve_api_key(Some("env-key".to_string()), &path);
+        assert_eq!(got, Some("env-key".to_string()));
+    }
+
+    #[test]
+    fn file_used_when_env_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_key_file(dir.path(), "file-key");
+        let got = resolve_api_key(None, &path);
+        assert_eq!(got, Some("file-key".to_string()));
+    }
+
+    #[test]
+    fn file_contents_are_trimmed_of_a_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_key_file(dir.path(), "file-key\n");
+        let got = resolve_api_key(None, &path);
+        assert_eq!(got, Some("file-key".to_string()));
+    }
+
+    #[test]
+    fn an_empty_file_resolves_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_key_file(dir.path(), "   \n");
+        let got = resolve_api_key(None, &path);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_file_resolves_to_none_not_a_crash() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_key_file(dir.path(), "file-key");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let got = resolve_api_key(None, &path);
+
+        // Restore permissions so the tempdir can clean itself up.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn no_sources_resolves_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anthropic-key"); // never written
+        let got = resolve_api_key(None, &path);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn an_empty_env_value_falls_through_to_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_key_file(dir.path(), "file-key");
+        let got = resolve_api_key(Some(String::new()), &path);
+        assert_eq!(got, Some("file-key".to_string()));
     }
 }
