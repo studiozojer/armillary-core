@@ -264,11 +264,23 @@ pub fn project_context(
                 // is accepted as a fallback identifier so a caller that only
                 // has a bare stream-relationship still renders something
                 // besides the empty string.
+                //
+                // `operator` is required-but-nullable in the wider schema
+                // (`string | null`), so a conformant dispatch to an anonymous
+                // child carries the key with a JSON `null` value, not an
+                // absent key. `.get("operator").or_else(|| .get("child"))`
+                // falls through only on a MISSING key — with `operator: null`
+                // present, `and_then(as_str)` on it already yields `None` and
+                // `or_else` never runs, so every dispatch would render `?`
+                // even when `data.child` names the target. Chaining
+                // `and_then(as_str)` per field first, THEN falling back,
+                // is what actually treats "present but null" the same as
+                // "absent".
                 let target = ev
                     .data
                     .get("operator")
-                    .or_else(|| ev.data.get("child"))
                     .and_then(|v| v.as_str())
+                    .or_else(|| ev.data.get("child").and_then(|v| v.as_str()))
                     .unwrap_or("?");
                 let child_stream = text_field(&ev.data, "childStream");
                 raw.push(ProviderMessage {
@@ -356,6 +368,63 @@ mod tests {
         assert_eq!(turn.messages[1].role, ProviderRole::Assistant);
         assert_eq!(turn.messages[2].content, "bye");
         assert_eq!(turn.messages[2].role, ProviderRole::User);
+    }
+
+    #[test]
+    fn a_later_boot_event_overwrites_system_not_the_first() {
+        // P-1: the log is append-only, but the *projection* of "current
+        // system prompt" is a fold that keeps overwriting — a re-recorded
+        // boot supersedes the one before it, so the last boot standing
+        // wins, not the first.
+        let dir = tempfile::tempdir().unwrap();
+        let first_bytes: &[u8] = b"# first boot";
+        let second_bytes: &[u8] = b"# second boot, supersedes the first";
+        std::fs::write(dir.path().join("first.md"), first_bytes).unwrap();
+        std::fs::write(dir.path().join("second.md"), second_bytes).unwrap();
+
+        let events = vec![
+            ev(
+                1,
+                "b1",
+                "boot",
+                json!({"path": "first.md", "sha256": sha256_hex(first_bytes)}),
+            ),
+            ev(2, "u1", "user_message", json!({"text": "hi"})),
+            ev(
+                3,
+                "b2",
+                "boot",
+                json!({"path": "second.md", "sha256": sha256_hex(second_bytes)}),
+            ),
+        ];
+
+        let turn = project_context(&events, dir.path()).unwrap();
+
+        assert_eq!(turn.system.as_deref(), Some("# second boot, supersedes the first"));
+    }
+
+    #[test]
+    fn dispatch_falls_back_to_child_when_operator_is_present_but_null() {
+        // The Important finding this test pins: `operator` is
+        // required-but-nullable (`string | null`) in the wider schema, so a
+        // conformant dispatch to an anonymous child carries the key with a
+        // JSON `null` value, not an absent key. The naive
+        // `.get("operator").or_else(|| .get("child"))` falls through only on
+        // a MISSING key, so with `operator: null` present it never reaches
+        // `child` at all and every such dispatch would wrongly render `?`.
+        let events = vec![ev(
+            1,
+            "d1",
+            "dispatch",
+            json!({"operator": null, "child": "worker-7", "childStream": "child-stream-1"}),
+        )];
+
+        let turn = project_context(&events, Path::new(".")).unwrap();
+
+        assert_eq!(
+            turn.messages[0].content,
+            "[dispatched worker-7 — child stream child-stream-1]"
+        );
     }
 
     #[test]
