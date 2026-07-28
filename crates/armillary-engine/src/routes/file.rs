@@ -36,6 +36,23 @@ fn read(root: &Path, path: &str) -> Result<(String, u64, String), (StatusCode, S
     if meta.is_dir() {
         return Err((StatusCode::BAD_REQUEST, "is_a_directory".to_string()));
     }
+
+    // Ordering is load-bearing. `guard::resolve` above has already refused
+    // credentials with 403; reaching here means the file is merely of an
+    // unknown type, which is a 415. Checked BEFORE the size check so a 300 MB
+    // .zip reads as "can't open this type" rather than "too large" — the type
+    // is the true reason, and the size would be a misleading one.
+    let name = resolved
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if !guard::is_openable(&name) {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "not_openable".to_string(),
+        ));
+    }
+
     // Checked from metadata before reading, so an oversized file is never loaded
     // in order to be rejected.
     if meta.len() > MAX_BYTES {

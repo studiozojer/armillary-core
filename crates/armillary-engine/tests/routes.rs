@@ -33,6 +33,22 @@ async fn get_json(router: axum::Router, uri: &str) -> (StatusCode, serde_json::V
     (status, json)
 }
 
+/// Error responses are `(StatusCode, String)` — plain text, not JSON — so
+/// `get_json` reads them back as `Null`. Two different refusals can share a
+/// status code (`not_openable` and `not_text` are both 415), so the body is
+/// what actually says which branch fired.
+async fn get_text(router: axum::Router, uri: &str) -> (StatusCode, String) {
+    let response = router
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 8 * ONE_MIB)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
 #[tokio::test]
 async fn health_reports_ok() {
     let (status, json) = get_json(app_over(|_| {}), "/health").await;
@@ -169,20 +185,42 @@ async fn file_returns_text_with_its_hash() {
 
 #[tokio::test]
 async fn file_over_the_cap_is_413() {
+    // `.md` so the openable check (now checked first — see
+    // `unopenable_type_is_415_and_still_lists` below) doesn't mask the size
+    // check this test exists to exercise.
     let router = app_over(|root| {
-        std::fs::write(root.join("big.bin"), vec![b'a'; ONE_MIB + 1]).unwrap();
+        std::fs::write(root.join("big.md"), vec![b'a'; ONE_MIB + 1]).unwrap();
     });
-    let (status, _) = get_json(router, "/file?path=big.bin").await;
+    let (status, _) = get_json(router, "/file?path=big.md").await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 #[tokio::test]
-async fn non_utf8_file_is_415() {
+async fn non_utf8_bytes_in_an_openable_file_are_415_not_text() {
+    // The openable check runs before this one, so the fixture needs an
+    // allowlisted extension — otherwise the request never reaches the
+    // `String::from_utf8` branch this test exists to cover, and it would pass
+    // for the wrong reason (as `image.png` below now demonstrates).
+    let router = app_over(|root| {
+        std::fs::write(root.join("notes.md"), [0x23u8, 0x20, 0xFF, 0xFE]).unwrap();
+    });
+    let (status, body) = get_text(router, "/file?path=notes.md").await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(body, "not_text");
+}
+
+#[tokio::test]
+async fn unopenable_extension_is_415_not_openable_before_any_utf8_check() {
+    // What `non_utf8_file_is_415` used to (mis)prove: `.png` is refused for
+    // its extension alone, before the bytes are ever read, so this is a
+    // `not_openable` regardless of what — or whether — the file contains
+    // valid text.
     let router = app_over(|root| {
         std::fs::write(root.join("image.png"), [0x89u8, 0x50, 0x4E, 0x47, 0xFF, 0xFE]).unwrap();
     });
-    let (status, _) = get_json(router, "/file?path=image.png").await;
+    let (status, body) = get_text(router, "/file?path=image.png").await;
     assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(body, "not_openable");
 }
 
 #[tokio::test]
@@ -197,4 +235,45 @@ async fn dotenv_is_refused_even_when_guessed_directly() {
         StatusCode::FORBIDDEN,
         "the denylist must hold for a path no listing ever revealed"
     );
+}
+
+#[tokio::test]
+async fn credential_is_refused_as_a_credential_not_as_an_unknown_type() {
+    // Rule ordering, and it is the one that would silently regress: the
+    // denylist must be consulted before the allowlist, so `Secrets.xcconfig`
+    // reads as "never served" (403) rather than "can't open this type" (415).
+    // The two say different things to whoever is looking at the screen.
+    let router = app_over(|root| {
+        std::fs::create_dir_all(root.join("repos/app")).unwrap();
+        std::fs::write(root.join("repos/app/Secrets.xcconfig"), "KEY=live").unwrap();
+    });
+    let (status, _) = get_json(router, "/file?path=repos/app/Secrets.xcconfig").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn voicenotes_is_404_when_the_protocol_is_not_declared() {
+    // The default fixture declares no voicenotes protocol at all.
+    let (status, _) = get_json(app_over(|_| {}), "/voicenotes").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn unopenable_type_is_415_and_still_lists() {
+    let setup = |root: &PathBuf| {
+        std::fs::create_dir_all(root.join("local/inbox")).unwrap();
+        std::fs::write(root.join("local/inbox/memo.m4a"), [0u8; 4]).unwrap();
+    };
+
+    let (status, _) = get_json(app_over(setup), "/file?path=local/inbox/memo.m4a").await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    // The allowlist governs opening, not listing. A browser that hides what it
+    // cannot open is lying about the filesystem one level down.
+    let (_, listing) = get_json(app_over(setup), "/tree?path=local/inbox").await;
+    assert!(listing["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["name"] == "memo.m4a"));
 }
