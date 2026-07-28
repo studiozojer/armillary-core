@@ -275,6 +275,19 @@ pub fn resolve(root: &Path, user_path: &str) -> Result<PathBuf, GuardError> {
 // and is consulted first, so a credential-shaped name reads as "never served"
 // rather than "unknown type" even when its extension would otherwise open.
 
+// TRIPWIRE for whoever adds a client-writable boot path: `projection::
+// resolve_boot_path` and `loop_::rerecord_boot` read a `boot` event's
+// `data.path` via plain `std::fs`, entirely bypassing this module's
+// `judge`/`is_credential`/`is_noise` denial — a `boot` event could name
+// `.env` or `.git/config` and this module would never be consulted. That is
+// currently safe ONLY because nothing here lets a client choose or write a
+// boot path: `data.path` is set at instance creation (server-side), not by
+// any of `send`/`interrupt`/`evict`'s request bodies. The moment a future
+// task makes a boot path client-writable (or client-selectable from a set
+// wider than the server already trusts), THIS is where the credential
+// bypass needs closing — most likely by routing that read through `resolve`
+// above instead of `resolve_boot_path`'s bare root-containment check.
+
 #[cfg(test)]
 mod tests {
     use super::*;
