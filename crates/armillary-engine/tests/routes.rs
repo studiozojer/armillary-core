@@ -33,6 +33,22 @@ async fn get_json(router: axum::Router, uri: &str) -> (StatusCode, serde_json::V
     (status, json)
 }
 
+/// Error responses are `(StatusCode, String)` — plain text, not JSON — so
+/// `get_json` reads them back as `Null`. Two different refusals can share a
+/// status code (`not_openable` and `not_text` are both 415), so the body is
+/// what actually says which branch fired.
+async fn get_text(router: axum::Router, uri: &str) -> (StatusCode, String) {
+    let response = router
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 8 * ONE_MIB)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
 #[tokio::test]
 async fn health_reports_ok() {
     let (status, json) = get_json(app_over(|_| {}), "/health").await;
@@ -180,12 +196,31 @@ async fn file_over_the_cap_is_413() {
 }
 
 #[tokio::test]
-async fn non_utf8_file_is_415() {
+async fn non_utf8_bytes_in_an_openable_file_are_415_not_text() {
+    // The openable check runs before this one, so the fixture needs an
+    // allowlisted extension — otherwise the request never reaches the
+    // `String::from_utf8` branch this test exists to cover, and it would pass
+    // for the wrong reason (as `image.png` below now demonstrates).
+    let router = app_over(|root| {
+        std::fs::write(root.join("notes.md"), [0x23u8, 0x20, 0xFF, 0xFE]).unwrap();
+    });
+    let (status, body) = get_text(router, "/file?path=notes.md").await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(body, "not_text");
+}
+
+#[tokio::test]
+async fn unopenable_extension_is_415_not_openable_before_any_utf8_check() {
+    // What `non_utf8_file_is_415` used to (mis)prove: `.png` is refused for
+    // its extension alone, before the bytes are ever read, so this is a
+    // `not_openable` regardless of what — or whether — the file contains
+    // valid text.
     let router = app_over(|root| {
         std::fs::write(root.join("image.png"), [0x89u8, 0x50, 0x4E, 0x47, 0xFF, 0xFE]).unwrap();
     });
-    let (status, _) = get_json(router, "/file?path=image.png").await;
+    let (status, body) = get_text(router, "/file?path=image.png").await;
     assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(body, "not_openable");
 }
 
 #[tokio::test]
