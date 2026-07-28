@@ -46,6 +46,8 @@ cargo run -p armillary-engine -- --root /path/to/workspace
 curl -s http://127.0.0.1:7778/health
 ```
 
+Set `ANTHROPIC_API_KEY` in the environment (never a flag) and pass `--model` to pilot sessions with the real Anthropic API; without a key the engine still serves the Explorer, and every `send` fails with the named `no_api_key` error instead of the engine refusing to start.
+
 Binds loopback by default and **refuses `--bind 0.0.0.0`**: it serves unauthenticated reads of an entire workspace, so it must bind loopback or a specific tailnet address. `.env*` is never listed and never served; `node_modules`, `target`, `build`, `.next` and `.git` are never listed. The engine serves the *disk*, not git, so `.gitignore` filters nothing — the denylist is what stands between a tailnet and a credential file.
 
 Deployment recipe: `zojercommons/setup/armillary-engine-deploy.md` (studio-local).
@@ -58,9 +60,11 @@ cargo test            # conformance fixtures, guard, routes
 
 **v0.1 — standard seeded 2026-07-24, machinery added 2026-07-26, public 2026-07-26.**
 
-`constitution/instances.md` (the instance/log model; the survey-hardened spine) and `constitution/composition.md` (manifests, load timings, summon-boot, the overlay merge — extracted from the router's lived protocol). Fixtures cover manifest parsing, legacy section normalization, overlay merge, name collision, and summon detection. Two implementations run them: this repo's `armillary-composition`, and the pi `armillary-boot` extension.
+`constitution/instances.md` (the instance/log model; the survey-hardened spine) and `constitution/composition.md` (manifests, load timings, summon-boot, the overlay merge — extracted from the router's lived protocol). Fixtures cover manifest parsing, legacy section normalization, overlay merge, name collision, summon detection, and (as of 2026-07-27/28) log replay/gap detection with event-envelope schema validation. Two implementations run the composition fixtures: this repo's `armillary-composition`, and the pi `armillary-boot` extension.
 
-Known deferrals, deliberate: transport choice (Connect-RPC vs SSE — parked), multi-writer/ownership (single-writer is v0 law), context paging/compaction rules, protocol-kind taxonomy (unearned — see C-5), and the loop itself.
+The engine has a loop now: `send` records the user message, runs one turn against a pluggable model provider, streams transient deltas and the durable outcome to every subscriber, and supports mid-turn interrupt and context eviction — proven by `cargo test` and, live, by a `curl` turn against a running engine.
+
+Known deferrals, deliberate: transport choice (Connect-RPC vs SSE — parked), multi-writer/ownership (single-writer is v0 law), context paging/compaction rules, and protocol-kind taxonomy (unearned — see C-5).
 
 ## Provenance
 

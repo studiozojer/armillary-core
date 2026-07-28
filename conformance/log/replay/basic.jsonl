@@ -1,0 +1,3 @@
+{"stream":"s1","id":"b-1","seq":1,"ts":"2026-07-20T10:00:00Z","actor":{"role":"system"},"type":"instance_created","version":1,"data":{"operator":"tycho","startedAt":"2026-07-20T10:00:00Z"}}
+{"stream":"s1","id":"b-2","seq":2,"ts":"2026-07-20T10:00:05Z","actor":{"role":"user"},"type":"user_message","version":1,"data":{"text":"what's the weather look like today?","clientKey":"c-1"}}
+{"stream":"s1","id":"b-3","seq":3,"ts":"2026-07-20T10:00:09Z","actor":{"role":"operator","instance":"tycho"},"type":"assistant_message","version":1,"data":{"text":"Clear skies, light wind.","generation":"g-1","interrupted":false,"model":"scripted"}}
