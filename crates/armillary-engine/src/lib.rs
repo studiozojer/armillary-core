@@ -9,6 +9,7 @@ pub mod guard;
 pub mod hash;
 pub mod log;
 pub mod projection;
+pub mod provider;
 pub mod routes;
 pub mod sessions;
 pub mod state;
