@@ -12,13 +12,74 @@
 
 use crate::log::envelope::EventEnvelope;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// Append-only JSONL log, one file per stream, all files under a single
 /// `streams/` directory of a data dir.
 pub struct LogStore {
     dir: PathBuf,
+}
+
+/// Before writing a new line, clean up a torn tail (see `LogStore::
+/// read_from`'s doc) left on disk by a prior power-loss write, so the new
+/// write lands on a properly newline-terminated file rather than
+/// concatenating onto garbage.
+///
+/// `OpenOptions::append` positions at the literal end of the file
+/// regardless of newlines — it has no concept of "lines" at all — so
+/// without this step, appending straight onto a torn fragment would fuse
+/// the fragment and the new event into a single line. That line WOULD end
+/// in `\n` (this store always terminates what it writes), so it would no
+/// longer be exempt as a torn tail on the next read: `read_from` would see
+/// one fully-terminated, unparseable line and error forever, exactly the
+/// brick this whole fix exists to prevent.
+///
+/// So: if the file's last byte isn't `\n`, find the last complete line (the
+/// bytes after the last `\n`, or the whole file if it has none) and check
+/// whether IT parses. If it doesn't, it's the torn fragment itself —
+/// truncate it off entirely, discarding exactly the bytes `read_from`
+/// already treats as absent, so nothing durable is lost (I-5: the write
+/// that produced it already surfaced its own failure to its writer; this
+/// is cleanup, not a second chance for unacknowledged data). If it DOES
+/// parse, it's a complete event that simply never got its trailing
+/// newline — not this fix's concern — so this only appends the missing
+/// newline rather than discarding real content.
+fn repair_torn_tail_before_append(path: &Path, stream: &str) -> io::Result<()> {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+        return Ok(());
+    }
+
+    let last_newline = bytes.iter().rposition(|&b| b == b'\n');
+    let tail_start = last_newline.map(|i| i + 1).unwrap_or(0);
+    let tail = &bytes[tail_start..];
+    let tail_parses = std::str::from_utf8(tail)
+        .ok()
+        .and_then(|s| serde_json::from_str::<EventEnvelope>(s).ok())
+        .is_some();
+
+    if tail_parses {
+        // A complete event, just missing its own trailing newline.
+        let mut file = OpenOptions::new().append(true).open(path)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+    } else {
+        eprintln!(
+            "warning: stream {stream:?} has a torn tail on disk ({} garbage byte(s) after the \
+             last complete line) — truncating it before this append; the write that produced \
+             it already surfaced its own error to its writer at write time (I-5), so nothing \
+             here silently diverges.",
+            tail.len()
+        );
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(tail_start as u64)?;
+    }
+    Ok(())
 }
 
 /// Stream names come from instance ids: no path separators, no leading dot.
@@ -79,10 +140,16 @@ impl LogStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
         line.push('\n');
 
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(self.path_for(stream))?;
+        let path = self.path_for(stream);
+        // `head` above was computed via `read_from`, which already treats a
+        // torn tail (see its doc) as absent — but the garbage bytes
+        // themselves are still sitting on disk. Clean them up before this
+        // write lands, so a plain `OpenOptions::append` below can't
+        // concatenate onto them (see `repair_torn_tail_before_append`'s doc
+        // for why that matters).
+        repair_torn_tail_before_append(&path, stream)?;
+
+        let mut file = OpenOptions::new().append(true).create(true).open(&path)?;
         file.write_all(line.as_bytes())?;
         file.flush()?;
         Ok(())
@@ -92,30 +159,84 @@ impl LogStore {
     /// (which is append order, which is seq order — I-1). Absent stream
     /// reads as empty, not an error: a stream that has never been written
     /// to is not a corrupt one.
+    ///
+    /// ## The torn-tail seam
+    ///
+    /// `append` is write + flush, not write + flush + fsync, so a power loss
+    /// mid-write can leave the LAST line on disk truncated mid-byte — no
+    /// trailing newline, garbage JSON. Before this function accounted for
+    /// that, any unparseable line failed the entire read, forever: `read_from`
+    /// errored, `head_seq` (which calls it) errored, and every future
+    /// `append` (which calls `head_seq` first) errored too — a torn tail
+    /// permanently bricked the stream.
+    ///
+    /// So: a line that fails to parse is treated as a genuine corruption
+    /// (`InvalidData`, as before) UNLESS it is both (a) the last line in the
+    /// file and (b) the file does not end in a trailing newline — the exact
+    /// shape a torn write leaves. In that one case it is a torn tail, not
+    /// corruption: the write that produced it already surfaced an error to
+    /// ITS writer at write time (I-5 — in-memory and on-disk state cannot
+    /// have silently diverged, because nobody ever observed that write as
+    /// having succeeded), so dropping the fragment here doesn't lose an
+    /// acknowledged fact, it just declines to resurrect an unacknowledged
+    /// one. The line is logged and skipped — `read_from`, and everything
+    /// built on it (`head_seq`, `earliest_seq`, `append`'s own next-`seq`
+    /// check), behaves as if the torn line were never there.
+    ///
+    /// A corrupt line anywhere else in the file — mid-file, or a final line
+    /// that DOES end with a newline (so it was fully flushed, and whatever
+    /// is wrong with it isn't a torn write) — still errors exactly as before.
     pub fn read_from(&self, stream: &str, from_seq: u64) -> io::Result<Vec<EventEnvelope>> {
         validate_stream_name(stream)?;
 
         let path = self.path_for(stream);
-        let file = match fs::File::open(&path) {
-            Ok(f) => f,
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
+        let ends_with_newline = bytes.last() == Some(&b'\n');
+        let content = String::from_utf8(bytes).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("non-utf8 bytes in stream {stream:?}: {e}"),
+            )
+        })?;
+
+        // `str::lines()` splits on '\n' and does not report whether the
+        // final line had a trailing terminator — hence `ends_with_newline`,
+        // read from the raw bytes above, as the separate signal for that.
+        let lines: Vec<&str> = content.lines().collect();
+        let last_index = lines.len().checked_sub(1);
 
         let mut events = Vec::new();
-        for line in BufReader::new(file).lines() {
-            let line = line?;
+        for (i, line) in lines.into_iter().enumerate() {
             if line.is_empty() {
                 continue;
             }
-            let ev: EventEnvelope = serde_json::from_str(&line).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("corrupt log entry in stream {stream:?}: {e}"),
-                )
-            })?;
-            if ev.seq >= from_seq {
-                events.push(ev);
+            match serde_json::from_str::<EventEnvelope>(line) {
+                Ok(ev) => {
+                    if ev.seq >= from_seq {
+                        events.push(ev);
+                    }
+                }
+                Err(e) => {
+                    let is_torn_tail = Some(i) == last_index && !ends_with_newline;
+                    if is_torn_tail {
+                        eprintln!(
+                            "warning: stream {stream:?} has a torn tail (unparseable final \
+                             line, no trailing newline — a power-loss write, not corruption): \
+                             {e}. Ignoring it; the write that produced it already surfaced its \
+                             own error to its writer at write time (I-5), so nothing here \
+                             silently diverges."
+                        );
+                        continue;
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("corrupt log entry in stream {stream:?}: {e}"),
+                    ));
+                }
             }
         }
         Ok(events)
@@ -159,8 +280,8 @@ impl LogStore {
 mod tests {
     use crate::log::envelope::{Actor, Cost, EventEnvelope, Role};
     use crate::log::store::LogStore;
-    use std::fs;
-    use std::io;
+    use std::fs::{self, OpenOptions};
+    use std::io::{self, Write};
 
     fn envelope(stream: &str, seq: u64) -> EventEnvelope {
         EventEnvelope {
@@ -305,6 +426,81 @@ mod tests {
         let err = store.read_from("s1", 0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("s1"));
+    }
+
+    #[test]
+    fn a_final_complete_but_corrupt_line_still_errors() {
+        // Same fixture as the test above, but the point being pinned here is
+        // narrower and specific to the torn-tail fix: a fully-flushed final
+        // line (it HAS a trailing newline, so it was not torn by a
+        // power-loss write) that is nonetheless bad JSON must still be
+        // treated as real corruption, not silently forgiven the way an
+        // actual torn tail now is.
+        let dir = tempfile::tempdir().unwrap();
+        let store = LogStore::open(dir.path()).unwrap();
+        store.append("s1", &envelope("s1", 1)).unwrap();
+
+        let path = dir.path().join("streams").join("s1.jsonl");
+        let mut contents = fs::read_to_string(&path).unwrap();
+        contents.push_str("not json but flushed completely\n");
+        fs::write(&path, contents).unwrap();
+
+        let err = store.read_from("s1", 0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_corrupt_line_in_the_middle_of_the_file_still_errors() {
+        // Only the LAST line, with no trailing newline, is forgiven as a
+        // torn tail — a bad line anywhere else in the file is exactly as
+        // fatal as before the fix, torn-tail or not.
+        let dir = tempfile::tempdir().unwrap();
+        let store = LogStore::open(dir.path()).unwrap();
+        store.append("s1", &envelope("s1", 1)).unwrap();
+        store.append("s1", &envelope("s1", 2)).unwrap();
+
+        let path = dir.path().join("streams").join("s1.jsonl");
+        let mut contents = fs::read_to_string(&path).unwrap();
+        // Splice garbage between the two good lines, rather than after them.
+        let mid = contents.find("\n{").map(|i| i + 1).unwrap_or(contents.len());
+        contents.insert_str(mid, "not json\n");
+        fs::write(&path, contents).unwrap();
+
+        let err = store.read_from("s1", 0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_torn_tail_with_no_trailing_newline_is_ignored_and_append_still_works() {
+        // The finding this pins: a power-loss write leaves the final line
+        // truncated mid-byte, no trailing newline. Before the fix this
+        // bricked the stream forever — read_from errored, so head_seq
+        // (which calls it) errored, so every future append (which calls
+        // head_seq first) errored too.
+        let dir = tempfile::tempdir().unwrap();
+        let store = LogStore::open(dir.path()).unwrap();
+        store.append("s1", &envelope("s1", 1)).unwrap();
+
+        let path = dir.path().join("streams").join("s1.jsonl");
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        // No trailing newline: exactly the shape write+flush-without-fsync
+        // leaves behind on power loss mid-write.
+        file.write_all(b"{\"stream\":\"s1\",\"seq\":2,\"id\":\"tor").unwrap();
+        drop(file);
+
+        let read = store.read_from("s1", 0).unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].seq, 1);
+
+        assert_eq!(store.head_seq("s1").unwrap(), 1);
+
+        // Appending the next event (seq 2, since the torn fragment is
+        // treated as absent) must succeed rather than perpetually 409ing on
+        // a head the store can never reach past.
+        store.append("s1", &envelope("s1", 2)).unwrap();
+        let read = store.read_from("s1", 0).unwrap();
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[1].seq, 2);
     }
 
     #[cfg(unix)]
