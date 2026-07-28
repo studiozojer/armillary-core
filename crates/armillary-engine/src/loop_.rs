@@ -141,7 +141,22 @@ fn machine_code_for_provider_error(e: &ProviderError) -> String {
 /// projection's existing interrupted-marker covers rendering. No new event
 /// type minted mid-sprint (ratified in the brief; revisit with
 /// machine-verdicts).
-async fn fail_turn(sessions: &Arc<Sessions>, stream: &str, operator: &str, generation: &str, code: &str) {
+///
+/// `model` is the CONFIGURED model string (`state.model.model`), not one a
+/// provider ever confirmed running — a failure path by definition has no
+/// `TurnOutcome::model` to report, since it either never reached the
+/// provider or the provider itself is what failed. Included anyway so the
+/// success and failure shapes agree on which fields an `assistant_message`
+/// always carries, rather than the failure shape silently being the one
+/// case missing it.
+async fn fail_turn(
+    sessions: &Arc<Sessions>,
+    stream: &str,
+    operator: &str,
+    generation: &str,
+    code: &str,
+    model: &str,
+) {
     let ev = NewEvent {
         actor: assistant_actor(operator),
         event_type: "assistant_message".to_string(),
@@ -150,6 +165,7 @@ async fn fail_turn(sessions: &Arc<Sessions>, stream: &str, operator: &str, gener
             "generation": generation,
             "interrupted": true,
             "error": code,
+            "model": model,
         }),
     };
     if let Err(e) = append_blocking(sessions, stream, ev).await {
@@ -217,7 +233,7 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
         Ok(events) => events,
         Err(e) => {
             eprintln!("failed to read stream {stream:?} for a turn: {e}");
-            fail_turn(&state.sessions, &stream, "dispatcher", &generation, "boot_unreadable").await;
+            fail_turn(&state.sessions, &stream, "dispatcher", &generation, "boot_unreadable", &state.model.model).await;
             return;
         }
     };
@@ -227,27 +243,27 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
         Ok(turn) => turn,
         Err(ProjectionError::BootDrift { path }) => {
             if let Err(code) = rerecord_boot(&state, &stream, &path).await {
-                fail_turn(&state.sessions, &stream, &operator, &generation, code).await;
+                fail_turn(&state.sessions, &stream, &operator, &generation, code, &state.model.model).await;
                 return;
             }
             let events = match read_all(&state.sessions, &stream).await {
                 Ok(events) => events,
                 Err(e) => {
                     eprintln!("failed to re-read stream {stream:?} after re-recording boot: {e}");
-                    fail_turn(&state.sessions, &stream, &operator, &generation, "boot_unreadable").await;
+                    fail_turn(&state.sessions, &stream, &operator, &generation, "boot_unreadable", &state.model.model).await;
                     return;
                 }
             };
             match project_context(&events, &state.root) {
                 Ok(turn) => turn,
                 Err(_) => {
-                    fail_turn(&state.sessions, &stream, &operator, &generation, "boot_unreadable").await;
+                    fail_turn(&state.sessions, &stream, &operator, &generation, "boot_unreadable", &state.model.model).await;
                     return;
                 }
             }
         }
         Err(ProjectionError::BootUnreadable { .. }) | Err(ProjectionError::Transient) => {
-            fail_turn(&state.sessions, &stream, &operator, &generation, "boot_unreadable").await;
+            fail_turn(&state.sessions, &stream, &operator, &generation, "boot_unreadable", &state.model.model).await;
             return;
         }
     };
@@ -315,7 +331,7 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
         }
         Err(e) => {
             let code = machine_code_for_provider_error(&e);
-            fail_turn(&state.sessions, &stream, &operator, &generation, &code).await;
+            fail_turn(&state.sessions, &stream, &operator, &generation, &code, &state.model.model).await;
         }
     }
 }
@@ -392,6 +408,10 @@ mod tests {
         assert_eq!(last.data["interrupted"], true);
         assert_eq!(last.data["error"], "no_api_key");
         assert_eq!(last.data["generation"], generation);
+        // The failure shape must carry `model` just like the success shape
+        // does — the configured model string, since a failure path never
+        // gets a `TurnOutcome::model` to report.
+        assert_eq!(last.data["model"], "claude-sonnet-5");
         assert_eq!(last.actor.instance.as_deref(), Some("tycho"));
     }
 
