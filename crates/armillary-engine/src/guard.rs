@@ -132,6 +132,15 @@ fn is_noise(name_lower: &str) -> bool {
             | ".venv"
             | ".gradle"
             | "pods"
+            // The engine's own guarded data dir (session logs, `sessions.rs`
+            // + `log/store.rs`). Not secret in the credential sense, but it
+            // must never be readable through the Explorer either: every
+            // session's full event log sits under here, and this service
+            // serves the disk — without this entry, `/tree` and `/file`
+            // would happily hand it out. Applied here, not just at the
+            // default `--data-dir` value, so a caller cannot regain access by
+            // repointing the flag inside the served root.
+            | ".armillary"
     )
 }
 
@@ -409,12 +418,45 @@ mod tests {
 
     #[test]
     fn listings_hide_exactly_what_resolution_refuses() {
-        for name in [".env", ".ENV", ".git", "Secrets.xcconfig", "node_modules", "id_rsa"] {
+        for name in [
+            ".env",
+            ".ENV",
+            ".git",
+            "Secrets.xcconfig",
+            "node_modules",
+            "id_rsa",
+            ".armillary",
+        ] {
             assert!(is_hidden_from_listings(name), "{name} should be hidden");
         }
         for name in ["zojercommons", "environment.md", ".env.example", "README.md"] {
             assert!(!is_hidden_from_listings(name), "{name} should be visible");
         }
+    }
+
+    #[test]
+    fn the_data_dir_is_denied_as_noise_at_any_depth() {
+        // The engine serves the disk; without this, every session's full
+        // event log becomes readable through /tree and /file the moment
+        // `--data-dir` (defaulting to `<root>/.armillary`) resolves under
+        // the served root.
+        let (root, _o) = farm();
+        fs::create_dir_all(root.path().join(".armillary/streams")).unwrap();
+        fs::write(
+            root.path().join(".armillary/streams/some-instance.jsonl"),
+            "{}",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve(root.path(), ".armillary"),
+            Err(GuardError::DeniedNoise)
+        );
+        assert_eq!(
+            resolve(root.path(), ".armillary/streams/some-instance.jsonl"),
+            Err(GuardError::DeniedNoise)
+        );
+        assert!(is_hidden_from_listings(".armillary"));
     }
 
     #[test]

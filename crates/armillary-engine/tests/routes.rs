@@ -1,28 +1,97 @@
 //! Route-level tests against an in-process axum app — no sockets, no network.
 
-use armillary_engine::{app, state::AppState};
+use armillary_engine::{
+    app,
+    log::store::LogStore,
+    sessions::Sessions,
+    state::{AppState, ModelConfig},
+};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tower::ServiceExt;
 
 const ONE_MIB: usize = 1024 * 1024;
 
+fn model_config() -> ModelConfig {
+    ModelConfig {
+        model: "claude-sonnet-5".to_string(),
+        api_key: None,
+    }
+}
+
 /// Build an app over a temp root. The `TempDir` is leaked deliberately: these
 /// are short-lived test processes and keeping the guard's canonicalization
 /// honest matters more than reclaiming a few directories.
+///
+/// The sessions data dir is a SEPARATE tempdir, outside the served root — so
+/// the existing `/tree`/`/file` expectations (fixed entry counts, cap tests)
+/// stay unchanged. `app_with_data_dir_under_root` below is the fixture for
+/// the one test that needs the data dir INSIDE the root.
 fn app_over(setup: impl FnOnce(&PathBuf)) -> axum::Router {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.keep();
     setup(&root);
+
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let store = LogStore::open(&data_dir).unwrap();
+
     app(AppState {
         root: root.canonicalize().unwrap(),
+        sessions: Arc::new(Sessions::new(store)),
+        model: model_config(),
+    })
+}
+
+/// Like `app_over`, but the data dir lives INSIDE the served root at
+/// `.armillary` — the one arrangement that actually exercises `guard.rs`'s
+/// denial of it through `/tree` and `/file` (A-5's sibling concern: this
+/// engine serves the disk, so anything under the root is reachable unless
+/// the guard says otherwise).
+fn app_with_data_dir_under_root(setup: impl FnOnce(&PathBuf)) -> axum::Router {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.keep();
+    setup(&root);
+    let root = root.canonicalize().unwrap();
+
+    let data_dir = root.join(".armillary");
+    let store = LogStore::open(&data_dir).unwrap();
+
+    app(AppState {
+        root,
+        sessions: Arc::new(Sessions::new(store)),
+        model: model_config(),
     })
 }
 
 async fn get_json(router: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
     let response = router
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 8 * ONE_MIB)
+        .await
+        .unwrap();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+async fn post_json(
+    router: axum::Router,
+    uri: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
         .await
         .unwrap();
     let status = response.status();
@@ -276,4 +345,106 @@ async fn unopenable_type_is_415_and_still_lists() {
         .unwrap()
         .iter()
         .any(|e| e["name"] == "memo.m4a"));
+}
+
+#[tokio::test]
+async fn create_instance_returns_201_and_logs_instance_created_at_seq_1() {
+    let router = app_over(|_| {});
+    let (status, created) =
+        post_json(router.clone(), "/instances", serde_json::json!({ "operator": "tycho" })).await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["operator"], "tycho");
+    assert_eq!(created["lastSeq"], 1);
+    assert!(created["startedAt"].as_str().is_some_and(|s| !s.is_empty()));
+    let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["stream"], id, "stream == id in v0");
+
+    // Proven over HTTP, since that's the only interface this test has: the
+    // event actually landed in the log at seq 1, not merely in the response.
+    let (status, attach) = get_json(router, &format!("/instances/{id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(attach["earliestSeq"], 1);
+    assert_eq!(attach["headSeq"], 1);
+}
+
+#[tokio::test]
+async fn create_instance_with_a_null_operator_is_accepted() {
+    let router = app_over(|_| {});
+    let (status, created) =
+        post_json(router, "/instances", serde_json::json!({ "operator": null })).await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(created["operator"].is_null());
+}
+
+#[tokio::test]
+async fn list_shows_created_instances() {
+    let router = app_over(|_| {});
+    let (_, a) = post_json(router.clone(), "/instances", serde_json::json!({ "operator": "tycho" })).await;
+    let (_, b) =
+        post_json(router.clone(), "/instances", serde_json::json!({ "operator": "kepler" })).await;
+
+    let (status, listed) = get_json(router, "/instances").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let entries = listed.as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    let ids: Vec<&str> = entries.iter().map(|i| i["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&a["id"].as_str().unwrap()));
+    assert!(ids.contains(&b["id"].as_str().unwrap()));
+}
+
+#[tokio::test]
+async fn list_is_empty_before_any_instance_is_created() {
+    let (status, listed) = get_json(app_over(|_| {}), "/instances").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn attach_returns_earliest_and_head_seq_and_the_instance() {
+    let router = app_over(|_| {});
+    let (_, created) =
+        post_json(router.clone(), "/instances", serde_json::json!({ "operator": "tycho" })).await;
+    let id = created["id"].as_str().unwrap();
+
+    let (status, attach) = get_json(router, &format!("/instances/{id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(attach["earliestSeq"], 1);
+    assert_eq!(attach["headSeq"], 1);
+    assert_eq!(attach["instance"]["id"], id);
+    assert_eq!(attach["instance"]["operator"], "tycho");
+}
+
+#[tokio::test]
+async fn attach_on_an_unknown_id_is_404_unknown_instance() {
+    let (status, body) = get_text(app_over(|_| {}), "/instances/does-not-exist").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, "unknown_instance");
+}
+
+#[tokio::test]
+async fn tree_and_file_deny_the_data_dir_when_it_lives_under_the_served_root() {
+    let router = app_with_data_dir_under_root(|_| {});
+
+    let (_, created) =
+        post_json(router.clone(), "/instances", serde_json::json!({ "operator": null })).await;
+    let id = created["id"].as_str().unwrap();
+
+    let (status, json) = get_json(router.clone(), "/tree?path=").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == ".armillary"),
+        "the data dir must never be listed"
+    );
+
+    let (status, body) =
+        get_text(router, &format!("/file?path=.armillary/streams/{id}.jsonl")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, "denied_noise");
 }

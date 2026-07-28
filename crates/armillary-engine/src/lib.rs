@@ -9,6 +9,7 @@ pub mod guard;
 pub mod hash;
 pub mod log;
 pub mod routes;
+pub mod sessions;
 pub mod state;
 
 use axum::{routing::get, Router};
@@ -23,5 +24,7 @@ pub fn app(state: AppState) -> Router {
         .route("/tree", get(routes::tree::tree))
         .route("/file", get(routes::file::file))
         .route("/voicenotes", get(routes::voicenotes::voicenotes))
+        .route("/instances", get(routes::instances::list).post(routes::instances::create))
+        .route("/instances/{id}", get(routes::instances::attach))
         .with_state(shared)
 }

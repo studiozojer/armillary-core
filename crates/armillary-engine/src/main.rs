@@ -1,7 +1,13 @@
-use armillary_engine::{app, state::AppState};
+use armillary_engine::{
+    app,
+    log::store::LogStore,
+    sessions::Sessions,
+    state::{AppState, ModelConfig},
+};
 use clap::Parser;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -21,6 +27,20 @@ struct Args {
     /// Port. 7778 sits beside the Python inbox endpoint on 7777.
     #[arg(long, default_value_t = 7778)]
     port: u16,
+
+    /// Where the event log lives. Defaults to `<root>/.armillary` — a name
+    /// `guard.rs` denies from every Explorer surface (`/tree`, `/file`) no
+    /// matter where it resolves, so session logs are never readable through
+    /// this same service.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+
+    /// Which model pilots sessions. No provider call exists yet (Task 10) —
+    /// this just rides in `AppState` until one does. The credential is never
+    /// a flag (`ANTHROPIC_API_KEY` only, below) so it never lands in shell
+    /// history or `ps`.
+    #[arg(long, default_value = "claude-sonnet-5")]
+    model: String,
 }
 
 #[tokio::main]
@@ -64,6 +84,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let data_dir = args
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| root.join(".armillary"));
+    let store = LogStore::open(&data_dir).map_err(|e| {
+        format!(
+            "failed to open data dir {} — sessions cannot be logged: {e}",
+            data_dir.display()
+        )
+    })?;
+    let sessions = Arc::new(Sessions::new(store));
+    let model = ModelConfig {
+        model: args.model.clone(),
+        // Never a flag, never logged — see the struct doc on `ModelConfig`.
+        api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
+    };
+
     let addr = SocketAddr::new(args.bind, args.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!(
@@ -72,6 +109,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         addr
     );
 
-    axum::serve(listener, app(AppState { root })).await?;
+    axum::serve(
+        listener,
+        app(AppState {
+            root,
+            sessions,
+            model,
+        }),
+    )
+    .await?;
     Ok(())
 }
