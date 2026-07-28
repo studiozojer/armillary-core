@@ -140,6 +140,10 @@ pub async fn send(
 /// `POST /instances/{id}/interrupt` — always 204, whether or not a turn is
 /// running (idempotent): `Sessions::interrupt` is a no-op when there is
 /// nothing claimed.
+///
+/// S-3 (enforceable beats advisory): this is the client's side of the
+/// enforcement mechanism, not a request the model gets to weigh in on — see
+/// `Sessions::interrupt`'s doc for the halt itself.
 pub async fn interrupt(
     State(state): State<SharedState>,
     Path(id): Path<String>,

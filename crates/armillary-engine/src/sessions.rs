@@ -234,6 +234,14 @@ impl Sessions {
     /// Sends the interrupt signal if a turn is currently claimed for
     /// `stream`; otherwise does nothing. Always safe to call — the route
     /// this backs returns 204 either way (interrupt is idempotent).
+    ///
+    /// S-3: enforceable beats advisory. This `watch` channel is the
+    /// enforcement mechanism — the harness halts the loop directly (the
+    /// provider's `select!` on `cancel.changed()`, or its next between-
+    /// fragment check) rather than asking the model to stop nicely. The
+    /// model's only channel is the result handed back (a truncated
+    /// `TurnOutcome`, then the durable `interrupt`/`assistant_message`
+    /// pair); it does not get a vote on whether the stop happens.
     pub fn interrupt(&self, stream: &str) {
         let inner = self.inner.lock().unwrap();
         if let Some(state) = inner.get(stream) {

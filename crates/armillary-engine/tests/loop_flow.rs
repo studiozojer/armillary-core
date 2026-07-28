@@ -545,3 +545,80 @@ async fn a_drifted_boot_event_is_rerecorded_fresh_before_the_turn_runs() {
     let assistant = events.iter().find(|e| e.event_type == "assistant_message").unwrap();
     assert_eq!(assistant.data["interrupted"], false, "the turn recovers and completes normally");
 }
+
+// --- 404 unknown_instance / unknown_event: every mutating endpoint, both
+// the "the stream doesn't exist at all" shape and evict's own "the stream
+// exists but this eventId doesn't" shape. Unverified-by-inspection was the
+// exact gap a review found here — these four pin it directly. ---
+
+#[tokio::test]
+async fn send_to_an_unknown_instance_is_404_unknown_instance() {
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let provider = Arc::new(ScriptedProvider::new(vec!["unused"]));
+    let (addr, _sessions) = spawn(&data_dir, provider).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{addr}/instances/does-not-exist/send"))
+        .json(&serde_json::json!({ "text": "hi", "clientKey": "c1" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(response.text().await.unwrap(), "unknown_instance");
+}
+
+#[tokio::test]
+async fn interrupt_on_an_unknown_instance_is_404_unknown_instance() {
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let provider = Arc::new(ScriptedProvider::new(vec!["unused"]));
+    let (addr, _sessions) = spawn(&data_dir, provider).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{addr}/instances/does-not-exist/interrupt"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(response.text().await.unwrap(), "unknown_instance");
+}
+
+#[tokio::test]
+async fn evict_on_an_unknown_instance_is_404_unknown_instance() {
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let provider = Arc::new(ScriptedProvider::new(vec!["unused"]));
+    let (addr, _sessions) = spawn(&data_dir, provider).await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{addr}/instances/does-not-exist/evict"))
+        .json(&serde_json::json!({ "eventId": "whatever" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(response.text().await.unwrap(), "unknown_instance");
+}
+
+#[tokio::test]
+async fn evict_with_an_event_id_not_in_the_stream_is_404_unknown_event() {
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let provider = Arc::new(ScriptedProvider::new(vec!["ok"]));
+    let (addr, _sessions) = spawn(&data_dir, provider).await;
+    let client = reqwest::Client::new();
+    let id = create_instance(&client, addr).await;
+
+    let response = client
+        .post(format!("http://{addr}/instances/{id}/evict"))
+        .json(&serde_json::json!({ "eventId": "not-a-real-event-id" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(response.text().await.unwrap(), "unknown_event");
+}
