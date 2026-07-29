@@ -48,6 +48,7 @@ async fn spawn(data_dir: &Path, provider: Arc<dyn ModelProvider>) -> (SocketAddr
         sessions: sessions.clone(),
         model: model_config(),
         provider,
+        boot: None,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -500,6 +501,7 @@ async fn a_drifted_boot_event_is_rerecorded_fresh_before_the_turn_runs() {
         sessions: sessions.clone(),
         model: model_config(),
         provider,
+        boot: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

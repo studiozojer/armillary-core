@@ -43,6 +43,7 @@ fn app_over(setup: impl FnOnce(&PathBuf)) -> axum::Router {
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
         provider: Arc::new(KeylessProvider),
+        boot: None,
     })
 }
 
@@ -65,6 +66,7 @@ fn app_with_data_dir_under_root(setup: impl FnOnce(&PathBuf)) -> axum::Router {
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
         provider: Arc::new(KeylessProvider),
+        boot: None,
     })
 }
 

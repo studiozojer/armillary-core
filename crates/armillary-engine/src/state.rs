@@ -36,6 +36,15 @@ pub struct AppState {
     /// `Arc<dyn ModelProvider>` so tests can swap in `ScriptedProvider` (or a
     /// recording double) without touching `main.rs`'s wiring.
     pub provider: Arc<dyn ModelProvider>,
+    /// The router's own boot file, as declared by `[router] boot` — a path
+    /// RELATIVE to `root`, deliberately unresolved here so the containment
+    /// check happens at one place (`projection::resolve_boot_path`) rather
+    /// than at two.
+    ///
+    /// Read once at startup: changing WHICH file boots needs a restart;
+    /// changing its CONTENT does not, since the projection re-reads and
+    /// re-hashes every turn and `rerecord_boot` handles the drift.
+    pub boot: Option<String>,
 }
 
 /// Hand-written because `dyn ModelProvider` has no `Debug` impl of its own
@@ -47,6 +56,7 @@ impl std::fmt::Debug for AppState {
             .field("root", &self.root)
             .field("sessions", &self.sessions)
             .field("model", &self.model)
+            .field("boot", &self.boot)
             .finish_non_exhaustive()
     }
 }

@@ -395,6 +395,7 @@ mod tests {
             sessions: sessions.clone(),
             model: model_config(),
             provider: Arc::new(KeylessProvider),
+            boot: None,
         });
 
         let generation = uuid::Uuid::new_v4().to_string();
@@ -428,6 +429,7 @@ mod tests {
             sessions: sessions.clone(),
             model: model_config(),
             provider: Arc::new(KeylessProvider),
+            boot: None,
         });
 
         let generation = uuid::Uuid::new_v4().to_string();

@@ -194,6 +194,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Which file boots a session is a manifest fact, not a flag — the same
+    // C-3 reasoning as /composition: byte-derived from the manifest, never
+    // re-derived by a model. A parse failure is a warning, not a fatal: the
+    // Explorer must keep serving even when the manifest is malformed.
+    let boot = match armillary_composition::parse_workspace(&root) {
+        Ok(composition) => composition.router.boot,
+        Err(e) => {
+            eprintln!("warning: could not parse the manifest for [router] boot ({e}); sessions will start with no system prompt");
+            None
+        }
+    };
+    match &boot {
+        Some(path) => eprintln!("boot: [router] boot = {path:?}"),
+        None => eprintln!("boot: no [router] boot declared — sessions start with no system prompt"),
+    }
+
     let data_dir = args
         .data_dir
         .clone()
@@ -263,6 +279,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sessions,
             model,
             provider,
+            boot,
         }),
     )
     .await?;

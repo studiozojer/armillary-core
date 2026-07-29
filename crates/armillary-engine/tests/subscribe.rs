@@ -70,6 +70,7 @@ async fn spawn(data_dir: &std::path::Path) -> (SocketAddr, Arc<Sessions>) {
         sessions: sessions.clone(),
         model: model_config(),
         provider: Arc::new(KeylessProvider),
+        boot: None,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
