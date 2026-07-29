@@ -70,6 +70,25 @@ fn app_with_data_dir_under_root(setup: impl FnOnce(&PathBuf)) -> axum::Router {
     })
 }
 
+/// Like `app_over`, but with `[router] boot` declared. The boot file is
+/// written into the served root, since a boot path must resolve under it.
+fn app_with_boot(boot_rel: &str, contents: &str) -> axum::Router {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.keep();
+    std::fs::write(root.join(boot_rel), contents).unwrap();
+
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let store = LogStore::open(&data_dir).unwrap();
+
+    app(AppState {
+        root: root.canonicalize().unwrap(),
+        sessions: Arc::new(Sessions::new(store)),
+        model: model_config(),
+        provider: Arc::new(KeylessProvider),
+        boot: Some(boot_rel.to_string()),
+    })
+}
+
 async fn get_json(router: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
     let response = router
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -105,6 +124,22 @@ async fn post_json(
         .unwrap();
     let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, json)
+}
+
+/// Creates an instance, then attaches to it — returning the attach JSON
+/// (`headSeq`/`earliestSeq`/`instance`) so callers can read how many events
+/// actually landed on the stream, not just what `create`'s own response
+/// claims (which deliberately still reports `lastSeq: 1` — see `create`'s
+/// doc comment).
+async fn create_and_attach(router: axum::Router) -> serde_json::Value {
+    let (status, created) =
+        post_json(router.clone(), "/instances", serde_json::json!({ "operator": null })).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let (status, attach) = get_json(router, &format!("/instances/{id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    attach
 }
 
 /// Error responses are `(StatusCode, String)` — plain text, not JSON — so
@@ -452,4 +487,59 @@ async fn tree_and_file_deny_the_data_dir_when_it_lives_under_the_served_root() {
         get_text(router, &format!("/file?path=.armillary/streams/{id}.jsonl")).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body, "denied_noise");
+}
+
+#[tokio::test]
+async fn create_appends_a_boot_event_after_instance_created() {
+    let contents = "# Getting started\n\nAn operator is an identity.\n";
+    let router = app_with_boot("getting-started.md", contents);
+    let attach = create_and_attach(router).await;
+    // instance_created is seq 1, boot is seq 2 — the ordering the instance
+    // registry depends on (instance_from_first_event requires seq 1 to be
+    // instance_created).
+    assert_eq!(attach["headSeq"], 2);
+    assert_eq!(attach["earliestSeq"], 1);
+}
+
+#[tokio::test]
+async fn create_without_a_declared_boot_appends_only_instance_created() {
+    // C-4: presence-gated. A bare clone must behave exactly as before.
+    let attach = create_and_attach(app_over(|_root| {})).await;
+    assert_eq!(attach["headSeq"], 1);
+}
+
+#[tokio::test]
+async fn an_unreadable_boot_source_still_creates_the_instance() {
+    // Skip-not-fail: an instance that works without identity beats an
+    // instance that cannot be created (KeylessProvider's posture).
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.keep();
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let store = LogStore::open(&data_dir).unwrap();
+    let router = app(AppState {
+        root: root.canonicalize().unwrap(),
+        sessions: Arc::new(Sessions::new(store)),
+        model: model_config(),
+        provider: Arc::new(KeylessProvider),
+        boot: Some("does-not-exist.md".to_string()),
+    });
+    let attach = create_and_attach(router).await;
+    assert_eq!(attach["headSeq"], 1);
+}
+
+#[tokio::test]
+async fn a_boot_path_escaping_root_is_skipped_not_honored() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.keep();
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let store = LogStore::open(&data_dir).unwrap();
+    let router = app(AppState {
+        root: root.canonicalize().unwrap(),
+        sessions: Arc::new(Sessions::new(store)),
+        model: model_config(),
+        provider: Arc::new(KeylessProvider),
+        boot: Some("../escaped.md".to_string()),
+    });
+    let attach = create_and_attach(router).await;
+    assert_eq!(attach["headSeq"], 1);
 }

@@ -111,6 +111,76 @@ fn attach_info(store: &LogStore, id: &str) -> Result<AttachInfo, SessionError> {
     })
 }
 
+/// Appends the router's `boot` event, or logs and skips.
+///
+/// **Skip, never fail.** An instance that works without identity beats an
+/// instance that cannot be created — the same posture as `KeylessProvider`
+/// (the engine serves regardless; you discover the gap at first use). The
+/// accepted cost, recorded in the design: a misconfigured boot path is
+/// invisible from the phone, indistinguishable from having declared none.
+/// Phase 2 makes it a durable event.
+///
+/// Reuses `projection::resolve_boot_path` rather than re-deriving root
+/// containment — that function is `pub(crate)` for exactly this reason, so an
+/// absolute or `..`-laden path is rejected by the same code the projection
+/// trusts. Mirrors `loop_::rerecord_boot`'s shape (resolve off-thread, then
+/// `tokio::fs::read`) since both call sites read the same kind of file for
+/// the same reason.
+async fn append_boot_event(state: &SharedState, stream: &str, rel: &str) {
+    let root = state.root.clone();
+    let rel_owned = rel.to_string();
+    let resolved = match tokio::task::spawn_blocking(move || {
+        crate::projection::resolve_boot_path(&root, &rel_owned)
+    })
+    .await
+    {
+        Ok(Ok(path)) => path,
+        _ => {
+            eprintln!(
+                "warning: [router] boot = {rel:?} does not resolve under the workspace root — \
+                 creating instance {stream} with no boot event (it will have no system prompt)"
+            );
+            return;
+        }
+    };
+
+    let bytes = match tokio::fs::read(&resolved).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!(
+                "warning: [router] boot = {rel:?} is unreadable ({e}) — creating instance \
+                 {stream} with no boot event (it will have no system prompt)"
+            );
+            return;
+        }
+    };
+    let sha256 = crate::hash::sha256_hex(&bytes);
+
+    let sessions = state.sessions.clone();
+    let stream_owned = stream.to_string();
+    let path_for_event = rel.to_string();
+    let appended = tokio::task::spawn_blocking(move || {
+        sessions.append(
+            &stream_owned,
+            NewEvent {
+                actor: Actor {
+                    role: Role::System,
+                    instance: None,
+                },
+                event_type: "boot".to_string(),
+                data: serde_json::json!({ "path": path_for_event, "sha256": sha256 }),
+            },
+        )
+    })
+    .await;
+
+    match appended {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => eprintln!("warning: failed to append the boot event for {stream}: {e:?}"),
+        Err(_) => eprintln!("warning: the boot append task panicked for {stream}"),
+    }
+}
+
 pub async fn create(
     State(state): State<SharedState>,
     Json(body): Json<CreateRequest>,
@@ -138,6 +208,17 @@ pub async fn create(
     })
     .await?;
 
+    // AFTER instance_created, never before: instance_from_first_event requires
+    // a stream's first event to be instance_created, and list_instances skips
+    // any stream where it is not. Boot-first would make every instance
+    // invisible to the list screen.
+    if let Some(rel) = state.boot.clone() {
+        append_boot_event(&state, &id, &rel).await;
+    }
+
+    // last_seq stays ev.seq (1, from instance_created) even when a boot event
+    // just landed at seq 2: this response describes the instance as CREATED,
+    // not its current head. A client that wants the head calls attach.
     let instance = instance_from_first_event(&id, &ev, ev.seq).ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
         "log_write_failed".to_string(),
