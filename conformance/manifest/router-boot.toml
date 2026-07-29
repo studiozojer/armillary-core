@@ -1,0 +1,3 @@
+[router]
+contains = ["CLAUDE.md", "README.md"]
+boot = "public-boot.md"

@@ -1,4 +1,4 @@
-use crate::{Composition, CompositionError, Module, Protocol};
+use crate::{Composition, CompositionError, Module, Protocol, Router};
 use std::collections::HashSet;
 
 pub(crate) trait Named {
@@ -62,6 +62,24 @@ fn union<T: Named>(
     Ok(base)
 }
 
+/// C-6 for a TABLE rather than an array-of-tables: `[router]` merges
+/// FIELD-WISE, overlay winning per field — not wholesale. A machine-local
+/// overlay must be able to set `boot` without restating `contains`, which a
+/// wholesale replace would silently erase.
+///
+/// No collision error here, unlike the `[[...]]` sections: those key on
+/// `name` and a duplicate is genuinely ambiguous, whereas `[router]` is a
+/// singleton whose whole purpose is per-machine override.
+fn merge_router(base: Router, overlay: Router) -> Router {
+    let mut extra = base.extra;
+    extra.extend(overlay.extra);
+    Router {
+        contains: if overlay.contains.is_empty() { base.contains } else { overlay.contains },
+        boot: overlay.boot.or(base.boot),
+        extra,
+    }
+}
+
 /// C-6: the overlay merges additively per section, base first then overlay,
 /// preserving declaration order within each. A `name` collision within a
 /// section is an error — never a silent override, never a silent duplicate.
@@ -84,5 +102,6 @@ pub fn merge(base: Composition, overlay: Composition) -> Result<Composition, Com
         commons: union("commons", base.commons, overlay.commons)?,
         repos: union("repos", base.repos, overlay.repos)?,
         protocols: union("protocols", base.protocols, overlay.protocols)?,
+        router: merge_router(base.router, overlay.router),
     })
 }
