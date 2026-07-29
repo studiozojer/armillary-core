@@ -72,21 +72,31 @@ fn app_with_data_dir_under_root(setup: impl FnOnce(&PathBuf)) -> axum::Router {
 
 /// Like `app_over`, but with `[router] boot` declared. The boot file is
 /// written into the served root, since a boot path must resolve under it.
-fn app_with_boot(boot_rel: &str, contents: &str) -> axum::Router {
+///
+/// Returns the root and the session data dir alongside the router — `boot`'s
+/// stricter tests need to read the stream's raw events back (identity, not
+/// just count) or hand them to `project_context` directly (the end-to-end
+/// property this task exists to deliver), and `AppState`'s `Sessions` is
+/// moved into the router with no way to get it back out. Reopening a fresh
+/// `LogStore` over the same `data_dir` afterward — the same pattern
+/// `loop_flow.rs`'s crash-resume test uses — reads what's actually durable.
+fn app_with_boot(boot_rel: &str, contents: &str) -> (axum::Router, PathBuf, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.keep();
     std::fs::write(root.join(boot_rel), contents).unwrap();
+    let root = root.canonicalize().unwrap();
 
     let data_dir = tempfile::tempdir().unwrap().keep();
     let store = LogStore::open(&data_dir).unwrap();
 
-    app(AppState {
-        root: root.canonicalize().unwrap(),
+    let router = app(AppState {
+        root: root.clone(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
         provider: Arc::new(KeylessProvider),
         boot: Some(boot_rel.to_string()),
-    })
+    });
+    (router, root, data_dir)
 }
 
 async fn get_json(router: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
@@ -492,13 +502,50 @@ async fn tree_and_file_deny_the_data_dir_when_it_lives_under_the_served_root() {
 #[tokio::test]
 async fn create_appends_a_boot_event_after_instance_created() {
     let contents = "# Getting started\n\nAn operator is an identity.\n";
-    let router = app_with_boot("getting-started.md", contents);
+    let (router, _root, data_dir) = app_with_boot("getting-started.md", contents);
     let attach = create_and_attach(router).await;
     // instance_created is seq 1, boot is seq 2 — the ordering the instance
     // registry depends on (instance_from_first_event requires seq 1 to be
     // instance_created).
     assert_eq!(attach["headSeq"], 2);
     assert_eq!(attach["earliestSeq"], 1);
+
+    // `headSeq == 2` alone would pass if `create` appended ANY second event
+    // — read the stream back and check what actually landed, and in what
+    // order, so an inversion (boot appended before instance_created) fails
+    // HERE directly, rather than only incidentally via some other test's
+    // 404 surfacing as "404 != 200".
+    let id = attach["instance"]["id"].as_str().unwrap().to_string();
+    let store = LogStore::open(&data_dir).unwrap();
+    let events = store.read_from(&id, 0).unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].event_type, "instance_created");
+    assert_eq!(events[1].event_type, "boot");
+    assert_eq!(events[1].data["path"], "getting-started.md");
+    assert_eq!(
+        events[1].data["sha256"],
+        armillary_engine::hash::sha256_hex(contents.as_bytes())
+    );
+}
+
+#[tokio::test]
+async fn a_created_instances_boot_event_projects_to_a_system_prompt() {
+    // The end-to-end property this task exists to deliver: create → the
+    // boot event lands durably → project_context reads it back as
+    // `system: Some(...)`. This is the one thing no other test in this file
+    // actually connects, and it exercises the relative-path storage, the
+    // sha, the event type and the ordering together — a non-UTF-8 boot file
+    // (guarded against separately below) would have failed exactly here,
+    // as `BootUnreadable` rather than a system prompt.
+    let contents = "# Getting started\n\nAn operator is an identity.\n";
+    let (router, root, data_dir) = app_with_boot("getting-started.md", contents);
+    let attach = create_and_attach(router).await;
+    let id = attach["instance"]["id"].as_str().unwrap().to_string();
+
+    let store = LogStore::open(&data_dir).unwrap();
+    let events = store.read_from(&id, 0).unwrap();
+    let turn = armillary_engine::projection::project_context(&events, &root).unwrap();
+    assert_eq!(turn.system, Some(contents.to_string()));
 }
 
 #[tokio::test]
@@ -528,7 +575,66 @@ async fn an_unreadable_boot_source_still_creates_the_instance() {
 }
 
 #[tokio::test]
+async fn a_non_utf8_boot_source_is_skipped_not_appended() {
+    // Appending a boot event over bytes that don't decode would turn a
+    // benign misconfiguration into every future turn on this stream failing
+    // forever (projection.rs's String::from_utf8 failure routes to
+    // fail_turn, not to drift-recovery) — skip-never-fail demands this is
+    // caught before the append, not discovered at first use.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.keep();
+    std::fs::write(root.join("boot.md"), [0xff, 0xfe, 0x00, 0xff]).unwrap();
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let store = LogStore::open(&data_dir).unwrap();
+    let router = app(AppState {
+        root: root.canonicalize().unwrap(),
+        sessions: Arc::new(Sessions::new(store)),
+        model: model_config(),
+        provider: Arc::new(KeylessProvider),
+        boot: Some("boot.md".to_string()),
+    });
+    let attach = create_and_attach(router).await;
+    assert_eq!(attach["headSeq"], 1);
+}
+
+#[tokio::test]
+async fn a_boot_path_declared_absolute_is_refused_not_relativized() {
+    // The manifest documents `[router] boot` as relative to root. An
+    // absolute path that happens to sit inside root would still pass
+    // resolve_boot_path's containment check — refused here instead, rather
+    // than silently rewritten, so a misconfiguration doesn't hide.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.keep();
+    let root = root.canonicalize().unwrap();
+    std::fs::write(root.join("boot.md"), "# hello\n").unwrap();
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let store = LogStore::open(&data_dir).unwrap();
+    let router = app(AppState {
+        root: root.clone(),
+        sessions: Arc::new(Sessions::new(store)),
+        model: model_config(),
+        provider: Arc::new(KeylessProvider),
+        boot: Some(root.join("boot.md").to_string_lossy().to_string()),
+    });
+    let attach = create_and_attach(router).await;
+    assert_eq!(attach["headSeq"], 1);
+}
+
+#[tokio::test]
 async fn a_boot_path_escaping_root_is_skipped_not_honored() {
+    // A REAL containment escape — mirroring projection.rs's
+    // `boot_path_escaping_root_is_boot_unreadable` — not merely a missing
+    // file. A file that exists in a SIBLING tempdir, reached via
+    // `../<sibling-name>/secret.md`: a nonexistent `../escaped.md` would
+    // fail at `canonicalize()` before the `starts_with` containment check
+    // in `resolve_boot_path` is ever reached, making that version of this
+    // test pass even with the containment check deleted entirely.
+    let outside = tempfile::tempdir().unwrap();
+    let outside_root = outside.keep();
+    std::fs::write(outside_root.join("secret.md"), b"nope").unwrap();
+    let outside_name = outside_root.file_name().unwrap().to_string_lossy().to_string();
+    let escape_path = format!("../{outside_name}/secret.md");
+
     let dir = tempfile::tempdir().unwrap();
     let root = dir.keep();
     let data_dir = tempfile::tempdir().unwrap().keep();
@@ -538,7 +644,7 @@ async fn a_boot_path_escaping_root_is_skipped_not_honored() {
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
         provider: Arc::new(KeylessProvider),
-        boot: Some("../escaped.md".to_string()),
+        boot: Some(escape_path),
     });
     let attach = create_and_attach(router).await;
     assert_eq!(attach["headSeq"], 1);

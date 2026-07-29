@@ -127,6 +127,22 @@ fn attach_info(store: &LogStore, id: &str) -> Result<AttachInfo, SessionError> {
 /// `tokio::fs::read`) since both call sites read the same kind of file for
 /// the same reason.
 async fn append_boot_event(state: &SharedState, stream: &str, rel: &str) {
+    // `constitution/composition.md` (Task 1) documents `[router] boot` as a
+    // path RELATIVE to root. An absolute path that happens to sit inside
+    // root would still pass `resolve_boot_path`'s containment check below —
+    // and then get written verbatim into a durable, portable log, where it
+    // would break on any machine whose root sits somewhere else. Refused
+    // rather than silently relativized (e.g. via `strip_prefix`): rewriting
+    // it would hide a misconfiguration instead of surfacing it.
+    if std::path::Path::new(rel).is_absolute() {
+        eprintln!(
+            "warning: [router] boot = {rel:?} is an absolute path, but this key is documented \
+             as relative to the workspace root — creating instance {stream} with no boot event \
+             (it will have no system prompt)"
+        );
+        return;
+    }
+
     let root = state.root.clone();
     let rel_owned = rel.to_string();
     let resolved = match tokio::task::spawn_blocking(move || {
@@ -137,8 +153,9 @@ async fn append_boot_event(state: &SharedState, stream: &str, rel: &str) {
         Ok(Ok(path)) => path,
         _ => {
             eprintln!(
-                "warning: [router] boot = {rel:?} does not resolve under the workspace root — \
-                 creating instance {stream} with no boot event (it will have no system prompt)"
+                "warning: [router] boot = {rel:?} cannot be resolved (missing, or outside the \
+                 workspace root) — creating instance {stream} with no boot event (it will have \
+                 no system prompt)"
             );
             return;
         }
@@ -154,6 +171,24 @@ async fn append_boot_event(state: &SharedState, stream: &str, rel: &str) {
             return;
         }
     };
+
+    // A non-UTF-8 boot file must never be appended: `projection.rs`'s "boot"
+    // arm decodes the bytes with `String::from_utf8`, and a decode failure
+    // there surfaces as `ProjectionError::BootUnreadable`, which
+    // `loop_::run_turn` routes to `fail_turn(..., "boot_unreadable", ...)` —
+    // NOT to the drift-recovery branch (only a SHA mismatch on an
+    // already-recorded event re-records). Appending an event that can never
+    // be read back would turn a benign misconfiguration into every future
+    // turn on this stream failing forever — the exact inversion of
+    // skip-never-fail this function exists to avoid.
+    if std::str::from_utf8(&bytes).is_err() {
+        eprintln!(
+            "warning: [router] boot = {rel:?} is not valid UTF-8 — creating instance {stream} \
+             with no boot event (appending it would make every turn on this stream fail)"
+        );
+        return;
+    }
+
     let sha256 = crate::hash::sha256_hex(&bytes);
 
     let sessions = state.sessions.clone();
@@ -212,8 +247,8 @@ pub async fn create(
     // a stream's first event to be instance_created, and list_instances skips
     // any stream where it is not. Boot-first would make every instance
     // invisible to the list screen.
-    if let Some(rel) = state.boot.clone() {
-        append_boot_event(&state, &id, &rel).await;
+    if let Some(rel) = state.boot.as_deref() {
+        append_boot_event(&state, &id, rel).await;
     }
 
     // last_seq stays ev.seq (1, from instance_created) even when a boot event
