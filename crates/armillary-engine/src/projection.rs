@@ -114,9 +114,16 @@ const HANDLED_TYPES: &[&str] = &[
 ];
 
 /// Join `rel` under `root` and require the canonical result to stay under
-/// `root` — an absolute or `..`-laden `data.path` is not a different kind of
-/// error, it is the same `BootUnreadable` a missing file produces, since
-/// neither is ever a legitimate boot source.
+/// `root` — a `data.path` that escapes root is not a different kind of error, it
+/// is the same `BootUnreadable` a missing file produces, since neither is ever a
+/// legitimate boot source.
+///
+/// Containment is ALL this checks. `Path::join` with an absolute argument
+/// replaces the base, so an absolute `data.path` pointing inside root passes here
+/// — refusing absolute paths is the caller's job (see
+/// `routes::instances::append_boot_event`, which does it before ever appending
+/// one). `guard::resolve` is the resolver that rejects absolute paths and `..`
+/// components outright; unifying on it is parked for Phase 2.
 ///
 /// `pub(crate)` (not private): the loop (`loop_.rs`) re-records a fresh
 /// `boot` event on `BootDrift` by re-reading the SAME path this function

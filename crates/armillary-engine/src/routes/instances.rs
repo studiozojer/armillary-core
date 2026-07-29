@@ -121,9 +121,21 @@ fn attach_info(store: &LogStore, id: &str) -> Result<AttachInfo, SessionError> {
 /// Phase 2 makes it a durable event.
 ///
 /// Reuses `projection::resolve_boot_path` rather than re-deriving root
-/// containment — that function is `pub(crate)` for exactly this reason, so an
-/// absolute or `..`-laden path is rejected by the same code the projection
-/// trusts. Mirrors `loop_::rerecord_boot`'s shape (resolve off-thread, then
+/// containment — that function is `pub(crate)` for exactly this reason, so what
+/// this call site accepts is exactly what the projection will later accept.
+///
+/// `resolve_boot_path` is NOT a full path guard, and this function must not be
+/// read as inheriting one. All it does is `root.join(rel)`, `canonicalize`, and
+/// `starts_with(root)`. Because `Path::join` with an absolute argument *replaces*
+/// the base, an absolute path that happens to sit inside root canonicalizes to
+/// something under root and passes. That is precisely why the caller-side
+/// absolute-path refusal below exists — it is the only thing rejecting an
+/// absolute `[router] boot`, and any future caller of `resolve_boot_path` needs
+/// its own. (`guard::resolve` is the resolver that does reject absolute paths and
+/// `..` components before canonicalizing; unifying the three resolvers on it is
+/// parked for Phase 2.)
+///
+/// Mirrors `loop_::rerecord_boot`'s shape (resolve off-thread, then
 /// `tokio::fs::read`) since both call sites read the same kind of file for
 /// the same reason.
 async fn append_boot_event(state: &SharedState, stream: &str, rel: &str) {

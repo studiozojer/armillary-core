@@ -60,6 +60,42 @@ async fn spawn(data_dir: &Path, provider: Arc<dyn ModelProvider>) -> (SocketAddr
     (addr, sessions)
 }
 
+/// Like `spawn`, but the workspace root holds a boot file at `boot_rel`, and
+/// `AppState.boot` carries `declared`.
+///
+/// Returns the root so a test can mutate the boot file mid-stream — the only way
+/// to make the two `boot` writers (`routes::instances::append_boot_event` at
+/// create, `loop_::rerecord_boot` on drift) both fire on one real stream.
+async fn spawn_with_boot(
+    data_dir: &Path,
+    provider: Arc<dyn ModelProvider>,
+    boot_rel: &str,
+    contents: &str,
+    declared: Option<&str>,
+) -> (SocketAddr, Arc<Sessions>, std::path::PathBuf) {
+    let store = LogStore::open(data_dir).unwrap();
+    let sessions = Arc::new(Sessions::new(store));
+    let root = tempfile::tempdir().unwrap().keep();
+    std::fs::write(root.join(boot_rel), contents).unwrap();
+    let root = root.canonicalize().unwrap();
+
+    let state = AppState {
+        root: root.clone(),
+        sessions: sessions.clone(),
+        model: model_config(),
+        provider,
+        boot: declared.map(|s| s.to_string()),
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app(state)).await;
+    });
+
+    (addr, sessions, root)
+}
+
 /// Splits decoded SSE body text into `(event, data)` frames on the blank
 /// line that terminates each one — the same shape `tests/subscribe.rs`'s
 /// `SseFramer` uses, just fed from `reqwest`'s already-de-chunked bytes
@@ -491,23 +527,11 @@ async fn crash_resume_the_log_survives_dropping_and_rebuilding_the_whole_process
 async fn a_drifted_boot_event_is_rerecorded_fresh_before_the_turn_runs() {
     let data_dir = tempfile::tempdir().unwrap().keep();
     let provider = Arc::new(ScriptedProvider::new(vec!["ok"]));
-    let root_dir = tempfile::tempdir().unwrap();
-    std::fs::write(root_dir.path().join("boot.md"), "# current boot content").unwrap();
-
-    let store = LogStore::open(&data_dir).unwrap();
-    let sessions = Arc::new(Sessions::new(store));
-    let state = AppState {
-        root: root_dir.path().canonicalize().unwrap(),
-        sessions: sessions.clone(),
-        model: model_config(),
-        provider,
-        boot: None,
-    };
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app(state)).await;
-    });
+    // `boot: None` deliberately: this test isolates the RECOVERY path, so the
+    // stream's only boot event is the hand-written drifted one below. The two
+    // writers meeting on one stream is the test that follows.
+    let (addr, sessions, _root) =
+        spawn_with_boot(&data_dir, provider, "boot.md", "# current boot content", None).await;
 
     let client = reqwest::Client::new();
     let id = create_instance(&client, addr).await;
@@ -546,6 +570,81 @@ async fn a_drifted_boot_event_is_rerecorded_fresh_before_the_turn_runs() {
 
     let assistant = events.iter().find(|e| e.event_type == "assistant_message").unwrap();
     assert_eq!(assistant.data["interrupted"], false, "the turn recovers and completes normally");
+}
+
+// --- the two `boot` writers on ONE real stream ---
+
+/// There are two producers of `boot` events — `routes::instances::append_boot_event`
+/// at instance creation, and `loop_::rerecord_boot` on `BootDrift` — and until this
+/// test each was only ever proven in isolation (the drift test above hand-appends
+/// its own first boot event and runs with `boot: None`). Nothing showed the two
+/// agreeing on a real stream: same `path` spelling, advancing `sha256`, and a
+/// projection that ends up on the CURRENT file rather than the recorded one.
+///
+/// It also retires a manual device-probe step: "edit the boot file, then send from
+/// the phone and check the session picked up the edit" is now CI.
+#[tokio::test]
+async fn both_boot_writers_land_on_one_stream_and_the_turn_reads_the_current_file() {
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let recorder = Arc::new(RecordingProvider::new(ScriptedProvider::new(vec!["ok"])));
+    let (addr, sessions, root) = spawn_with_boot(
+        &data_dir,
+        recorder.clone(),
+        "boot.md",
+        "# first boot content",
+        Some("boot.md"),
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    let id = create_instance(&client, addr).await;
+
+    // Writer one: the create path, no hand-appending anywhere in this test.
+    let at_create = sessions.store().read_from(&id, 0).unwrap();
+    let boots: Vec<&EventEnvelope> = at_create.iter().filter(|e| e.event_type == "boot").collect();
+    assert_eq!(boots.len(), 1, "create appends exactly one boot event: {at_create:?}");
+    assert_eq!(boots[0].data["path"], "boot.md");
+    assert_eq!(
+        boots[0].data["sha256"],
+        armillary_engine::hash::sha256_hex(b"# first boot content")
+    );
+
+    // The workspace edits its boot file, the way a real one does between sessions.
+    std::fs::write(root.join("boot.md"), "# second boot content").unwrap();
+
+    client
+        .post(format!("http://{addr}/instances/{id}/send"))
+        .json(&serde_json::json!({ "text": "hi", "clientKey": "c1" }))
+        .send()
+        .await
+        .unwrap();
+    wait_for_assistant_message(&sessions, &id, 1).await;
+
+    // Writer two: drift recovery, on the same stream, appending rather than
+    // rewriting — P-1's append-only truth, with the projection's last-boot-wins
+    // fold deciding which one is current.
+    let events = sessions.store().read_from(&id, 0).unwrap();
+    let boots: Vec<&EventEnvelope> = events.iter().filter(|e| e.event_type == "boot").collect();
+    assert_eq!(boots.len(), 2, "both writers must be on the stream: {events:?}");
+    assert_eq!(
+        boots[0].data["path"], boots[1].data["path"],
+        "both writers record the same declared path spelling"
+    );
+    assert_ne!(
+        boots[0].data["sha256"], boots[1].data["sha256"],
+        "the re-record must carry a DIFFERENT sha — otherwise it is not re-reading disk"
+    );
+    assert_eq!(
+        boots[1].data["sha256"],
+        armillary_engine::hash::sha256_hex(b"# second boot content")
+    );
+
+    // And the system prompt the provider was actually handed is the current file.
+    let last_turn = recorder.last_turn.lock().unwrap().clone().expect("a turn was recorded");
+    assert_eq!(last_turn.system.as_deref(), Some("# second boot content"));
+
+    let assistant = events.iter().find(|e| e.event_type == "assistant_message").unwrap();
+    assert_eq!(assistant.data["interrupted"], false, "the turn completes normally");
 }
 
 // --- 404 unknown_instance / unknown_event: every mutating endpoint, both

@@ -163,6 +163,36 @@ fn resolve_api_key(env_val: Option<String>, key_file: &Path) -> Option<String> {
     }
 }
 
+/// Reads `[router] boot` from the workspace at `root` — the declaration that
+/// gives a session its system prompt.
+///
+/// Which file boots a session is a manifest fact, not a flag — the same C-3
+/// reasoning as `/composition`: byte-derived from the manifest, never re-derived
+/// by a model. `parse_workspace` is what applies the C-6 overlay, so a private
+/// `modules.local.toml` can name a different boot file than the public
+/// `modules.toml` and win.
+///
+/// A parse failure is a warning, not a fatal: the Explorer must keep serving even
+/// when the manifest is malformed. The cost of the warning posture is that the
+/// session starts with no system prompt, which is why it says so.
+///
+/// A pure, testable function rather than inline in `main()` — like
+/// `bind_permitted` and `resolve_api_key` above. Reading the *right* field of the
+/// *merged* composition is the entire join between "the manifest declares a boot
+/// file" and "the instance records one"; inline in `main()` it would be
+/// unreachable from any test, and reading `router.contains.first()`, or skipping
+/// the overlay, would present as "the phone still has no system prompt" rather
+/// than as a failing test.
+fn declared_boot(root: &Path) -> Option<String> {
+    match armillary_composition::parse_workspace(root) {
+        Ok(composition) => composition.router.boot,
+        Err(e) => {
+            eprintln!("warning: could not parse the manifest for [router] boot ({e}); sessions will start with no system prompt");
+            None
+        }
+    }
+}
+
 /// The per-machine key file's real path: `$HOME/.config/armillary/anthropic-key`.
 /// Built from `HOME` directly (`std::env::var_os`, no path-lookup crate) —
 /// see `resolve_api_key`'s doc for why this file's home was chosen.
@@ -194,17 +224,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Which file boots a session is a manifest fact, not a flag — the same
-    // C-3 reasoning as /composition: byte-derived from the manifest, never
-    // re-derived by a model. A parse failure is a warning, not a fatal: the
-    // Explorer must keep serving even when the manifest is malformed.
-    let boot = match armillary_composition::parse_workspace(&root) {
-        Ok(composition) => composition.router.boot,
-        Err(e) => {
-            eprintln!("warning: could not parse the manifest for [router] boot ({e}); sessions will start with no system prompt");
-            None
-        }
-    };
+    // See `declared_boot`'s doc: a manifest fact, overlay-merged, warn-not-fatal.
+    let boot = declared_boot(&root);
     match &boot {
         Some(path) => eprintln!("boot: [router] boot = {path:?}"),
         None => eprintln!("boot: no [router] boot declared — sessions start with no system prompt"),
@@ -409,5 +430,90 @@ mod tests {
         let path = write_key_file(dir.path(), "file-key");
         let got = resolve_api_key(Some(String::new()), &path);
         assert_eq!(got, Some("file-key".to_string()));
+    }
+
+    // declared_boot: the join between a manifest on disk and `AppState.boot`.
+    // Everything else in the suite either passes `boot: None` or hand-writes a
+    // `Some(..)`, so without these the engine could read the wrong field, or read
+    // only `modules.toml`, and stay green.
+
+    #[test]
+    fn declared_boot_reads_the_router_boot_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("modules.toml"),
+            "[router]\ncontains = [\"CLAUDE.md\"]\nboot = \"getting-started.md\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            declared_boot(dir.path()),
+            Some("getting-started.md".to_string())
+        );
+    }
+
+    #[test]
+    fn declared_boot_is_none_when_the_router_declares_only_contains() {
+        // The failure mode this pins: reading `router.contains.first()` instead of
+        // `router.boot` would return "CLAUDE.md" here and look plausible.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("modules.toml"),
+            "[router]\ncontains = [\"CLAUDE.md\"]\n",
+        )
+        .unwrap();
+        assert_eq!(declared_boot(dir.path()), None);
+    }
+
+    #[test]
+    fn declared_boot_is_none_when_nothing_is_composed() {
+        let dir = tempfile::tempdir().unwrap();
+        // C-4: no modules.toml at all is a working host, not an error.
+        assert_eq!(declared_boot(dir.path()), None);
+    }
+
+    #[test]
+    fn declared_boot_lets_the_private_overlay_win() {
+        // C-6 at the engine level, not only as a composition-crate fixture: the
+        // whole point of a per-machine overlay is that it can name a different
+        // boot file, so reading `modules.toml` alone would be silently wrong.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("modules.toml"),
+            "[router]\ncontains = [\"CLAUDE.md\"]\nboot = \"public-boot.md\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("modules.local.toml"),
+            "[router]\nboot = \"getting-started.md\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            declared_boot(dir.path()),
+            Some("getting-started.md".to_string())
+        );
+    }
+
+    #[test]
+    fn declared_boot_takes_the_base_when_the_overlay_is_silent_about_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("modules.toml"),
+            "[router]\nboot = \"public-boot.md\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("modules.local.toml"),
+            "[[repos]]\nname = \"kairos\"\npath = \"repos/kairos\"\n",
+        )
+        .unwrap();
+        assert_eq!(declared_boot(dir.path()), Some("public-boot.md".to_string()));
+    }
+
+    #[test]
+    fn declared_boot_warns_rather_than_aborting_on_a_malformed_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("modules.toml"), "[router\nboot = ").unwrap();
+        // The Explorer must keep serving a workspace whose manifest is broken.
+        assert_eq!(declared_boot(dir.path()), None);
     }
 }
