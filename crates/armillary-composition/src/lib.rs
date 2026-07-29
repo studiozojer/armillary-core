@@ -278,4 +278,16 @@ boot = "getting-started.md"
         let merged = crate::merge(base, overlay).unwrap();
         assert_eq!(merged.router.boot.as_deref(), Some("local.md"));
     }
+
+    #[test]
+    fn overlay_router_contains_does_not_erase_the_base_boot() {
+        // The mirror of `overlay_router_merges_field_wise_not_wholesale`. Field-wise
+        // is a claim about BOTH fields, and a refactor that made `contains` the
+        // trigger for replacing the whole table would pass every other test here.
+        let base = parse_manifest_str("[router]\nboot = \"getting-started.md\"\n").unwrap();
+        let overlay = parse_manifest_str("[router]\ncontains = [\"CLAUDE.md\"]\n").unwrap();
+        let merged = crate::merge(base, overlay).unwrap();
+        assert_eq!(merged.router.boot.as_deref(), Some("getting-started.md"));
+        assert_eq!(merged.router.contains, vec!["CLAUDE.md"]);
+    }
 }
