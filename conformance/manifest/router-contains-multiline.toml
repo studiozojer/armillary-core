@@ -1,0 +1,9 @@
+[router]
+contains = [
+  "CLAUDE.md",
+  "README.md",
+] # comment after the closing bracket; note the trailing comma above
+
+[[operators]]
+name = "tycho"
+path = "operators/tycho"
