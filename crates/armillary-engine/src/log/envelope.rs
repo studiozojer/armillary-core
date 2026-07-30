@@ -20,6 +20,8 @@ pub const DURABLE_TYPES: &[&str] = &[
     "context_evict",
     "dispatch",
     "return",
+    "tool_use",
+    "tool_result",
 ];
 
 /// `{role, instance}` — I-2 requires actor be structured, never a free
