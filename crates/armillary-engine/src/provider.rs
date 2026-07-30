@@ -19,10 +19,35 @@ use futures_util::StreamExt;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
-/// `max_tokens: 4096` below is a v0 default this task picked, not a rule
-/// this codebase or Anthropic's API imposes — a later task is free to make
-/// it configurable per `ModelConfig` without this module's shape changing.
-const MAX_TOKENS: u32 = 4096;
+/// The per-response output ceiling.
+///
+/// Was 4096, which was a live defect rather than a conservative default.
+/// `max_tokens` caps **thinking plus response text together**, and this engine
+/// sends no `thinking` parameter — on `claude-sonnet-5`, omitting it runs
+/// *adaptive thinking*. So every session has been sharing one 4096-token
+/// ceiling between the model's reasoning and its answer, and a turn that
+/// thought hard arrived truncated or empty. Nothing observed it: the stream
+/// parser did not read `stop_reason`, so a `max_tokens` cut was recorded as an
+/// ordinary completed turn.
+///
+/// 64000 is the streaming-request default this codebase's model family
+/// documents. It is a ceiling, not a reservation — an ordinary turn costs what
+/// it costs.
+///
+/// **Deliberately NOT changed here: the `thinking` parameter.** Making it
+/// explicit would be honest, but its meaning is model-dependent — on
+/// `claude-sonnet-5` omitting it and sending `{"type":"adaptive"}` are
+/// identical, while on `claude-haiku-4-5` the first means no thinking and the
+/// second means thinking. `--model` is configurable, so declaring it is a
+/// behaviour change for some workspaces and a no-op for others. That is a call
+/// for the workspace owner, not a fix to slip into a truncation patch.
+///
+/// Still unhandled, and worth knowing before tools land: **thinking blocks are
+/// never captured.** The parser keeps text and tool blocks and discards the
+/// rest. That is survivable while a turn's content is a bare string, and stops
+/// being survivable when a `tool_use` block must travel back alongside the
+/// thinking blocks from the same assistant turn.
+const MAX_TOKENS: u32 = 64_000;
 
 /// What one turn produced. `stopped` is true only when `cancel` fired before
 /// the model finished on its own — a normal end-of-stream (or a scripted
@@ -961,7 +986,7 @@ mod tests {
             build_request_body("claude-sonnet-5", &turn),
             serde_json::json!({
                 "model": "claude-sonnet-5",
-                "max_tokens": 4096,
+                "max_tokens": 64000,
                 "stream": true,
                 "system": "# boot",
                 "messages": [
@@ -993,7 +1018,7 @@ mod tests {
             body,
             serde_json::json!({
                 "model": "claude-sonnet-5",
-                "max_tokens": 4096,
+                "max_tokens": 64000,
                 "stream": true,
                 "messages": [{ "role": "user", "content": "hi" }],
             })
