@@ -8,7 +8,7 @@
 mod manifest;
 mod merge;
 
-pub use manifest::{Composition, Module, Protocol};
+pub use manifest::{Composition, Module, Protocol, Router};
 pub use merge::merge;
 
 use manifest::RawManifest;
@@ -224,5 +224,70 @@ mod tests {
         // C-2: the *section name* normalizes; the declared path is honored as
         // written, so a workspace mid-migration keeps resolving.
         assert_eq!(c.operators[0].path, "models/tycho");
+    }
+
+    #[test]
+    fn router_table_parses_contains_and_boot() {
+        let text = r#"
+[router]
+contains = ["CLAUDE.md", "README.md"]
+boot = "getting-started.md"
+"#;
+        let c = parse_manifest_str(text).unwrap();
+        assert_eq!(c.router.boot.as_deref(), Some("getting-started.md"));
+        assert_eq!(c.router.contains, vec!["CLAUDE.md", "README.md"]);
+    }
+
+    #[test]
+    fn an_absent_router_table_is_the_default_and_serializes_to_nothing() {
+        // C-4: a manifest that declares no router table is a working manifest.
+        // The serialization half matters as much as the parse half — every
+        // conformance fixture is a serialized Composition, and an always-present
+        // `router` key would rewrite all of them.
+        let c = parse_manifest_str("").unwrap();
+        assert_eq!(c.router.boot, None);
+        assert!(c.router.contains.is_empty());
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("router"), "empty router must not serialize: {json}");
+    }
+
+    #[test]
+    fn an_unknown_router_key_is_tolerated_not_rejected() {
+        // C-5: the shape is provisional. An engine reading a newer manifest must
+        // not reject it.
+        let c = parse_manifest_str("[router]\nboot = \"a.md\"\nfuture_key = 3\n").unwrap();
+        assert_eq!(c.router.boot.as_deref(), Some("a.md"));
+        assert!(c.router.extra.contains_key("future_key"));
+    }
+
+    #[test]
+    fn overlay_router_merges_field_wise_not_wholesale() {
+        // A machine-local overlay must be able to set `boot` without restating
+        // `contains` — a wholesale replace would silently erase the allowlist.
+        let base = parse_manifest_str("[router]\ncontains = [\"CLAUDE.md\"]\n").unwrap();
+        let overlay = parse_manifest_str("[router]\nboot = \"getting-started.md\"\n").unwrap();
+        let merged = crate::merge(base, overlay).unwrap();
+        assert_eq!(merged.router.contains, vec!["CLAUDE.md"]);
+        assert_eq!(merged.router.boot.as_deref(), Some("getting-started.md"));
+    }
+
+    #[test]
+    fn overlay_router_boot_overrides_the_base_boot() {
+        let base = parse_manifest_str("[router]\nboot = \"public.md\"\n").unwrap();
+        let overlay = parse_manifest_str("[router]\nboot = \"local.md\"\n").unwrap();
+        let merged = crate::merge(base, overlay).unwrap();
+        assert_eq!(merged.router.boot.as_deref(), Some("local.md"));
+    }
+
+    #[test]
+    fn overlay_router_contains_does_not_erase_the_base_boot() {
+        // The mirror of `overlay_router_merges_field_wise_not_wholesale`. Field-wise
+        // is a claim about BOTH fields, and a refactor that made `contains` the
+        // trigger for replacing the whole table would pass every other test here.
+        let base = parse_manifest_str("[router]\nboot = \"getting-started.md\"\n").unwrap();
+        let overlay = parse_manifest_str("[router]\ncontains = [\"CLAUDE.md\"]\n").unwrap();
+        let merged = crate::merge(base, overlay).unwrap();
+        assert_eq!(merged.router.boot.as_deref(), Some("getting-started.md"));
+        assert_eq!(merged.router.contains, vec!["CLAUDE.md"]);
     }
 }

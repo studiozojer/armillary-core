@@ -17,5 +17,6 @@
       "load": "on-demand",
       "when": "resume athanor work"
     }
-  ]
+  ],
+  "router": { "contains": ["CLAUDE.md"] }
 }

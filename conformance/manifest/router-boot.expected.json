@@ -1,0 +1,10 @@
+{
+  "operators": [],
+  "commons": [],
+  "repos": [],
+  "protocols": [],
+  "router": {
+    "contains": ["CLAUDE.md", "README.md"],
+    "boot": "getting-started.md"
+  }
+}

@@ -111,6 +111,123 @@ fn attach_info(store: &LogStore, id: &str) -> Result<AttachInfo, SessionError> {
     })
 }
 
+/// Appends the router's `boot` event, or logs and skips.
+///
+/// **Skip, never fail.** An instance that works without identity beats an
+/// instance that cannot be created — the same posture as `KeylessProvider`
+/// (the engine serves regardless; you discover the gap at first use). The
+/// accepted cost, recorded in the design: a misconfigured boot path is
+/// invisible from the phone, indistinguishable from having declared none.
+/// Phase 2 makes it a durable event.
+///
+/// Reuses `projection::resolve_boot_path` rather than re-deriving root
+/// containment — that function is `pub(crate)` for exactly this reason, so what
+/// this call site accepts is exactly what the projection will later accept.
+///
+/// `resolve_boot_path` is NOT a full path guard, and this function must not be
+/// read as inheriting one. All it does is `root.join(rel)`, `canonicalize`, and
+/// `starts_with(root)`. Because `Path::join` with an absolute argument *replaces*
+/// the base, an absolute path that happens to sit inside root canonicalizes to
+/// something under root and passes. That is precisely why the caller-side
+/// absolute-path refusal below exists — it is the only thing rejecting an
+/// absolute `[router] boot`, and any future caller of `resolve_boot_path` needs
+/// its own. (`guard::resolve` is the resolver that does reject absolute paths and
+/// `..` components before canonicalizing; unifying the three resolvers on it is
+/// parked for Phase 2.)
+///
+/// Mirrors `loop_::rerecord_boot`'s shape (resolve off-thread, then
+/// `tokio::fs::read`) since both call sites read the same kind of file for
+/// the same reason.
+async fn append_boot_event(state: &SharedState, stream: &str, rel: &str) {
+    // `constitution/composition.md` (Task 1) documents `[router] boot` as a
+    // path RELATIVE to root. An absolute path that happens to sit inside
+    // root would still pass `resolve_boot_path`'s containment check below —
+    // and then get written verbatim into a durable, portable log, where it
+    // would break on any machine whose root sits somewhere else. Refused
+    // rather than silently relativized (e.g. via `strip_prefix`): rewriting
+    // it would hide a misconfiguration instead of surfacing it.
+    if std::path::Path::new(rel).is_absolute() {
+        eprintln!(
+            "warning: [router] boot = {rel:?} is an absolute path, but this key is documented \
+             as relative to the workspace root — creating instance {stream} with no boot event \
+             (it will have no system prompt)"
+        );
+        return;
+    }
+
+    let root = state.root.clone();
+    let rel_owned = rel.to_string();
+    let resolved = match tokio::task::spawn_blocking(move || {
+        crate::projection::resolve_boot_path(&root, &rel_owned)
+    })
+    .await
+    {
+        Ok(Ok(path)) => path,
+        _ => {
+            eprintln!(
+                "warning: [router] boot = {rel:?} cannot be resolved (missing, or outside the \
+                 workspace root) — creating instance {stream} with no boot event (it will have \
+                 no system prompt)"
+            );
+            return;
+        }
+    };
+
+    let bytes = match tokio::fs::read(&resolved).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!(
+                "warning: [router] boot = {rel:?} is unreadable ({e}) — creating instance \
+                 {stream} with no boot event (it will have no system prompt)"
+            );
+            return;
+        }
+    };
+
+    // A non-UTF-8 boot file must never be appended: `projection.rs`'s "boot"
+    // arm decodes the bytes with `String::from_utf8`, and a decode failure
+    // there surfaces as `ProjectionError::BootUnreadable`, which
+    // `loop_::run_turn` routes to `fail_turn(..., "boot_unreadable", ...)` —
+    // NOT to the drift-recovery branch (only a SHA mismatch on an
+    // already-recorded event re-records). Appending an event that can never
+    // be read back would turn a benign misconfiguration into every future
+    // turn on this stream failing forever — the exact inversion of
+    // skip-never-fail this function exists to avoid.
+    if std::str::from_utf8(&bytes).is_err() {
+        eprintln!(
+            "warning: [router] boot = {rel:?} is not valid UTF-8 — creating instance {stream} \
+             with no boot event (appending it would make every turn on this stream fail)"
+        );
+        return;
+    }
+
+    let sha256 = crate::hash::sha256_hex(&bytes);
+
+    let sessions = state.sessions.clone();
+    let stream_owned = stream.to_string();
+    let path_for_event = rel.to_string();
+    let appended = tokio::task::spawn_blocking(move || {
+        sessions.append(
+            &stream_owned,
+            NewEvent {
+                actor: Actor {
+                    role: Role::System,
+                    instance: None,
+                },
+                event_type: "boot".to_string(),
+                data: serde_json::json!({ "path": path_for_event, "sha256": sha256 }),
+            },
+        )
+    })
+    .await;
+
+    match appended {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => eprintln!("warning: failed to append the boot event for {stream}: {e:?}"),
+        Err(_) => eprintln!("warning: the boot append task panicked for {stream}"),
+    }
+}
+
 pub async fn create(
     State(state): State<SharedState>,
     Json(body): Json<CreateRequest>,
@@ -138,6 +255,17 @@ pub async fn create(
     })
     .await?;
 
+    // AFTER instance_created, never before: instance_from_first_event requires
+    // a stream's first event to be instance_created, and list_instances skips
+    // any stream where it is not. Boot-first would make every instance
+    // invisible to the list screen.
+    if let Some(rel) = state.boot.as_deref() {
+        append_boot_event(&state, &id, rel).await;
+    }
+
+    // last_seq stays ev.seq (1, from instance_created) even when a boot event
+    // just landed at seq 2: this response describes the instance as CREATED,
+    // not its current head. A client that wants the head calls attach.
     let instance = instance_from_first_event(&id, &ev, ev.seq).ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
         "log_write_failed".to_string(),

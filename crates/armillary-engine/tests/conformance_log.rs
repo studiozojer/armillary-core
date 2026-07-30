@@ -239,6 +239,7 @@ async fn every_event_a_scripted_turn_emits_validates_against_the_schema() {
         sessions: sessions.clone(),
         model: model_config(),
         provider: Arc::new(ScriptedProvider::new(vec!["Hel", "Hello there"])),
+        boot: None,
     });
 
     let generation = uuid::Uuid::new_v4().to_string();

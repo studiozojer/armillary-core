@@ -187,6 +187,18 @@ async fn fail_turn(
 /// brief's `boot_unreadable` machine code on any failure along the way (an
 /// unreadable file, or the append itself failing — both leave the turn with
 /// no system prompt it can trust, so both fold into the same named code).
+///
+/// **Deliberately lacks two guards that `routes::instances::append_boot_event`
+/// has** — the absolute-path refusal and the UTF-8 check — and the asymmetry is
+/// reasoned, not forgotten. This function never introduces a path: it can only
+/// re-affirm a path some earlier event already recorded, so an absolute path here
+/// was already durable and refusing it now would strand the stream rather than
+/// clean it. And a non-UTF-8 boot file fails this turn either way — the
+/// re-projection immediately below returns `BootUnreadable` on the decode — so
+/// the guard would buy nothing except sparing the log one junk event. Adding the
+/// guards is a Phase 2 semantics decision (see the design doc's parked items,
+/// which also covers whether re-recording should follow the *current* `[router]
+/// boot` declaration rather than the recorded path), not a fix to slip in here.
 async fn rerecord_boot(state: &SharedState, stream: &str, path: &str) -> Result<(), &'static str> {
     let root = state.root.clone();
     let path_owned = path.to_string();
@@ -395,6 +407,7 @@ mod tests {
             sessions: sessions.clone(),
             model: model_config(),
             provider: Arc::new(KeylessProvider),
+            boot: None,
         });
 
         let generation = uuid::Uuid::new_v4().to_string();
@@ -428,6 +441,7 @@ mod tests {
             sessions: sessions.clone(),
             model: model_config(),
             provider: Arc::new(KeylessProvider),
+            boot: None,
         });
 
         let generation = uuid::Uuid::new_v4().to_string();

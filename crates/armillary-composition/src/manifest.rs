@@ -29,6 +29,35 @@ pub struct Protocol {
     pub extra: BTreeMap<String, toml::Value>,
 }
 
+/// The `[router]` table — the minimal core that IS this repo, never a module.
+///
+/// `contains` is the allowlist the workspace's gitignore mirrors. `boot` names
+/// the router's OWN boot file, read once at instance creation — distinct from
+/// a module-contributed `[[protocols]]` entry with `load = "boot"`, which
+/// carries protocol semantics (`requires`, load timing, companion data) that
+/// the router's own file does not.
+///
+/// Like `Protocol`, this carries `extra` and must never gain
+/// `deny_unknown_fields` (C-5).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Router {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, toml::Value>,
+}
+
+impl Router {
+    /// True when nothing was declared. Gates serialization so a manifest with
+    /// no `[router]` table produces JSON identical to before this key existed
+    /// — which is what keeps every existing conformance fixture passing.
+    pub fn is_empty(&self) -> bool {
+        self.contains.is_empty() && self.boot.is_none() && self.extra.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Composition {
     #[serde(default)]
@@ -39,6 +68,8 @@ pub struct Composition {
     pub repos: Vec<Module>,
     #[serde(default)]
     pub protocols: Vec<Protocol>,
+    #[serde(default, skip_serializing_if = "Router::is_empty")]
+    pub router: Router,
 }
 
 /// The raw shape as it appears on disk, before legacy normalization.
@@ -58,6 +89,9 @@ pub(crate) struct RawManifest {
     pub repos: Vec<Module>,
     #[serde(default)]
     pub protocols: Vec<Protocol>,
+    // in RawManifest — no skip_serializing_if; it is Deserialize-only
+    #[serde(default)]
+    pub router: Router,
 }
 
 impl From<RawManifest> for Composition {
@@ -74,6 +108,7 @@ impl From<RawManifest> for Composition {
             commons: raw.commons,
             repos: raw.repos,
             protocols: raw.protocols,
+            router: raw.router,
         }
     }
 }
