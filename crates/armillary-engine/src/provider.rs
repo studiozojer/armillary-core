@@ -315,25 +315,38 @@ impl StreamAccumulator {
 
     /// Materialize in wire order.
     ///
-    /// A `tool_use` whose accumulated fragments do not parse is **dropped**, not
-    /// salvaged. That happens when `max_tokens` cuts the stream mid-arguments,
-    /// and a partially-parsed argument set is the dangerous outcome: a
-    /// `read_file` with a truncated path is a read of the wrong file, and
-    /// `guard::resolve` will allow it if the truncation is still inside root.
-    /// The turn's `stop_reason` is already `max_tokens`, so the caller can tell
-    /// what happened without being handed a fabricated call.
+    /// Two failures that look alike and are not:
+    ///
+    /// - **No arguments.** A tool whose schema takes none streams either no
+    ///   `input_json_delta` frames at all, or exactly one whose `partial_json`
+    ///   is the empty string. Both accumulate to `""`, which does not parse.
+    ///   That is a complete call with an empty input, and dropping it loses a
+    ///   perfectly good tool use — observed live against `get_composition`
+    ///   before this distinction existed.
+    /// - **Truncated arguments.** A non-empty accumulation that does not parse
+    ///   means `max_tokens` cut the stream mid-JSON. That call is **dropped**,
+    ///   never salvaged: a `read_file` with a half-written path is a read of
+    ///   the wrong file, and `guard::resolve` will allow it if the truncation
+    ///   happens to land inside root. The turn's `stop_reason` already says
+    ///   `max_tokens`, so the caller learns what happened without being handed
+    ///   a fabricated call.
     fn blocks(&self) -> Vec<ContentBlock> {
         self.open
             .values()
             .filter_map(|b| match b {
                 PartialBlock::Text(t) => Some(ContentBlock::Text(t.clone())),
-                PartialBlock::ToolUse { id, name, json } => serde_json::from_str(json)
-                    .ok()
-                    .map(|input| ContentBlock::ToolUse {
+                PartialBlock::ToolUse { id, name, json } => {
+                    let input = if json.trim().is_empty() {
+                        Some(serde_json::Value::Object(Default::default()))
+                    } else {
+                        serde_json::from_str(json).ok()
+                    };
+                    input.map(|input| ContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input,
-                    }),
+                    })
+                }
             })
             .collect()
     }
@@ -1096,6 +1109,46 @@ mod tests {
         assert_eq!(acc.blocks().len(), 2);
         assert!(matches!(acc.blocks()[0], ContentBlock::Text(_)));
         assert!(matches!(acc.blocks()[1], ContentBlock::ToolUse { .. }));
+    }
+
+    #[test]
+    fn a_no_argument_tool_call_survives_its_single_empty_fragment() {
+        // Captured verbatim from a live `claude-sonnet-5` stream calling
+        // `get_composition`, which takes no arguments: ONE `input_json_delta`
+        // whose `partial_json` is the empty string. The accumulation is
+        // therefore `""`, which does not parse — and an earlier version of the
+        // drop rule below threw the call away because of it.
+        //
+        // No arguments and TRUNCATED arguments are different failures and must
+        // not share a branch. Every other test here used a tool that takes
+        // arguments, so none of them could see this.
+        let acc = frames(&[
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01J6MQ","name":"get_composition","input":{},"caller":{"type":"direct"}}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+        ]);
+
+        assert_eq!(acc.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(
+            acc.blocks(),
+            vec![ContentBlock::ToolUse {
+                id: "toolu_01J6MQ".to_string(),
+                name: "get_composition".to_string(),
+                input: serde_json::json!({}),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_tool_call_with_no_delta_frames_at_all_is_also_a_call() {
+        // The same case one step further: no `input_json_delta` frames at all.
+        let acc = frames(&[
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"get_composition","input":{}}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+        ]);
+
+        assert_eq!(acc.blocks().len(), 1, "{:?}", acc.blocks());
     }
 
     #[test]
