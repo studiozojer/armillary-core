@@ -14,7 +14,7 @@
 //! `async_trait` rather than return-position `impl Trait` — RPITIT is not
 //! dyn-compatible, and a boxed trait object is the whole point here.
 
-use crate::projection::{ModelTurn, ProviderRole};
+use crate::projection::{ContentBlock, ModelTurn, ProviderRole};
 use futures_util::StreamExt;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -125,6 +125,47 @@ fn role_str(role: ProviderRole) -> &'static str {
     }
 }
 
+/// Encode one block in Anthropic's wire shape.
+///
+/// `ToolResult` emits exactly `{type, tool_use_id, content, is_error}`. It must
+/// never gain a `status` key — measured, that is a 400 ("Extra inputs are not
+/// permitted"). See `projection::ContentBlock`'s doc for where the typed status
+/// actually lives.
+fn block_json(block: &ContentBlock) -> serde_json::Value {
+    match block {
+        ContentBlock::Text(text) => serde_json::json!({ "type": "text", "text": text }),
+        ContentBlock::ToolUse { id, name, input } => serde_json::json!({
+            "type": "tool_use",
+            "id": id,
+            "name": name,
+            "input": input,
+        }),
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": content,
+            "is_error": is_error,
+        }),
+    }
+}
+
+/// Materialize a block list into the `content` field.
+///
+/// A lone `Text` block becomes a bare JSON string rather than a one-element
+/// array. Both are legal, and choosing the string is what makes this migration
+/// inert: every turn that uses no tools produces the exact bytes the
+/// pre-migration build produced, which the request goldens pin.
+fn flatten_content(blocks: &[ContentBlock]) -> serde_json::Value {
+    match blocks {
+        [ContentBlock::Text(text)] => serde_json::json!(text),
+        _ => serde_json::Value::Array(blocks.iter().map(block_json).collect()),
+    }
+}
+
 /// Build the `/v1/messages` request body for one turn.
 ///
 /// Extracted from `AnthropicProvider::run_turn` so the body is inspectable
@@ -139,7 +180,7 @@ fn build_request_body(model: &str, turn: &ModelTurn) -> serde_json::Value {
         .map(|m| {
             serde_json::json!({
                 "role": role_str(m.role),
-                "content": m.content,
+                "content": flatten_content(&m.content),
             })
         })
         .collect();
@@ -558,15 +599,15 @@ mod tests {
             messages: vec![
                 ProviderMessage {
                     role: ProviderRole::User,
-                    content: "hi".to_string(),
+                    content: vec![ContentBlock::Text("hi".to_string())],
                 },
                 ProviderMessage {
                     role: ProviderRole::Assistant,
-                    content: "hello".to_string(),
+                    content: vec![ContentBlock::Text("hello".to_string())],
                 },
                 ProviderMessage {
                     role: ProviderRole::User,
-                    content: "bye".to_string(),
+                    content: vec![ContentBlock::Text("bye".to_string())],
                 },
             ],
         };
@@ -596,7 +637,7 @@ mod tests {
             system: None,
             messages: vec![ProviderMessage {
                 role: ProviderRole::User,
-                content: "hi".to_string(),
+                content: vec![ContentBlock::Text("hi".to_string())],
             }],
         };
 
@@ -610,6 +651,100 @@ mod tests {
                 "max_tokens": 4096,
                 "stream": true,
                 "messages": [{ "role": "user", "content": "hi" }],
+            })
+        );
+    }
+
+    // --- block flattening (P-4's materialization edge) ---
+
+    fn text_msg(role: ProviderRole, s: &str) -> ProviderMessage {
+        ProviderMessage {
+            role,
+            content: vec![ContentBlock::Text(s.to_string())],
+        }
+    }
+
+    #[test]
+    fn a_lone_text_block_flattens_to_a_bare_string_not_a_block_list() {
+        // The wire accepts both forms. Choosing the string keeps every
+        // text-only turn byte-identical to the pre-migration build, so the
+        // goldens above stay valid and the migration's blast radius is only
+        // turns that actually use tools.
+        let turn = ModelTurn {
+            system: None,
+            messages: vec![text_msg(ProviderRole::User, "hi")],
+        };
+
+        assert_eq!(
+            build_request_body("m", &turn)["messages"][0]["content"],
+            serde_json::json!("hi")
+        );
+    }
+
+    #[test]
+    fn a_message_carrying_a_tool_use_flattens_to_a_block_list() {
+        let turn = ModelTurn {
+            system: None,
+            messages: vec![ProviderMessage {
+                role: ProviderRole::Assistant,
+                content: vec![
+                    ContentBlock::Text("reading it".to_string()),
+                    ContentBlock::ToolUse {
+                        id: "toolu_01AAA".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({ "path": "x.md" }),
+                    },
+                ],
+            }],
+        };
+
+        assert_eq!(
+            build_request_body("m", &turn)["messages"][0]["content"],
+            serde_json::json!([
+                { "type": "text", "text": "reading it" },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_01AAA",
+                    "name": "read_file",
+                    "input": { "path": "x.md" },
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn a_tool_result_block_never_emits_the_typed_status_to_the_wire() {
+        // MEASURED against the live API: a `status` key inside a `tool_result`
+        // block returns 400 `invalid_request_error` — "Extra inputs are not
+        // permitted". The typed status is sovereign in the LOG; at the wire it
+        // survives only as `is_error` plus whatever the projection rendered
+        // into `content`. That is P-4's "as far as the provider channel
+        // allows", and this test is what stops someone re-adding the field.
+        let turn = ModelTurn {
+            system: None,
+            messages: vec![ProviderMessage {
+                role: ProviderRole::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_01AAA".to_string(),
+                    content: "denied_credential: refused; try a path under operators/".to_string(),
+                    is_error: true,
+                }],
+            }],
+        };
+
+        let block = &build_request_body("m", &turn)["messages"][0]["content"][0];
+
+        assert!(
+            block.get("status").is_none(),
+            "a status key on the wire is a 400: {block}"
+        );
+        assert_eq!(
+            *block,
+            serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_01AAA",
+                "content": "denied_credential: refused; try a path under operators/",
+                "is_error": true,
             })
         );
     }
@@ -644,7 +779,7 @@ mod tests {
             system: None,
             messages: vec![ProviderMessage {
                 role: ProviderRole::User,
-                content: "Reply with exactly one word: hello".to_string(),
+                content: vec![ContentBlock::Text("Reply with exactly one word: hello".to_string())],
             }],
         };
         let (tx, mut rx) = mpsc::channel(32);

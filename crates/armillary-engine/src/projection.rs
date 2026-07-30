@@ -37,7 +37,11 @@ use std::path::{Path, PathBuf};
 /// What a model actually sees for one turn: an optional system prompt (from
 /// the last-standing `boot` event) plus the flattened, alternation-merged
 /// message list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// No `Eq`: `ContentBlock::ToolUse` carries a `serde_json::Value`, which is
+/// `PartialEq` but not `Eq` (floats). `PartialEq` is all any caller or test
+/// needs.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelTurn {
     pub system: Option<String>,
     pub messages: Vec<ProviderMessage>,
@@ -46,10 +50,51 @@ pub struct ModelTurn {
 /// One flattened message. `content` has already had same-role neighbors
 /// merged (see `merge_consecutive`) — this is the P-4 provider shape, not
 /// the log's typed shape.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProviderMessage {
     pub role: ProviderRole,
-    pub content: String,
+    pub content: Vec<ContentBlock>,
+}
+
+/// A single content block, mirroring the three Anthropic shapes this engine
+/// can produce. Materialized to JSON by `provider::build_request_body` — this
+/// type is deliberately wire-*shaped* but not wire-*encoded*, so the encoding
+/// lives at one edge (P-4's separate flattening stage).
+///
+/// **`ToolResult` carries no `status` field, and must not grow one.** Measured
+/// against the live API: a `status` key inside a `tool_result` block returns
+/// 400 `invalid_request_error` — "Extra inputs are not permitted". The typed
+/// status is sovereign in the *log*; what crosses to the model is `is_error`
+/// plus whatever the projection rendered into `content`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContentBlock {
+    Text(String),
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
+}
+
+impl ContentBlock {
+    /// Convenience for the common single-text case.
+    pub fn text(s: impl Into<String>) -> Self {
+        ContentBlock::Text(s.into())
+    }
+}
+
+/// One message whose content is exactly one text block — the shape every
+/// pre-tool projection arm produces.
+fn text_message(role: ProviderRole, text: impl Into<String>) -> ProviderMessage {
+    ProviderMessage {
+        role,
+        content: vec![ContentBlock::Text(text.into())],
+    }
 }
 
 /// Anthropic's two-role wire vocabulary — deliberately narrower than
@@ -155,13 +200,39 @@ fn merge_consecutive(raw: Vec<ProviderMessage>) -> Vec<ProviderMessage> {
     for msg in raw {
         match merged.last_mut() {
             Some(last) if last.role == msg.role => {
-                last.content.push_str("\n\n");
-                last.content.push_str(&msg.content);
+                for block in msg.content {
+                    append_block(&mut last.content, block);
+                }
             }
             _ => merged.push(msg),
         }
     }
     merged
+}
+
+/// Append a block, folding text into text.
+///
+/// Two adjacent `Text` blocks are legal on the wire but wasteful: folding them
+/// preserves the single-block shortcut that keeps text-only turns byte-identical
+/// to the pre-tool build, which is the only reason the request goldens still
+/// hold after this migration. The `"\n\n"` is the separator the string version
+/// of this function used, kept so the merged text is byte-identical too.
+///
+/// **Ordering caveat for whoever adds tool events.** Anthropic requires
+/// `tool_result` blocks to form an uninterrupted *leading* sequence in the user
+/// turn that answers a `tool_use` (measured: text before a result, or a result
+/// after intervening text, is a 400). This function appends in log order and
+/// therefore does NOT enforce that. It is correct today only because no arm
+/// below produces a `ToolResult`; the ordering rule belongs to the branch that
+/// adds them, not here.
+fn append_block(blocks: &mut Vec<ContentBlock>, block: ContentBlock) {
+    match (blocks.last_mut(), &block) {
+        (Some(ContentBlock::Text(prev)), ContentBlock::Text(next)) => {
+            prev.push_str("\n\n");
+            prev.push_str(next);
+        }
+        _ => blocks.push(block),
+    }
 }
 
 /// The evict seam: Anthropic requires the message list to open on `User` and
@@ -189,10 +260,10 @@ fn ensure_opens_on_user(mut messages: Vec<ProviderMessage>) -> Vec<ProviderMessa
     if opens_on_assistant {
         messages.insert(
             0,
-            ProviderMessage {
-                role: ProviderRole::User,
-                content: "[earlier user message removed from context]".to_string(),
-            },
+            text_message(
+                ProviderRole::User,
+                "[earlier user message removed from context]",
+            ),
         );
     }
     messages
@@ -291,10 +362,10 @@ pub fn project_context(
             }
 
             "user_message" => {
-                raw.push(ProviderMessage {
-                    role: ProviderRole::User,
-                    content: text_field(&ev.data, "text"),
-                });
+                raw.push(text_message(
+                    ProviderRole::User,
+                    text_field(&ev.data, "text"),
+                ));
             }
 
             "assistant_message" => {
@@ -305,10 +376,7 @@ pub fn project_context(
                     // carrier, so the marker belongs here, not there.
                     content.push_str("\n[generation stopped by user]");
                 }
-                raw.push(ProviderMessage {
-                    role: ProviderRole::Assistant,
-                    content,
-                });
+                raw.push(text_message(ProviderRole::Assistant, content));
             }
 
             // The interrupted flag on the assistant_message carries this;
@@ -347,10 +415,10 @@ pub fn project_context(
                     .or_else(|| ev.data.get("child").and_then(|v| v.as_str()))
                     .unwrap_or("?");
                 let child_stream = text_field(&ev.data, "childStream");
-                raw.push(ProviderMessage {
-                    role: ProviderRole::User,
-                    content: format!("[dispatched {target} — child stream {child_stream}]"),
-                });
+                raw.push(text_message(
+                    ProviderRole::User,
+                    format!("[dispatched {target} — child stream {child_stream}]"),
+                ));
             }
 
             "return" => {
@@ -359,20 +427,17 @@ pub fn project_context(
                     Some(summary) => format!("[child {child} returned: {summary}]"),
                     None => format!("[child {child} returned]"),
                 };
-                raw.push(ProviderMessage {
-                    role: ProviderRole::User,
-                    content,
-                });
+                raw.push(text_message(ProviderRole::User, content));
             }
 
             // Never silent (P-3): visible in the transcript rather than
             // dropped, so a gap in coverage shows up where a human or the
             // exhaustiveness test can see it, instead of vanishing.
             other => {
-                raw.push(ProviderMessage {
-                    role: ProviderRole::User,
-                    content: format!("[unhandled event type: {other}]"),
-                });
+                raw.push(text_message(
+                    ProviderRole::User,
+                    format!("[unhandled event type: {other}]"),
+                ));
             }
         }
     }
@@ -388,6 +453,20 @@ mod tests {
     use super::*;
     use crate::log::envelope::{Actor, Role};
     use serde_json::json;
+
+    /// Assert a message is exactly one text block, and return it.
+    ///
+    /// Deliberately panics on a multi-block message rather than concatenating.
+    /// Every assertion below was written when `content` was a `String`; folding
+    /// blocks together silently would let this migration change a message's
+    /// shape without a single test noticing, which is the whole failure the
+    /// request goldens exist to prevent one layer up.
+    fn text_of(m: &ProviderMessage) -> &str {
+        match m.content.as_slice() {
+            [ContentBlock::Text(t)] => t,
+            other => panic!("expected exactly one text block, got {other:?}"),
+        }
+    }
 
     fn ev(seq: u64, id: &str, event_type: &str, data: serde_json::Value) -> EventEnvelope {
         EventEnvelope {
@@ -426,11 +505,11 @@ mod tests {
 
         assert_eq!(turn.system.as_deref(), Some("# system prompt"));
         assert_eq!(turn.messages.len(), 3);
-        assert_eq!(turn.messages[0].content, "hi");
+        assert_eq!(text_of(&turn.messages[0]), "hi");
         assert_eq!(turn.messages[0].role, ProviderRole::User);
-        assert_eq!(turn.messages[1].content, "hello");
+        assert_eq!(text_of(&turn.messages[1]), "hello");
         assert_eq!(turn.messages[1].role, ProviderRole::Assistant);
-        assert_eq!(turn.messages[2].content, "bye");
+        assert_eq!(text_of(&turn.messages[2]), "bye");
         assert_eq!(turn.messages[2].role, ProviderRole::User);
     }
 
@@ -523,7 +602,7 @@ mod tests {
         let turn = project_context(&events, Path::new(".")).unwrap();
 
         assert_eq!(
-            turn.messages[0].content,
+            text_of(&turn.messages[0]),
             "[dispatched worker-7 — child stream child-stream-1]"
         );
     }
@@ -550,9 +629,9 @@ mod tests {
 
         assert_eq!(turn.messages.len(), 2);
         assert_eq!(turn.messages[0].role, ProviderRole::User);
-        assert_eq!(turn.messages[0].content, "[earlier user message removed from context]");
+        assert_eq!(text_of(&turn.messages[0]), "[earlier user message removed from context]");
         assert_eq!(turn.messages[1].role, ProviderRole::Assistant);
-        assert_eq!(turn.messages[1].content, "hello");
+        assert_eq!(text_of(&turn.messages[1]), "hello");
     }
 
     #[test]
@@ -566,7 +645,7 @@ mod tests {
         let turn = project_context(&events, Path::new(".")).unwrap();
 
         assert_eq!(turn.messages.len(), 1);
-        assert_eq!(turn.messages[0].content, "stays");
+        assert_eq!(text_of(&turn.messages[0]), "stays");
     }
 
     #[test]
@@ -589,7 +668,7 @@ mod tests {
 
         let turn = project_context(&events, Path::new(".")).unwrap();
 
-        assert_eq!(turn.messages[1].content, "partial\n[generation stopped by user]");
+        assert_eq!(text_of(&turn.messages[1]), "partial\n[generation stopped by user]");
     }
 
     #[test]
@@ -604,9 +683,9 @@ mod tests {
 
         assert_eq!(turn.messages.len(), 2);
         assert_eq!(turn.messages[0].role, ProviderRole::User);
-        assert_eq!(turn.messages[0].content, "first\n\nsecond");
+        assert_eq!(text_of(&turn.messages[0]), "first\n\nsecond");
         assert_eq!(turn.messages[1].role, ProviderRole::Assistant);
-        assert_eq!(turn.messages[1].content, "reply");
+        assert_eq!(text_of(&turn.messages[1]), "reply");
     }
 
     #[test]
@@ -656,9 +735,9 @@ mod tests {
         assert!(turn.system.as_deref().unwrap_or("").contains("boot content"));
         for m in &turn.messages {
             assert!(
-                !m.content.contains("[unhandled"),
+                !text_of(m).contains("[unhandled"),
                 "unexpected unhandled marker for a known durable type: {}",
-                m.content
+                text_of(m)
             );
         }
     }
