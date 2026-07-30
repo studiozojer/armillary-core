@@ -224,6 +224,17 @@ impl ModelProvider for RecordingProvider {
 
 // --- (a) send returns 201 receipt whose seq is the user event's ---
 
+/// True when any text block in the message contains `needle`.
+///
+/// `ProviderMessage.content` became a block list with the tool-use migration;
+/// these assertions are about what the model can read, which is the text.
+fn message_contains(m: &armillary_engine::projection::ProviderMessage, needle: &str) -> bool {
+    m.content.iter().any(|b| match b {
+        armillary_engine::projection::ContentBlock::Text(t) => t.contains(needle),
+        _ => false,
+    })
+}
+
 #[tokio::test]
 async fn send_returns_the_user_events_id_and_seq() {
     let data_dir = tempfile::tempdir().unwrap().keep();
@@ -421,10 +432,10 @@ async fn evicted_message_is_absent_from_the_next_turns_projection() {
 
     let last_turn = recorder.last_turn.lock().unwrap().clone().expect("a turn was recorded");
     assert!(
-        !last_turn.messages.iter().any(|m| m.content.contains("evict me")),
+        !last_turn.messages.iter().any(|m| message_contains(m, "evict me")),
         "the evicted message must not reach the provider: {last_turn:?}"
     );
-    assert!(last_turn.messages.iter().any(|m| m.content.contains("second turn")));
+    assert!(last_turn.messages.iter().any(|m| message_contains(m, "second turn")));
 }
 
 async fn wait_for_assistant_message(sessions: &Arc<Sessions>, id: &str, count: usize) {

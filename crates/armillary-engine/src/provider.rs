@@ -14,23 +14,62 @@
 //! `async_trait` rather than return-position `impl Trait` — RPITIT is not
 //! dyn-compatible, and a boxed trait object is the whole point here.
 
-use crate::projection::{ModelTurn, ProviderRole};
+use crate::projection::{ContentBlock, ModelTurn, ProviderRole};
 use futures_util::StreamExt;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
-/// `max_tokens: 4096` below is a v0 default this task picked, not a rule
-/// this codebase or Anthropic's API imposes — a later task is free to make
-/// it configurable per `ModelConfig` without this module's shape changing.
-const MAX_TOKENS: u32 = 4096;
+/// The per-response output ceiling.
+///
+/// Was 4096, which was a live defect rather than a conservative default.
+/// `max_tokens` caps **thinking plus response text together**, and this engine
+/// sends no `thinking` parameter — on `claude-sonnet-5`, omitting it runs
+/// *adaptive thinking*. So every session has been sharing one 4096-token
+/// ceiling between the model's reasoning and its answer, and a turn that
+/// thought hard arrived truncated or empty. Nothing observed it: the stream
+/// parser did not read `stop_reason`, so a `max_tokens` cut was recorded as an
+/// ordinary completed turn.
+///
+/// 64000 is the streaming-request default this codebase's model family
+/// documents. It is a ceiling, not a reservation — an ordinary turn costs what
+/// it costs.
+///
+/// **Deliberately NOT changed here: the `thinking` parameter.** Making it
+/// explicit would be honest, but its meaning is model-dependent — on
+/// `claude-sonnet-5` omitting it and sending `{"type":"adaptive"}` are
+/// identical, while on `claude-haiku-4-5` the first means no thinking and the
+/// second means thinking. `--model` is configurable, so declaring it is a
+/// behaviour change for some workspaces and a no-op for others. That is a call
+/// for the workspace owner, not a fix to slip into a truncation patch.
+///
+/// Still unhandled, and worth knowing before tools land: **thinking blocks are
+/// never captured.** The parser keeps text and tool blocks and discards the
+/// rest. That is survivable while a turn's content is a bare string, and stops
+/// being survivable when a `tool_use` block must travel back alongside the
+/// thinking blocks from the same assistant turn.
+const MAX_TOKENS: u32 = 64_000;
 
 /// What one turn produced. `stopped` is true only when `cancel` fired before
 /// the model finished on its own — a normal end-of-stream (or a scripted
 /// provider exhausting its fragments) is `stopped: false` even if the text
 /// is short.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `text` is retained as the turn's visible prose (it is what the durable
+/// `assistant_message` records and what the transient sink streamed), but it is
+/// no longer the whole outcome: `blocks` carries every content block in wire
+/// order, and `stop_reason` is the provider's own account of why generation
+/// ended. A tool call is expressible in neither of the first two fields, which
+/// is why a loop written against the old shape could not see one.
+///
+/// No `Eq`: `blocks` may contain a `serde_json::Value`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct TurnOutcome {
     pub text: String,
+    pub blocks: Vec<ContentBlock>,
+    /// `end_turn` | `tool_use` | `max_tokens` | `refusal` | … Read from the
+    /// `message_delta` frame; `None` when the stream ended without one (a
+    /// transport cut, or a cancel before the first frame).
+    pub stop_reason: Option<String>,
     pub stopped: bool,
     pub model: String,
 }
@@ -118,10 +157,247 @@ fn is_message_stop(v: &serde_json::Value) -> bool {
     v.get("type").and_then(|t| t.as_str()) == Some("message_stop")
 }
 
+/// A block still being streamed. `ToolUse.json` is the raw concatenation of
+/// `input_json_delta` fragments — no fragment is valid JSON on its own, so
+/// parsing happens once, at materialization.
+#[derive(Debug)]
+enum PartialBlock {
+    Text(String),
+    ToolUse {
+        id: String,
+        name: String,
+        json: String,
+    },
+}
+
+/// Folds an Anthropic SSE stream into content blocks and a stop reason.
+///
+/// Three things this exists to get right, each measured against a live stream:
+///
+/// 1. **`content_block_start` for a `tool_use` carries `input: {}`** — empty,
+///    never the arguments. The arguments arrive only as `input_json_delta`
+///    fragments and must be concatenated in arrival order.
+/// 2. **The first fragment is frequently the empty string**, and no fragment is
+///    independently parseable (`""`, `{"`, `pa`, `th": ` …). Parse once, at the
+///    end, over the concatenation.
+/// 3. **`stop_reason` arrives on `message_delta`, not `message_stop`.** The
+///    pre-tool parser only inspected `message_stop`, so a turn that ended in
+///    order to call a tool looked exactly like one that finished talking.
+///
+/// Keyed by the frame's `index` so blocks materialize in wire order regardless
+/// of frame interleaving.
+#[derive(Debug, Default)]
+struct StreamAccumulator {
+    open: std::collections::BTreeMap<u64, PartialBlock>,
+    stop_reason: Option<String>,
+}
+
+impl StreamAccumulator {
+    fn observe(&mut self, v: &serde_json::Value) {
+        let frame = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+        let index = v.get("index").and_then(|i| i.as_u64());
+
+        match frame {
+            "content_block_start" => {
+                let (Some(index), Some(block)) = (index, v.get("content_block")) else {
+                    return;
+                };
+                let kind = block.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+                match kind {
+                    "text" => {
+                        let seed = block.get("text").and_then(|t| t.as_str()).unwrap_or_default();
+                        self.open.insert(index, PartialBlock::Text(seed.to_string()));
+                    }
+                    "tool_use" => {
+                        self.open.insert(
+                            index,
+                            PartialBlock::ToolUse {
+                                id: block
+                                    .get("id")
+                                    .and_then(|i| i.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                name: block
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                // NOT block["input"] — it is always `{}` here.
+                                json: String::new(),
+                            },
+                        );
+                    }
+                    // A block kind this engine does not model (thinking,
+                    // server_tool_use, …). Deliberately not opened: an unknown
+                    // block we cannot faithfully echo back is worse than one we
+                    // never claim to have.
+                    _ => {}
+                }
+            }
+
+            "content_block_delta" => {
+                let (Some(index), Some(delta)) = (index, v.get("delta")) else {
+                    return;
+                };
+                let kind = delta.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+                match (self.open.get_mut(&index), kind) {
+                    (Some(PartialBlock::Text(buf)), "text_delta") => {
+                        if let Some(t) = delta.get("text").and_then(|t| t.as_str()) {
+                            buf.push_str(t);
+                        }
+                    }
+                    (Some(PartialBlock::ToolUse { json, .. }), "input_json_delta") => {
+                        if let Some(fragment) = delta.get("partial_json").and_then(|p| p.as_str()) {
+                            json.push_str(fragment);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            "message_delta" => {
+                if let Some(reason) = v
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(|r| r.as_str())
+                {
+                    self.stop_reason = Some(reason.to_string());
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    /// The turn's visible text — every `Text` block concatenated. This is what
+    /// the transient sink has always carried (I-4: a snapshot, not an
+    /// increment), unchanged by the arrival of tool blocks.
+    fn text(&self) -> String {
+        self.open
+            .values()
+            .filter_map(|b| match b {
+                PartialBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Materialize in wire order.
+    ///
+    /// A `tool_use` whose accumulated fragments do not parse is **dropped**, not
+    /// salvaged. That happens when `max_tokens` cuts the stream mid-arguments,
+    /// and a partially-parsed argument set is the dangerous outcome: a
+    /// `read_file` with a truncated path is a read of the wrong file, and
+    /// `guard::resolve` will allow it if the truncation is still inside root.
+    /// The turn's `stop_reason` is already `max_tokens`, so the caller can tell
+    /// what happened without being handed a fabricated call.
+    fn blocks(&self) -> Vec<ContentBlock> {
+        self.open
+            .values()
+            .filter_map(|b| match b {
+                PartialBlock::Text(t) => Some(ContentBlock::Text(t.clone())),
+                PartialBlock::ToolUse { id, name, json } => serde_json::from_str(json)
+                    .ok()
+                    .map(|input| ContentBlock::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input,
+                    }),
+            })
+            .collect()
+    }
+}
+
 fn role_str(role: ProviderRole) -> &'static str {
     match role {
         ProviderRole::User => "user",
         ProviderRole::Assistant => "assistant",
+    }
+}
+
+/// Encode one block in Anthropic's wire shape.
+///
+/// `ToolResult` emits exactly `{type, tool_use_id, content, is_error}`. It must
+/// never gain a `status` key — measured, that is a 400 ("Extra inputs are not
+/// permitted"). See `projection::ContentBlock`'s doc for where the typed status
+/// actually lives.
+fn block_json(block: &ContentBlock) -> serde_json::Value {
+    match block {
+        ContentBlock::Text(text) => serde_json::json!({ "type": "text", "text": text }),
+        ContentBlock::ToolUse { id, name, input } => serde_json::json!({
+            "type": "tool_use",
+            "id": id,
+            "name": name,
+            "input": input,
+        }),
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": content,
+            "is_error": is_error,
+        }),
+    }
+}
+
+/// Materialize a block list into the `content` field.
+///
+/// A lone `Text` block becomes a bare JSON string rather than a one-element
+/// array. Both are legal, and choosing the string is what makes this migration
+/// inert: every turn that uses no tools produces the exact bytes the
+/// pre-migration build produced, which the request goldens pin.
+fn flatten_content(blocks: &[ContentBlock]) -> serde_json::Value {
+    match blocks {
+        [ContentBlock::Text(text)] => serde_json::json!(text),
+        _ => serde_json::Value::Array(blocks.iter().map(block_json).collect()),
+    }
+}
+
+/// Build the `/v1/messages` request body for one turn.
+///
+/// Extracted from `AnthropicProvider::run_turn` so the body is inspectable
+/// without a network call. It is the seam the golden tests pin: the block-list
+/// migration has to leave this function's output byte-identical for a
+/// text-only turn, and there is no way to check that while the body is built
+/// inline and handed straight to `reqwest`.
+fn build_request_body(model: &str, turn: &ModelTurn) -> serde_json::Value {
+    let messages: Vec<serde_json::Value> = turn
+        .messages
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "role": role_str(m.role),
+                "content": flatten_content(&m.content),
+            })
+        })
+        .collect();
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "max_tokens": MAX_TOKENS,
+        "messages": messages,
+        "stream": true,
+    });
+    if let Some(system) = &turn.system {
+        body["system"] = serde_json::json!(system);
+    }
+    body
+}
+
+impl AnthropicProvider {
+    /// Fold the accumulator into an outcome. One place so the four exit paths
+    /// through the stream loop cannot disagree about the shape.
+    fn outcome(&self, acc: StreamAccumulator, stopped: bool) -> TurnOutcome {
+        TurnOutcome {
+            text: acc.text(),
+            blocks: acc.blocks(),
+            stop_reason: acc.stop_reason.clone(),
+            stopped,
+            model: self.model.clone(),
+        }
     }
 }
 
@@ -136,31 +412,14 @@ impl ModelProvider for AnthropicProvider {
         if *cancel.borrow() {
             return Ok(TurnOutcome {
                 text: String::new(),
+                blocks: Vec::new(),
+                stop_reason: None,
                 stopped: true,
                 model: self.model.clone(),
             });
         }
 
-        let messages: Vec<serde_json::Value> = turn
-            .messages
-            .iter()
-            .map(|m| {
-                serde_json::json!({
-                    "role": role_str(m.role),
-                    "content": m.content,
-                })
-            })
-            .collect();
-
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "max_tokens": MAX_TOKENS,
-            "messages": messages,
-            "stream": true,
-        });
-        if let Some(system) = &turn.system {
-            body["system"] = serde_json::json!(system);
-        }
+        let body = build_request_body(&self.model, &turn);
 
         let client = reqwest::Client::new();
         let response = client
@@ -184,7 +443,7 @@ impl ModelProvider for AnthropicProvider {
 
         let mut byte_stream = response.bytes_stream();
         let mut line_buffer = String::new();
-        let mut accumulated = String::new();
+        let mut acc = StreamAccumulator::default();
 
         loop {
             tokio::select! {
@@ -192,11 +451,7 @@ impl ModelProvider for AnthropicProvider {
 
                 changed = cancel.changed() => {
                     if changed.is_err() || *cancel.borrow() {
-                        return Ok(TurnOutcome {
-                            text: accumulated,
-                            stopped: true,
-                            model: self.model.clone(),
-                        });
+                        return Ok(self.outcome(acc, true));
                     }
                 }
 
@@ -210,22 +465,20 @@ impl ModelProvider for AnthropicProvider {
 
                                 let Some(v) = parse_sse_data_line(&line) else { continue };
 
-                                if let Some(delta) = extract_text_delta(&v) {
-                                    accumulated.push_str(delta);
+                                let had_text = extract_text_delta(&v).is_some();
+                                acc.observe(&v);
+
+                                if had_text {
                                     // I-4: snapshot conversion happens here, at
                                     // the source — the sink never sees a raw
                                     // delta, only the whole string so far.
                                     // Ignored send error: no receiver just
                                     // means nobody is painting this turn.
-                                    let _ = sink.send(accumulated.clone()).await;
+                                    let _ = sink.send(acc.text()).await;
                                 }
 
                                 if is_message_stop(&v) {
-                                    return Ok(TurnOutcome {
-                                        text: accumulated,
-                                        stopped: false,
-                                        model: self.model.clone(),
-                                    });
+                                    return Ok(self.outcome(acc, false));
                                 }
                             }
                         }
@@ -233,11 +486,7 @@ impl ModelProvider for AnthropicProvider {
                             return Err(ProviderError::Http(e.to_string()));
                         }
                         None => {
-                            return Ok(TurnOutcome {
-                                text: accumulated,
-                                stopped: false,
-                                model: self.model.clone(),
-                            });
+                            return Ok(self.outcome(acc, false));
                         }
                     }
                 }
@@ -261,6 +510,175 @@ impl ModelProvider for KeylessProvider {
         _cancel: watch::Receiver<bool>,
     ) -> Result<TurnOutcome, ProviderError> {
         Err(ProviderError::NoApiKey)
+    }
+}
+
+/// A request shape the Anthropic API rejects with a 400.
+///
+/// Every variant here was **measured**, not inferred — each corresponds to a
+/// probe against the live API that came back `invalid_request_error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireViolation {
+    /// A `tool_use` with no `tool_result` immediately after it.
+    UnansweredToolUse { id: String },
+    /// A `tool_result` whose `tool_use_id` matches no `tool_use` in the
+    /// preceding assistant message.
+    OrphanToolResult { tool_use_id: String },
+    /// `tool_result` blocks must form an uninterrupted *leading* sequence in
+    /// the turn that answers a `tool_use`. Trailing text is fine; text before
+    /// or between results is not.
+    ToolResultsNotLeading,
+    /// `text content blocks must be non-empty`.
+    EmptyTextBlock,
+    /// `content cannot be empty if is_error is true`. Empty content alone is
+    /// legal; `is_error` with content is legal; the pair is not.
+    EmptyErrorResult { tool_use_id: String },
+}
+
+impl std::fmt::Display for WireViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WireViolation::UnansweredToolUse { id } => {
+                write!(f, "`tool_use` ids were found without `tool_result` blocks immediately after: {id}")
+            }
+            WireViolation::OrphanToolResult { tool_use_id } => write!(
+                f,
+                "unexpected `tool_use_id` found in `tool_result` blocks: {tool_use_id}"
+            ),
+            WireViolation::ToolResultsNotLeading => write!(
+                f,
+                "`tool_result` blocks must lead the turn, uninterrupted"
+            ),
+            WireViolation::EmptyTextBlock => write!(f, "text content blocks must be non-empty"),
+            WireViolation::EmptyErrorResult { tool_use_id } => write!(
+                f,
+                "content cannot be empty if `is_error` is true: {tool_use_id}"
+            ),
+        }
+    }
+}
+
+/// Check a turn against the request-validity rules the API enforces.
+///
+/// This is the piece that makes a scripted test mean something. A test double
+/// that answers anything will happily answer a message list the real API would
+/// refuse — so an assertion like "the stream still projects and takes a turn"
+/// passes over a broken projection. That is the same defect as a regression
+/// test that passes identically with the bug present, and this repo has shipped
+/// one already.
+pub fn validate_turn(turn: &ModelTurn) -> Result<(), WireViolation> {
+    for (i, message) in turn.messages.iter().enumerate() {
+        // Empty text is rejected wherever it appears.
+        if message
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.is_empty()))
+        {
+            return Err(WireViolation::EmptyTextBlock);
+        }
+
+        // Results must lead their turn, uninterrupted: once a non-result block
+        // is seen, no further result may appear in this message.
+        let mut seen_non_result = false;
+        for block in &message.content {
+            match block {
+                ContentBlock::ToolResult { .. } if seen_non_result => {
+                    return Err(WireViolation::ToolResultsNotLeading)
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    if *is_error && content.is_empty() {
+                        return Err(WireViolation::EmptyErrorResult {
+                            tool_use_id: tool_use_id.clone(),
+                        });
+                    }
+                    // Every result must answer a call in the message before it.
+                    let answered = i
+                        .checked_sub(1)
+                        .and_then(|p| turn.messages.get(p))
+                        .is_some_and(|prev| {
+                            prev.content.iter().any(|b| {
+                                matches!(b, ContentBlock::ToolUse { id, .. } if id == tool_use_id)
+                            })
+                        });
+                    if !answered {
+                        return Err(WireViolation::OrphanToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                        });
+                    }
+                }
+                _ => seen_non_result = true,
+            }
+        }
+
+        // Every call must be answered by the message immediately after.
+        for block in &message.content {
+            let ContentBlock::ToolUse { id, .. } = block else {
+                continue;
+            };
+            let answered = turn.messages.get(i + 1).is_some_and(|next| {
+                next.content.iter().any(|b| {
+                    matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id)
+                })
+            });
+            if !answered {
+                return Err(WireViolation::UnansweredToolUse { id: id.clone() });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Wraps another provider and refuses, exactly as the API would, any turn that
+/// violates a measured request-validity rule.
+///
+/// A sibling of `ScriptedProvider` — a test double that ships in the library
+/// because the integration tests in `tests/` need it, same as that one.
+#[derive(Debug)]
+pub struct ValidatingProvider<P> {
+    inner: P,
+}
+
+impl<P> ValidatingProvider<P> {
+    pub fn new(inner: P) -> Self {
+        ValidatingProvider { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl<P: ModelProvider> ModelProvider for ValidatingProvider<P> {
+    async fn run_turn(
+        &self,
+        turn: ModelTurn,
+        sink: mpsc::Sender<String>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<TurnOutcome, ProviderError> {
+        if let Err(violation) = validate_turn(&turn) {
+            // Shaped like the real refusal so a caller's error handling is
+            // exercised by the double rather than bypassed.
+            return Err(ProviderError::Api {
+                status: 400,
+                body: format!(
+                    r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"{violation}"}}}}"#
+                ),
+            });
+        }
+        self.inner.run_turn(turn, sink, cancel).await
+    }
+}
+
+/// A scripted turn's block list: one `Text` block, or none when the script
+/// produced nothing. Mirrors what the accumulator would build from a text-only
+/// stream, so a test written against the double exercises the same shape the
+/// real provider returns.
+fn scripted_blocks(text: &str) -> Vec<ContentBlock> {
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![ContentBlock::Text(text.to_string())]
     }
 }
 
@@ -305,7 +723,9 @@ impl ModelProvider for ScriptedProvider {
         for (i, fragment) in self.fragments.iter().enumerate() {
             if *cancel.borrow() {
                 return Ok(TurnOutcome {
+                    blocks: scripted_blocks(&last_sent),
                     text: last_sent,
+                    stop_reason: None,
                     stopped: true,
                     model: "scripted".to_string(),
                 });
@@ -323,7 +743,9 @@ impl ModelProvider for ScriptedProvider {
         }
 
         Ok(TurnOutcome {
+            blocks: scripted_blocks(&last_sent),
             text: last_sent,
+            stop_reason: Some("end_turn".to_string()),
             stopped: false,
             model: "scripted".to_string(),
         })
@@ -517,6 +939,315 @@ mod tests {
         assert!(saw_stop);
     }
 
+    // --- streaming a tool call ---
+    //
+    // Every frame below is copied from a real `claude-sonnet-5` stream captured
+    // against the live API, including the fragment boundaries. They are ugly on
+    // purpose: the first `partial_json` fragment is the empty string, and no
+    // fragment is valid JSON on its own.
+
+    fn frames(lines: &[&str]) -> StreamAccumulator {
+        let mut acc = StreamAccumulator::default();
+        for line in lines {
+            if let Some(v) = parse_sse_data_line(line) {
+                acc.observe(&v);
+            }
+        }
+        acc
+    }
+
+    #[test]
+    fn a_tool_use_stream_accumulates_partial_json_into_one_parsed_input() {
+        let acc = frames(&[
+            r#"data: {"type":"message_start","message":{"id":"msg_01","role":"assistant","content":[]}}"#,
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01Na9x","name":"read_file","input":{}}}"#,
+            r#"data: {"type":"ping"}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"pa"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"th\": "}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"x.md\""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":", \"of"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"fset\""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":": 40}"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":15}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ]);
+
+        assert_eq!(acc.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(
+            acc.blocks(),
+            vec![ContentBlock::ToolUse {
+                id: "toolu_01Na9x".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({ "path": "x.md", "offset": 40 }),
+            }]
+        );
+    }
+
+    #[test]
+    fn the_tool_use_start_frames_empty_input_is_not_mistaken_for_the_arguments() {
+        // Measured: `content_block_start` carries `input: {}` — empty, never the
+        // real arguments. Reading it instead of the deltas yields a tool call
+        // with no parameters, which for `read_file` is a read of nothing.
+        let acc = frames(&[
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"read_file","input":{}}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a\"}"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+        ]);
+
+        let blocks = acc.blocks();
+        match &blocks[0] {
+            ContentBlock::ToolUse { input, .. } => {
+                assert_eq!(*input, serde_json::json!({ "path": "a" }));
+            }
+            other => panic!("expected a tool_use block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_is_read_from_message_delta_not_message_stop() {
+        // The loop's termination signal lives on `message_delta`. `message_stop`
+        // carries nothing, and the pre-tool parser only ever looked at that —
+        // so a turn that ended to call a tool was indistinguishable from one
+        // that finished talking.
+        let ended = frames(&[
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ]);
+        assert_eq!(ended.stop_reason.as_deref(), Some("end_turn"));
+
+        let truncated = frames(&[
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#,
+        ]);
+        assert_eq!(truncated.stop_reason.as_deref(), Some("max_tokens"));
+    }
+
+    #[test]
+    fn a_text_only_stream_still_yields_exactly_one_text_block() {
+        let acc = frames(&[
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"!"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        ]);
+
+        assert_eq!(acc.text(), "Hello!");
+        assert_eq!(acc.blocks(), vec![ContentBlock::Text("Hello!".to_string())]);
+    }
+
+    #[test]
+    fn text_and_a_tool_call_in_one_turn_keep_their_order() {
+        let acc = frames(&[
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"reading it"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"read_file","input":{}}}"#,
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a\"}"}}"#,
+            r#"data: {"type":"content_block_stop","index":1}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+        ]);
+
+        assert_eq!(acc.text(), "reading it");
+        assert_eq!(acc.blocks().len(), 2);
+        assert!(matches!(acc.blocks()[0], ContentBlock::Text(_)));
+        assert!(matches!(acc.blocks()[1], ContentBlock::ToolUse { .. }));
+    }
+
+    #[test]
+    fn unparseable_tool_input_yields_no_tool_block_rather_than_a_fabricated_one() {
+        // A `max_tokens` cut mid-`input_json_delta` leaves fragments that do not
+        // parse. Executing a tool with salvaged arguments is worse than not
+        // executing it: a `read_file` with a truncated path reads the wrong
+        // file, and the guard will happily allow it if the truncation is still
+        // inside root. Drop the block; the turn's `stop_reason` already says
+        // `max_tokens`, so the loop can see what happened.
+        let acc = frames(&[
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"read_file","input":{}}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\": \"oper"}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#,
+        ]);
+
+        assert_eq!(acc.stop_reason.as_deref(), Some("max_tokens"));
+        assert!(
+            acc.blocks().is_empty(),
+            "a half-parsed tool call must not become a block: {:?}",
+            acc.blocks()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_outcome_carries_the_blocks_and_the_stop_reason_not_just_text() {
+        // `text` alone cannot express a tool call, so the loop had no way to
+        // learn the model asked for one — it only ever saw a string. These two
+        // fields are what make a second round decidable.
+        let provider = ScriptedProvider::new(vec!["The", "The engine hums"]);
+        let (tx, _rx) = mpsc::channel(8);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = provider.run_turn(empty_turn(), tx, cancel_rx).await.unwrap();
+
+        assert_eq!(outcome.text, "The engine hums");
+        assert_eq!(outcome.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(
+            outcome.blocks,
+            vec![ContentBlock::Text("The engine hums".to_string())]
+        );
+    }
+
+    // --- the validating double ---
+    //
+    // Each case below is a shape MEASURED against the live API as a 400. A
+    // scripted provider validates nothing, so a test asserting "the stream
+    // still projects and takes a turn" passes over a projection the real API
+    // would refuse. These are what stop that.
+
+    fn user(blocks: Vec<ContentBlock>) -> ProviderMessage {
+        ProviderMessage {
+            role: ProviderRole::User,
+            content: blocks,
+        }
+    }
+    fn assistant(blocks: Vec<ContentBlock>) -> ProviderMessage {
+        ProviderMessage {
+            role: ProviderRole::Assistant,
+            content: blocks,
+        }
+    }
+    fn tool_use(id: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({ "path": "x.md" }),
+        }
+    }
+    fn tool_result(id: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: "contents".to_string(),
+            is_error: false,
+        }
+    }
+    fn turn_of(messages: Vec<ProviderMessage>) -> ModelTurn {
+        ModelTurn {
+            system: None,
+            messages,
+        }
+    }
+
+    #[test]
+    fn a_well_formed_tool_round_validates() {
+        let turn = turn_of(vec![
+            user(vec![ContentBlock::text("read x")]),
+            assistant(vec![ContentBlock::text("on it"), tool_use("t1")]),
+            user(vec![tool_result("t1")]),
+        ]);
+        assert_eq!(validate_turn(&turn), Ok(()));
+    }
+
+    #[test]
+    fn an_unanswered_tool_use_is_refused() {
+        let turn = turn_of(vec![
+            user(vec![ContentBlock::text("read x")]),
+            assistant(vec![tool_use("t1")]),
+            user(vec![ContentBlock::text("never mind")]),
+        ]);
+        assert_eq!(
+            validate_turn(&turn),
+            Err(WireViolation::UnansweredToolUse { id: "t1".into() })
+        );
+    }
+
+    #[test]
+    fn a_tool_result_with_no_preceding_tool_use_is_refused() {
+        // This is the shape a boot-time composition pushed as a tool_result
+        // would have had. The API rejects it outright.
+        let turn = turn_of(vec![user(vec![
+            tool_result("t-nonexistent"),
+            ContentBlock::text("what repos exist?"),
+        ])]);
+        assert_eq!(
+            validate_turn(&turn),
+            Err(WireViolation::OrphanToolResult {
+                tool_use_id: "t-nonexistent".into()
+            })
+        );
+    }
+
+    #[test]
+    fn tool_results_must_lead_their_turn_uninterrupted() {
+        let turn = turn_of(vec![
+            user(vec![ContentBlock::text("read x")]),
+            assistant(vec![tool_use("t1"), tool_use("t2")]),
+            user(vec![
+                tool_result("t1"),
+                ContentBlock::text("also, hello"),
+                tool_result("t2"),
+            ]),
+        ]);
+        assert_eq!(
+            validate_turn(&turn),
+            Err(WireViolation::ToolResultsNotLeading)
+        );
+    }
+
+    #[test]
+    fn an_empty_text_block_is_refused() {
+        let turn = turn_of(vec![
+            user(vec![ContentBlock::text("hi")]),
+            assistant(vec![ContentBlock::text(""), tool_use("t1")]),
+            user(vec![tool_result("t1")]),
+        ]);
+        assert_eq!(validate_turn(&turn), Err(WireViolation::EmptyTextBlock));
+    }
+
+    #[test]
+    fn an_error_result_with_empty_content_is_refused() {
+        // The combination is the illegal one: empty content alone is fine, and
+        // is_error with content is fine. Every error path the loop can take has
+        // to render something, which is why "name the recovery action" is a
+        // wire requirement and not a style preference.
+        let turn = turn_of(vec![
+            user(vec![ContentBlock::text("read x")]),
+            assistant(vec![tool_use("t1")]),
+            user(vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                content: String::new(),
+                is_error: true,
+            }]),
+        ]);
+        assert_eq!(
+            validate_turn(&turn),
+            Err(WireViolation::EmptyErrorResult {
+                tool_use_id: "t1".into()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn the_validating_provider_refuses_rather_than_answering() {
+        let provider = ValidatingProvider::new(ScriptedProvider::new(vec!["ok"]));
+        let bad = turn_of(vec![
+            user(vec![ContentBlock::text("read x")]),
+            assistant(vec![tool_use("t1")]),
+            user(vec![ContentBlock::text("never mind")]),
+        ]);
+        let (tx, _rx) = mpsc::channel(8);
+        let (_c, cancel_rx) = watch::channel(false);
+
+        let err = provider.run_turn(bad, tx, cancel_rx).await.unwrap_err();
+
+        match err {
+            ProviderError::Api { status, body } => {
+                assert_eq!(status, 400);
+                assert!(body.contains("t1"), "the violation should name it: {body}");
+            }
+            other => panic!("expected a 400 like the real API, got {other:?}"),
+        }
+    }
+
     // --- KeylessProvider ---
 
     #[tokio::test]
@@ -528,6 +1259,172 @@ mod tests {
         let err = provider.run_turn(empty_turn(), tx, cancel_rx).await.unwrap_err();
 
         assert_eq!(err, ProviderError::NoApiKey);
+    }
+
+    // --- the request body, pinned ---
+    //
+    // These two goldens are captured against the PRE-migration build and must
+    // not be regenerated afterwards. Their whole job is to let the block-list
+    // migration prove it is inert rather than assert it: a golden written after
+    // the change would pass by construction and prove nothing, which is the
+    // "regression test that passes identically with the bug present" defect this
+    // repo has already shipped once.
+
+    #[test]
+    fn request_body_for_a_text_only_turn_is_the_pinned_shape() {
+        let turn = ModelTurn {
+            system: Some("# boot".to_string()),
+            messages: vec![
+                ProviderMessage {
+                    role: ProviderRole::User,
+                    content: vec![ContentBlock::Text("hi".to_string())],
+                },
+                ProviderMessage {
+                    role: ProviderRole::Assistant,
+                    content: vec![ContentBlock::Text("hello".to_string())],
+                },
+                ProviderMessage {
+                    role: ProviderRole::User,
+                    content: vec![ContentBlock::Text("bye".to_string())],
+                },
+            ],
+        };
+
+        assert_eq!(
+            build_request_body("claude-sonnet-5", &turn),
+            serde_json::json!({
+                "model": "claude-sonnet-5",
+                "max_tokens": 64000,
+                "stream": true,
+                "system": "# boot",
+                "messages": [
+                    { "role": "user", "content": "hi" },
+                    { "role": "assistant", "content": "hello" },
+                    { "role": "user", "content": "bye" },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn request_body_omits_system_entirely_when_no_boot_event_stands() {
+        // Not `"system": null` — the key is absent. A bare clone declares no
+        // boot file, and this is the shape that has been in production since
+        // the boot channel shipped.
+        let turn = ModelTurn {
+            system: None,
+            messages: vec![ProviderMessage {
+                role: ProviderRole::User,
+                content: vec![ContentBlock::Text("hi".to_string())],
+            }],
+        };
+
+        let body = build_request_body("claude-sonnet-5", &turn);
+
+        assert!(body.get("system").is_none(), "system must be absent, got: {body}");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "model": "claude-sonnet-5",
+                "max_tokens": 64000,
+                "stream": true,
+                "messages": [{ "role": "user", "content": "hi" }],
+            })
+        );
+    }
+
+    // --- block flattening (P-4's materialization edge) ---
+
+    fn text_msg(role: ProviderRole, s: &str) -> ProviderMessage {
+        ProviderMessage {
+            role,
+            content: vec![ContentBlock::Text(s.to_string())],
+        }
+    }
+
+    #[test]
+    fn a_lone_text_block_flattens_to_a_bare_string_not_a_block_list() {
+        // The wire accepts both forms. Choosing the string keeps every
+        // text-only turn byte-identical to the pre-migration build, so the
+        // goldens above stay valid and the migration's blast radius is only
+        // turns that actually use tools.
+        let turn = ModelTurn {
+            system: None,
+            messages: vec![text_msg(ProviderRole::User, "hi")],
+        };
+
+        assert_eq!(
+            build_request_body("m", &turn)["messages"][0]["content"],
+            serde_json::json!("hi")
+        );
+    }
+
+    #[test]
+    fn a_message_carrying_a_tool_use_flattens_to_a_block_list() {
+        let turn = ModelTurn {
+            system: None,
+            messages: vec![ProviderMessage {
+                role: ProviderRole::Assistant,
+                content: vec![
+                    ContentBlock::Text("reading it".to_string()),
+                    ContentBlock::ToolUse {
+                        id: "toolu_01AAA".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({ "path": "x.md" }),
+                    },
+                ],
+            }],
+        };
+
+        assert_eq!(
+            build_request_body("m", &turn)["messages"][0]["content"],
+            serde_json::json!([
+                { "type": "text", "text": "reading it" },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_01AAA",
+                    "name": "read_file",
+                    "input": { "path": "x.md" },
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn a_tool_result_block_never_emits_the_typed_status_to_the_wire() {
+        // MEASURED against the live API: a `status` key inside a `tool_result`
+        // block returns 400 `invalid_request_error` — "Extra inputs are not
+        // permitted". The typed status is sovereign in the LOG; at the wire it
+        // survives only as `is_error` plus whatever the projection rendered
+        // into `content`. That is P-4's "as far as the provider channel
+        // allows", and this test is what stops someone re-adding the field.
+        let turn = ModelTurn {
+            system: None,
+            messages: vec![ProviderMessage {
+                role: ProviderRole::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_01AAA".to_string(),
+                    content: "denied_credential: refused; try a path under operators/".to_string(),
+                    is_error: true,
+                }],
+            }],
+        };
+
+        let block = &build_request_body("m", &turn)["messages"][0]["content"][0];
+
+        assert!(
+            block.get("status").is_none(),
+            "a status key on the wire is a 400: {block}"
+        );
+        assert_eq!(
+            *block,
+            serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_01AAA",
+                "content": "denied_credential: refused; try a path under operators/",
+                "is_error": true,
+            })
+        );
     }
 
     // --- AnthropicProvider ---
@@ -560,7 +1457,7 @@ mod tests {
             system: None,
             messages: vec![ProviderMessage {
                 role: ProviderRole::User,
-                content: "Reply with exactly one word: hello".to_string(),
+                content: vec![ContentBlock::Text("Reply with exactly one word: hello".to_string())],
             }],
         };
         let (tx, mut rx) = mpsc::channel(32);
