@@ -128,6 +128,23 @@ pub enum ProjectionError {
     /// `root`. A boot path has no legitimate reason to leave the workspace
     /// root, so "escaped" and "unreadable" are one caller-visible outcome.
     BootUnreadable { path: String },
+    /// **DD-1.** The workspace manifests no longer hash to what the last
+    /// standing `composition` event recorded — one was edited, created, or
+    /// removed since it was written, so the session is describing a workspace
+    /// that no longer exists.
+    ///
+    /// Carries no path, unlike `BootDrift`: the composition is derived from
+    /// *all* the manifests together, so the recovery re-derives the whole
+    /// thing rather than re-reading one file. Which manifest moved is a
+    /// diagnostic, not something the repair needs.
+    ///
+    /// **Only the manifests are watched.** A protocol *source* (a board, an
+    /// athanor) changes constantly without the composition changing at all,
+    /// so its digest is neither recorded nor checked — see
+    /// `tools::composition_event_data`. The cost is that a protocol source
+    /// appearing or disappearing mid-session does not re-derive `present`
+    /// until something else does.
+    CompositionDrift,
     /// One or more `tool_use` events in this projection have no answering
     /// `tool_result`. The provider rejects that outright, so the caller must
     /// heal before it can take a turn.
@@ -166,6 +183,7 @@ pub enum ProjectionError {
 const HANDLED_TYPES: &[&str] = &[
     "instance_created",
     "boot",
+    "composition",
     "user_message",
     "assistant_message",
     "interrupt",
@@ -340,6 +358,55 @@ fn render_tool_result(status: &str, body: &str, is_error: bool) -> String {
     }
 }
 
+/// True when the manifests on disk no longer match what this `composition`
+/// event recorded — edited, created, or removed.
+///
+/// Compares the recorded `(path, sha256)` pairs against the current ones as
+/// sets, so all three changes are one comparison. A manifest the engine could
+/// not read is absent from both sides, which is what "not composed" means.
+fn manifests_drifted(root: &Path, data: &serde_json::Value) -> bool {
+    let recorded: Vec<(String, String)> = data
+        .get("manifests")
+        .and_then(|m| m.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|e| (text_field(e, "path"), text_field(e, "sha256")))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let current: Vec<(String, String)> = crate::tools::MANIFEST_FILES
+        .iter()
+        .filter_map(|name| {
+            std::fs::read(root.join(name))
+                .ok()
+                .map(|bytes| (name.to_string(), sha256_hex(&bytes)))
+        })
+        .collect();
+
+    recorded != current
+}
+
+/// The model-visible composition.
+///
+/// **The framing line is load-bearing.** `boot` gets the system slot and there
+/// is only one, so this rides in a User-role turn — and a User turn the user
+/// did not write is exactly the confusion D3 created by forging a tool result.
+/// Saying so in the content is the honest version: the model can tell who
+/// authored it, which is as far toward the boundary as the channel carries
+/// provenance (P-4).
+fn render_composition(data: &serde_json::Value) -> String {
+    let body = data.get("composition").unwrap_or(data);
+    let rendered =
+        serde_json::to_string_pretty(body).unwrap_or_else(|_| "unavailable".to_string());
+    format!(
+        "[engine] This workspace is composed of the following, derived by the engine from its \
+         manifest files. This is a record the engine placed here, not a message from the user.\n\
+         {rendered}"
+    )
+}
+
 fn text_field(data: &serde_json::Value, key: &str) -> String {
     data.get(key)
         .and_then(|v| v.as_str())
@@ -442,6 +509,14 @@ pub fn project_context(
         .rfind(|ev| ev.event_type == "boot" && !evicted.contains(ev.id.as_str()))
         .map(|ev| ev.id.as_str());
 
+    // DD-1 inherits the same rule, for the same reason: the drift recovery
+    // re-records rather than editing history, so validating every historical
+    // composition would fail on the very event the repair just superseded.
+    let last_composition_id: Option<&str> = events
+        .iter()
+        .rfind(|ev| ev.event_type == "composition" && !evicted.contains(ev.id.as_str()))
+        .map(|ev| ev.id.as_str());
+
     let mut system: Option<String> = None;
     let mut raw: Vec<ProviderMessage> = Vec::new();
 
@@ -494,6 +569,17 @@ pub fn project_context(
                     path: path.clone(),
                 })?;
                 system = Some(content);
+            }
+
+            // Superseded by a later composition — see `last_composition_id`.
+            // Contributes nothing, and is NOT drift-checked.
+            "composition" if Some(ev.id.as_str()) != last_composition_id => {}
+
+            "composition" => {
+                if manifests_drifted(root, &ev.data) {
+                    return Err(ProjectionError::CompositionDrift);
+                }
+                raw.push(text_message(ProviderRole::User, render_composition(&ev.data)));
             }
 
             "user_message" => {
@@ -773,6 +859,145 @@ mod tests {
         let turn = project_context(&events, dir.path()).expect("the stale b1 must not fail this projection");
 
         assert_eq!(turn.system.as_deref(), Some("# current boot content"));
+    }
+
+    // ---- DD-1: the composition reaches a session as its own durable event ----
+
+    /// A workspace whose manifests are on disk, plus the event that records
+    /// them. `extra` lets a test change what the event claims.
+    fn workspace_with_manifests() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("modules.toml"), "[router]\ncontains = [\"CLAUDE.md\"]\n")
+            .unwrap();
+        dir
+    }
+
+    fn composition_event(seq: u64, id: &str, root: &Path) -> EventEnvelope {
+        ev(
+            seq,
+            id,
+            "composition",
+            crate::tools::composition_event_data(root).unwrap(),
+        )
+    }
+
+    #[test]
+    fn the_composition_projects_as_a_user_turn_the_engine_marks_as_its_own() {
+        // P-2: recorded before projected. It rides in a User-role turn because
+        // the system slot belongs to `boot` and there is only one — so the
+        // framing has to say, in the content, that the user did not write this.
+        let dir = workspace_with_manifests();
+        let events = vec![
+            composition_event(1, "c1", dir.path()),
+            ev(2, "u1", "user_message", json!({"text": "what is here?"})),
+        ];
+
+        let turn = project_context(&events, dir.path()).unwrap();
+        let first = &turn.messages[0];
+
+        assert_eq!(first.role, ProviderRole::User);
+        let text = match &first.content[0] {
+            ContentBlock::Text(t) => t.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert!(
+            text.contains("[engine]"),
+            "the model must be able to tell this from a user message: {text}"
+        );
+        assert!(text.contains("CLAUDE.md"), "the composition itself: {text}");
+    }
+
+    #[test]
+    fn a_manifest_edited_under_a_recorded_composition_is_drift() {
+        // The half D3 silently abandoned. A manifest is exactly the thing that
+        // changes mid-session — you edit `modules.local.toml` and the session
+        // is now describing a workspace that no longer exists.
+        let dir = workspace_with_manifests();
+        let events = vec![composition_event(1, "c1", dir.path())];
+
+        std::fs::write(dir.path().join("modules.toml"), "[router]\ncontains = [\"README.md\"]\n")
+            .unwrap();
+
+        assert!(matches!(
+            project_context(&events, dir.path()),
+            Err(ProjectionError::CompositionDrift)
+        ));
+    }
+
+    #[test]
+    fn a_manifest_that_appeared_or_vanished_is_drift_too() {
+        // Composition is what the manifests *collectively* declare, so a new
+        // `modules.local.toml` changes it as surely as an edit does. Comparing
+        // recorded digests to current ones catches all three the same way.
+        let dir = workspace_with_manifests();
+        let events = vec![composition_event(1, "c1", dir.path())];
+
+        std::fs::write(dir.path().join("modules.local.toml"), "[[repos]]\nname='r'\npath='p'\n")
+            .unwrap();
+        assert!(
+            matches!(project_context(&events, dir.path()), Err(ProjectionError::CompositionDrift)),
+            "a manifest that appeared"
+        );
+
+        let with_both = vec![composition_event(1, "c1", dir.path())];
+        std::fs::remove_file(dir.path().join("modules.local.toml")).unwrap();
+        assert!(
+            matches!(project_context(&with_both, dir.path()), Err(ProjectionError::CompositionDrift)),
+            "a manifest that vanished"
+        );
+    }
+
+    #[test]
+    fn a_stale_drifted_composition_superseded_by_a_later_one_does_not_error() {
+        // The same rule `boot` already lives by, and for the same reason:
+        // recovery re-records rather than editing history, so the drifted
+        // event stays in the log forever. Validating every historical one
+        // would make the repair impossible — it would fail on the very event
+        // it just superseded.
+        let dir = workspace_with_manifests();
+        let mut stale = composition_event(1, "c1", dir.path());
+        stale.data["manifests"][0]["sha256"] = json!("0".repeat(64));
+
+        let events = vec![
+            stale,
+            ev(2, "u1", "user_message", json!({"text": "hi"})),
+            composition_event(3, "c2", dir.path()),
+        ];
+
+        let turn = project_context(&events, dir.path())
+            .expect("the superseded c1 must not fail this projection");
+
+        // And only ONE composition turn survives — the stale one contributes
+        // nothing, exactly like a superseded boot.
+        let engine_turns = turn
+            .messages
+            .iter()
+            .filter(|m| {
+                m.content.iter().any(|b| matches!(b, ContentBlock::Text(t) if t.contains("[engine]")))
+            })
+            .count();
+        assert_eq!(engine_turns, 1, "{:?}", turn.messages);
+    }
+
+    #[test]
+    fn an_evicted_composition_contributes_nothing_and_is_not_checked() {
+        // P-1: evicted, not deleted. An evicted composition must not drift the
+        // stream either — it is absent from this projection entirely.
+        let dir = workspace_with_manifests();
+        let mut stale = composition_event(1, "c1", dir.path());
+        stale.data["manifests"][0]["sha256"] = json!("0".repeat(64));
+
+        let events = vec![
+            stale,
+            ev(2, "e1", "context_evict", json!({"target": "c1"})),
+            ev(3, "u1", "user_message", json!({"text": "hi"})),
+        ];
+
+        let turn = project_context(&events, dir.path()).expect("an evicted event is not checked");
+        assert!(!turn.messages.iter().any(|m| m
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("[engine]")))));
     }
 
     #[test]
@@ -1153,6 +1378,9 @@ mod tests {
             let data = match *t {
                 "instance_created" => json!({}),
                 "boot" => json!({"path": "boot.md", "sha256": sha}),
+                // No manifests on disk in this fixture, so an empty recorded
+                // list is the non-drifted state.
+                "composition" => json!({"manifests": [], "composition": {}}),
                 "user_message" => json!({"text": "hello"}),
                 "assistant_message" => json!({"text": "hi", "interrupted": false}),
                 "interrupt" => json!({}),

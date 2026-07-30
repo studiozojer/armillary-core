@@ -175,6 +175,21 @@ impl Sessions {
         partial: NewEvent,
         parent: Option<String>,
     ) -> Result<EventEnvelope, SessionError> {
+        // Everything through here is durable by construction — `seq` is
+        // `head + 1`, never 0 — so its type belongs on the durable list. The
+        // exhaustiveness guard in `projection.rs` compares two hand-maintained
+        // lists to each other and therefore cannot see a type absent from
+        // both; this is the half that can. `debug_assert` on purpose: loud in
+        // development and every test run, compiled out in release, where the
+        // projection's `[unhandled event type: …]` remains the honest fallback
+        // rather than a lost event.
+        debug_assert!(
+            crate::log::envelope::DURABLE_TYPES.contains(&partial.event_type.as_str()),
+            "appending {:?}, which is not in DURABLE_TYPES — declare it there and give \
+             `project_context` an arm, or it reaches the model as an unhandled marker",
+            partial.event_type
+        );
+
         let mut inner = self.inner.lock().unwrap();
 
         let seq = self.store.head_seq(stream)? + 1;
@@ -307,6 +322,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LogStore::open(dir.path()).unwrap();
         (dir, Sessions::new(store))
+    }
+
+    #[test]
+    #[should_panic(expected = "not in DURABLE_TYPES")]
+    fn appending_a_type_that_was_never_declared_durable_is_a_wiring_bug() {
+        // The gap `handled_types_cover_every_durable_type` cannot see. That
+        // guard compares two hand-maintained lists to each other, so a type
+        // absent from BOTH satisfies it — which is exactly what happened when
+        // `composition` was written, appended, and projected while appearing
+        // on neither list. The projection's honest degradation meant nothing
+        // vanished; it just rendered as `[unhandled event type: composition]`
+        // in the model's window, silently, for as long as nobody looked.
+        //
+        // `debug_assert`, deliberately: loud here and in development, compiled
+        // out in release, so a mis-declared type can never cost a real session
+        // an event on the phone — there it still degrades honestly.
+        let (_dir, sessions) = sessions();
+        sessions
+            .append(
+                "s1",
+                NewEvent {
+                    actor: actor(),
+                    event_type: "sudden_inspiration".to_string(),
+                    data: serde_json::json!({}),
+                },
+            )
+            .ok();
     }
 
     #[tokio::test]

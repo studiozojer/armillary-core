@@ -172,6 +172,47 @@ pub fn dispatch(name: &str, input: &serde_json::Value, root: &Path) -> Result<St
     }
 }
 
+/// The files a workspace's composition is byte-derived from (C-3).
+///
+/// **One list, three readers:** the payload builder hashes them, DD-1's event
+/// records those hashes, and the projection re-checks them for drift. A second
+/// copy would mean a manifest the engine parses but never watches.
+pub const MANIFEST_FILES: [&str; 2] = ["modules.toml", "modules.local.toml"];
+
+/// The composition as a durable event's `data` — **DD-1**.
+///
+/// Same builder as everything else here, reshaped into two halves that are
+/// consumed by different code:
+///
+/// - **`manifests`** keeps its sha256 digests, because that is what the
+///   projection re-checks every turn. A workspace's manifests are exactly the
+///   thing that changes mid-session, and without this the session goes on
+///   describing a workspace that no longer exists.
+/// - **`composition`** is what the model reads, with the protocol-source
+///   digests stripped. They are **not** re-checked and must not appear: a
+///   digest nobody verifies is a promise the projection does not keep, and a
+///   protocol body (a board, an athanor) changes constantly without the
+///   composition changing at all. `present` survives, because presence is the
+///   C-4 question that actually matters.
+pub fn composition_event_data(root: &Path) -> Result<serde_json::Value, ToolError> {
+    let mut body = composition_payload(root)?;
+    let obj = body
+        .as_object_mut()
+        .ok_or_else(|| ToolError::new("composition_unreadable", "composition is not an object"))?;
+
+    let manifests = obj
+        .remove("manifests")
+        .unwrap_or_else(|| serde_json::json!([]));
+
+    if let Some(sources) = obj.get_mut("protocol_sources").and_then(|v| v.as_array_mut()) {
+        for entry in sources {
+            entry.as_object_mut().map(|o| o.remove("sha256"));
+        }
+    }
+
+    Ok(serde_json::json!({ "manifests": manifests, "composition": body }))
+}
+
 /// The full composition payload — the single implementation, shared by the
 /// `/composition` route and by the tool below.
 ///
@@ -190,7 +231,7 @@ pub fn composition_payload(root: &Path) -> Result<serde_json::Value, ToolError> 
         .map_err(|e| unreadable(e.to_string()))?;
 
     let mut manifests = Vec::new();
-    for name in ["modules.toml", "modules.local.toml"] {
+    for name in MANIFEST_FILES {
         if let Ok(bytes) = std::fs::read(root.join(name)) {
             manifests.push(serde_json::json!({
                 "path": name,
