@@ -305,7 +305,13 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
     let _ = relay.await;
 
     match outcome {
-        Ok(TurnOutcome { text, stopped, model }) => {
+        // `..` discards `blocks` and `stop_reason` ON PURPOSE. They exist now so
+        // the loop *can* see a tool call, but consuming them means becoming a
+        // multi-round loop — and that carries the orphan-repair, batch-eviction
+        // and cancel-across-rounds decisions that are not settled yet. Reading
+        // them here without those would give a turn that can start a tool call
+        // and cannot finish one. This turn stays single-call by design.
+        Ok(TurnOutcome { text, stopped, model, .. }) => {
             if stopped {
                 // Step 5: the `interrupt` event is recorded BEFORE the
                 // partial assistant_message — actor user, since a stop is

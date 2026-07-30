@@ -28,9 +28,23 @@ const MAX_TOKENS: u32 = 4096;
 /// the model finished on its own — a normal end-of-stream (or a scripted
 /// provider exhausting its fragments) is `stopped: false` even if the text
 /// is short.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `text` is retained as the turn's visible prose (it is what the durable
+/// `assistant_message` records and what the transient sink streamed), but it is
+/// no longer the whole outcome: `blocks` carries every content block in wire
+/// order, and `stop_reason` is the provider's own account of why generation
+/// ended. A tool call is expressible in neither of the first two fields, which
+/// is why a loop written against the old shape could not see one.
+///
+/// No `Eq`: `blocks` may contain a `serde_json::Value`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct TurnOutcome {
     pub text: String,
+    pub blocks: Vec<ContentBlock>,
+    /// `end_turn` | `tool_use` | `max_tokens` | `refusal` | … Read from the
+    /// `message_delta` frame; `None` when the stream ended without one (a
+    /// transport cut, or a cancel before the first frame).
+    pub stop_reason: Option<String>,
     pub stopped: bool,
     pub model: String,
 }
@@ -118,6 +132,157 @@ fn is_message_stop(v: &serde_json::Value) -> bool {
     v.get("type").and_then(|t| t.as_str()) == Some("message_stop")
 }
 
+/// A block still being streamed. `ToolUse.json` is the raw concatenation of
+/// `input_json_delta` fragments — no fragment is valid JSON on its own, so
+/// parsing happens once, at materialization.
+#[derive(Debug)]
+enum PartialBlock {
+    Text(String),
+    ToolUse {
+        id: String,
+        name: String,
+        json: String,
+    },
+}
+
+/// Folds an Anthropic SSE stream into content blocks and a stop reason.
+///
+/// Three things this exists to get right, each measured against a live stream:
+///
+/// 1. **`content_block_start` for a `tool_use` carries `input: {}`** — empty,
+///    never the arguments. The arguments arrive only as `input_json_delta`
+///    fragments and must be concatenated in arrival order.
+/// 2. **The first fragment is frequently the empty string**, and no fragment is
+///    independently parseable (`""`, `{"`, `pa`, `th": ` …). Parse once, at the
+///    end, over the concatenation.
+/// 3. **`stop_reason` arrives on `message_delta`, not `message_stop`.** The
+///    pre-tool parser only inspected `message_stop`, so a turn that ended in
+///    order to call a tool looked exactly like one that finished talking.
+///
+/// Keyed by the frame's `index` so blocks materialize in wire order regardless
+/// of frame interleaving.
+#[derive(Debug, Default)]
+struct StreamAccumulator {
+    open: std::collections::BTreeMap<u64, PartialBlock>,
+    stop_reason: Option<String>,
+}
+
+impl StreamAccumulator {
+    fn observe(&mut self, v: &serde_json::Value) {
+        let frame = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+        let index = v.get("index").and_then(|i| i.as_u64());
+
+        match frame {
+            "content_block_start" => {
+                let (Some(index), Some(block)) = (index, v.get("content_block")) else {
+                    return;
+                };
+                let kind = block.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+                match kind {
+                    "text" => {
+                        let seed = block.get("text").and_then(|t| t.as_str()).unwrap_or_default();
+                        self.open.insert(index, PartialBlock::Text(seed.to_string()));
+                    }
+                    "tool_use" => {
+                        self.open.insert(
+                            index,
+                            PartialBlock::ToolUse {
+                                id: block
+                                    .get("id")
+                                    .and_then(|i| i.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                name: block
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                // NOT block["input"] — it is always `{}` here.
+                                json: String::new(),
+                            },
+                        );
+                    }
+                    // A block kind this engine does not model (thinking,
+                    // server_tool_use, …). Deliberately not opened: an unknown
+                    // block we cannot faithfully echo back is worse than one we
+                    // never claim to have.
+                    _ => {}
+                }
+            }
+
+            "content_block_delta" => {
+                let (Some(index), Some(delta)) = (index, v.get("delta")) else {
+                    return;
+                };
+                let kind = delta.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+                match (self.open.get_mut(&index), kind) {
+                    (Some(PartialBlock::Text(buf)), "text_delta") => {
+                        if let Some(t) = delta.get("text").and_then(|t| t.as_str()) {
+                            buf.push_str(t);
+                        }
+                    }
+                    (Some(PartialBlock::ToolUse { json, .. }), "input_json_delta") => {
+                        if let Some(fragment) = delta.get("partial_json").and_then(|p| p.as_str()) {
+                            json.push_str(fragment);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            "message_delta" => {
+                if let Some(reason) = v
+                    .get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(|r| r.as_str())
+                {
+                    self.stop_reason = Some(reason.to_string());
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    /// The turn's visible text — every `Text` block concatenated. This is what
+    /// the transient sink has always carried (I-4: a snapshot, not an
+    /// increment), unchanged by the arrival of tool blocks.
+    fn text(&self) -> String {
+        self.open
+            .values()
+            .filter_map(|b| match b {
+                PartialBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Materialize in wire order.
+    ///
+    /// A `tool_use` whose accumulated fragments do not parse is **dropped**, not
+    /// salvaged. That happens when `max_tokens` cuts the stream mid-arguments,
+    /// and a partially-parsed argument set is the dangerous outcome: a
+    /// `read_file` with a truncated path is a read of the wrong file, and
+    /// `guard::resolve` will allow it if the truncation is still inside root.
+    /// The turn's `stop_reason` is already `max_tokens`, so the caller can tell
+    /// what happened without being handed a fabricated call.
+    fn blocks(&self) -> Vec<ContentBlock> {
+        self.open
+            .values()
+            .filter_map(|b| match b {
+                PartialBlock::Text(t) => Some(ContentBlock::Text(t.clone())),
+                PartialBlock::ToolUse { id, name, json } => serde_json::from_str(json)
+                    .ok()
+                    .map(|input| ContentBlock::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input,
+                    }),
+            })
+            .collect()
+    }
+}
+
 fn role_str(role: ProviderRole) -> &'static str {
     match role {
         ProviderRole::User => "user",
@@ -197,6 +362,20 @@ fn build_request_body(model: &str, turn: &ModelTurn) -> serde_json::Value {
     body
 }
 
+impl AnthropicProvider {
+    /// Fold the accumulator into an outcome. One place so the four exit paths
+    /// through the stream loop cannot disagree about the shape.
+    fn outcome(&self, acc: StreamAccumulator, stopped: bool) -> TurnOutcome {
+        TurnOutcome {
+            text: acc.text(),
+            blocks: acc.blocks(),
+            stop_reason: acc.stop_reason.clone(),
+            stopped,
+            model: self.model.clone(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ModelProvider for AnthropicProvider {
     async fn run_turn(
@@ -208,6 +387,8 @@ impl ModelProvider for AnthropicProvider {
         if *cancel.borrow() {
             return Ok(TurnOutcome {
                 text: String::new(),
+                blocks: Vec::new(),
+                stop_reason: None,
                 stopped: true,
                 model: self.model.clone(),
             });
@@ -237,7 +418,7 @@ impl ModelProvider for AnthropicProvider {
 
         let mut byte_stream = response.bytes_stream();
         let mut line_buffer = String::new();
-        let mut accumulated = String::new();
+        let mut acc = StreamAccumulator::default();
 
         loop {
             tokio::select! {
@@ -245,11 +426,7 @@ impl ModelProvider for AnthropicProvider {
 
                 changed = cancel.changed() => {
                     if changed.is_err() || *cancel.borrow() {
-                        return Ok(TurnOutcome {
-                            text: accumulated,
-                            stopped: true,
-                            model: self.model.clone(),
-                        });
+                        return Ok(self.outcome(acc, true));
                     }
                 }
 
@@ -263,22 +440,20 @@ impl ModelProvider for AnthropicProvider {
 
                                 let Some(v) = parse_sse_data_line(&line) else { continue };
 
-                                if let Some(delta) = extract_text_delta(&v) {
-                                    accumulated.push_str(delta);
+                                let had_text = extract_text_delta(&v).is_some();
+                                acc.observe(&v);
+
+                                if had_text {
                                     // I-4: snapshot conversion happens here, at
                                     // the source — the sink never sees a raw
                                     // delta, only the whole string so far.
                                     // Ignored send error: no receiver just
                                     // means nobody is painting this turn.
-                                    let _ = sink.send(accumulated.clone()).await;
+                                    let _ = sink.send(acc.text()).await;
                                 }
 
                                 if is_message_stop(&v) {
-                                    return Ok(TurnOutcome {
-                                        text: accumulated,
-                                        stopped: false,
-                                        model: self.model.clone(),
-                                    });
+                                    return Ok(self.outcome(acc, false));
                                 }
                             }
                         }
@@ -286,11 +461,7 @@ impl ModelProvider for AnthropicProvider {
                             return Err(ProviderError::Http(e.to_string()));
                         }
                         None => {
-                            return Ok(TurnOutcome {
-                                text: accumulated,
-                                stopped: false,
-                                model: self.model.clone(),
-                            });
+                            return Ok(self.outcome(acc, false));
                         }
                     }
                 }
@@ -314,6 +485,18 @@ impl ModelProvider for KeylessProvider {
         _cancel: watch::Receiver<bool>,
     ) -> Result<TurnOutcome, ProviderError> {
         Err(ProviderError::NoApiKey)
+    }
+}
+
+/// A scripted turn's block list: one `Text` block, or none when the script
+/// produced nothing. Mirrors what the accumulator would build from a text-only
+/// stream, so a test written against the double exercises the same shape the
+/// real provider returns.
+fn scripted_blocks(text: &str) -> Vec<ContentBlock> {
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![ContentBlock::Text(text.to_string())]
     }
 }
 
@@ -358,7 +541,9 @@ impl ModelProvider for ScriptedProvider {
         for (i, fragment) in self.fragments.iter().enumerate() {
             if *cancel.borrow() {
                 return Ok(TurnOutcome {
+                    blocks: scripted_blocks(&last_sent),
                     text: last_sent,
+                    stop_reason: None,
                     stopped: true,
                     model: "scripted".to_string(),
                 });
@@ -376,7 +561,9 @@ impl ModelProvider for ScriptedProvider {
         }
 
         Ok(TurnOutcome {
+            blocks: scripted_blocks(&last_sent),
             text: last_sent,
+            stop_reason: Some("end_turn".to_string()),
             stopped: false,
             model: "scripted".to_string(),
         })
@@ -568,6 +755,164 @@ mod tests {
 
         assert_eq!(accumulated, "Hello!");
         assert!(saw_stop);
+    }
+
+    // --- streaming a tool call ---
+    //
+    // Every frame below is copied from a real `claude-sonnet-5` stream captured
+    // against the live API, including the fragment boundaries. They are ugly on
+    // purpose: the first `partial_json` fragment is the empty string, and no
+    // fragment is valid JSON on its own.
+
+    fn frames(lines: &[&str]) -> StreamAccumulator {
+        let mut acc = StreamAccumulator::default();
+        for line in lines {
+            if let Some(v) = parse_sse_data_line(line) {
+                acc.observe(&v);
+            }
+        }
+        acc
+    }
+
+    #[test]
+    fn a_tool_use_stream_accumulates_partial_json_into_one_parsed_input() {
+        let acc = frames(&[
+            r#"data: {"type":"message_start","message":{"id":"msg_01","role":"assistant","content":[]}}"#,
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01Na9x","name":"read_file","input":{}}}"#,
+            r#"data: {"type":"ping"}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"pa"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"th\": "}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"x.md\""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":", \"of"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"fset\""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":": 40}"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":15}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ]);
+
+        assert_eq!(acc.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(
+            acc.blocks(),
+            vec![ContentBlock::ToolUse {
+                id: "toolu_01Na9x".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({ "path": "x.md", "offset": 40 }),
+            }]
+        );
+    }
+
+    #[test]
+    fn the_tool_use_start_frames_empty_input_is_not_mistaken_for_the_arguments() {
+        // Measured: `content_block_start` carries `input: {}` — empty, never the
+        // real arguments. Reading it instead of the deltas yields a tool call
+        // with no parameters, which for `read_file` is a read of nothing.
+        let acc = frames(&[
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"read_file","input":{}}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a\"}"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+        ]);
+
+        let blocks = acc.blocks();
+        match &blocks[0] {
+            ContentBlock::ToolUse { input, .. } => {
+                assert_eq!(*input, serde_json::json!({ "path": "a" }));
+            }
+            other => panic!("expected a tool_use block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_reason_is_read_from_message_delta_not_message_stop() {
+        // The loop's termination signal lives on `message_delta`. `message_stop`
+        // carries nothing, and the pre-tool parser only ever looked at that —
+        // so a turn that ended to call a tool was indistinguishable from one
+        // that finished talking.
+        let ended = frames(&[
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ]);
+        assert_eq!(ended.stop_reason.as_deref(), Some("end_turn"));
+
+        let truncated = frames(&[
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#,
+        ]);
+        assert_eq!(truncated.stop_reason.as_deref(), Some("max_tokens"));
+    }
+
+    #[test]
+    fn a_text_only_stream_still_yields_exactly_one_text_block() {
+        let acc = frames(&[
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"!"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        ]);
+
+        assert_eq!(acc.text(), "Hello!");
+        assert_eq!(acc.blocks(), vec![ContentBlock::Text("Hello!".to_string())]);
+    }
+
+    #[test]
+    fn text_and_a_tool_call_in_one_turn_keep_their_order() {
+        let acc = frames(&[
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"reading it"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"read_file","input":{}}}"#,
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a\"}"}}"#,
+            r#"data: {"type":"content_block_stop","index":1}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+        ]);
+
+        assert_eq!(acc.text(), "reading it");
+        assert_eq!(acc.blocks().len(), 2);
+        assert!(matches!(acc.blocks()[0], ContentBlock::Text(_)));
+        assert!(matches!(acc.blocks()[1], ContentBlock::ToolUse { .. }));
+    }
+
+    #[test]
+    fn unparseable_tool_input_yields_no_tool_block_rather_than_a_fabricated_one() {
+        // A `max_tokens` cut mid-`input_json_delta` leaves fragments that do not
+        // parse. Executing a tool with salvaged arguments is worse than not
+        // executing it: a `read_file` with a truncated path reads the wrong
+        // file, and the guard will happily allow it if the truncation is still
+        // inside root. Drop the block; the turn's `stop_reason` already says
+        // `max_tokens`, so the loop can see what happened.
+        let acc = frames(&[
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"read_file","input":{}}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\": \"oper"}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#,
+        ]);
+
+        assert_eq!(acc.stop_reason.as_deref(), Some("max_tokens"));
+        assert!(
+            acc.blocks().is_empty(),
+            "a half-parsed tool call must not become a block: {:?}",
+            acc.blocks()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_outcome_carries_the_blocks_and_the_stop_reason_not_just_text() {
+        // `text` alone cannot express a tool call, so the loop had no way to
+        // learn the model asked for one — it only ever saw a string. These two
+        // fields are what make a second round decidable.
+        let provider = ScriptedProvider::new(vec!["The", "The engine hums"]);
+        let (tx, _rx) = mpsc::channel(8);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+
+        let outcome = provider.run_turn(empty_turn(), tx, cancel_rx).await.unwrap();
+
+        assert_eq!(outcome.text, "The engine hums");
+        assert_eq!(outcome.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(
+            outcome.blocks,
+            vec![ContentBlock::Text("The engine hums".to_string())]
+        );
     }
 
     // --- KeylessProvider ---
