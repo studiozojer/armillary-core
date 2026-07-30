@@ -500,7 +500,16 @@ pub fn project_context(
                     // carrier, so the marker belongs here, not there.
                     content.push_str("\n[generation stopped by user]");
                 }
-                raw.push(text_message(ProviderRole::Assistant, content));
+                // An assistant turn that only called tools has no text, and an
+                // empty text block is a 400 (measured). Legal alternative,
+                // also measured: an assistant message carrying only `tool_use`
+                // blocks. So contribute nothing here and let the `tool_use`
+                // arm stand the message up — rather than synthesizing prose
+                // the model never produced, which would put words in the
+                // operator's mouth in a durable record.
+                if !content.is_empty() {
+                    raw.push(text_message(ProviderRole::Assistant, content));
+                }
             }
 
             // The interrupted flag on the assistant_message carries this;

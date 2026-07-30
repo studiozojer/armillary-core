@@ -213,12 +213,12 @@ impl RecordingProvider {
 impl ModelProvider for RecordingProvider {
     async fn run_turn(
         &self,
-        turn: ModelTurn,
+        req: armillary_engine::provider::TurnRequest,
         sink: mpsc::Sender<String>,
         cancel: watch::Receiver<bool>,
     ) -> Result<TurnOutcome, ProviderError> {
-        *self.last_turn.lock().unwrap() = Some(turn.clone());
-        self.inner.run_turn(turn, sink, cancel).await
+        *self.last_turn.lock().unwrap() = Some(req.turn.clone());
+        self.inner.run_turn(req, sink, cancel).await
     }
 }
 

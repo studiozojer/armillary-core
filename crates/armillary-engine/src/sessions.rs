@@ -147,6 +147,34 @@ impl Sessions {
     /// The lock is held for the whole operation (read current head, write,
     /// broadcast) — see the struct doc for why a coarse lock is fine here.
     pub fn append(&self, stream: &str, partial: NewEvent) -> Result<EventEnvelope, SessionError> {
+        self.append_inner(stream, partial, None)
+    }
+
+    /// Append an event that belongs to another event — a tool call or its
+    /// answer, linked to the assistant event that owns the batch.
+    ///
+    /// `parent` has been on the envelope since v0.1, serialized and documented
+    /// as a reserved seam, and constructed nowhere. It is what makes batch
+    /// membership a *filter*: eviction has to take a whole tool batch or the
+    /// stream dies (both halves of a split pair are a measured 400), and a
+    /// positional walk from the assistant event breaks as soon as anything in
+    /// the batch has already been evicted — which is exactly when the rule is
+    /// being asked to work.
+    pub fn append_child(
+        &self,
+        stream: &str,
+        parent: &str,
+        partial: NewEvent,
+    ) -> Result<EventEnvelope, SessionError> {
+        self.append_inner(stream, partial, Some(parent.to_string()))
+    }
+
+    fn append_inner(
+        &self,
+        stream: &str,
+        partial: NewEvent,
+        parent: Option<String>,
+    ) -> Result<EventEnvelope, SessionError> {
         let mut inner = self.inner.lock().unwrap();
 
         let seq = self.store.head_seq(stream)? + 1;
@@ -158,7 +186,7 @@ impl Sessions {
             actor: partial.actor,
             event_type: partial.event_type,
             thread: None,
-            parent: None,
+            parent,
             version: 1,
             cost: None,
             data: partial.data,

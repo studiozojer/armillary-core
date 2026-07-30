@@ -18,7 +18,9 @@
 
 use crate::log::envelope::{Actor, EventEnvelope, Role};
 use crate::projection::{project_context, ProjectionError};
-use crate::provider::{ProviderError, TurnOutcome};
+use crate::provider::ProviderError;
+#[cfg(test)]
+use crate::provider::TurnOutcome;
 use crate::sessions::{NewEvent, SessionError, Sessions};
 use crate::state::SharedState;
 use std::io;
@@ -238,146 +240,423 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
         stream: stream.clone(),
     };
 
-    // project_context over the WHOLE log — `read_from(0)` and `read_from(1)`
-    // are equivalent here (every persisted `seq` starts at 1; nothing durable
-    // is ever seq 0 — I-4), so either spelling reads the full history.
     let events = match read_all(&state.sessions, &stream).await {
         Ok(events) => events,
         Err(e) => {
             eprintln!("failed to read stream {stream:?} for a turn: {e}");
-            fail_turn(&state.sessions, &stream, "dispatcher", &generation, "boot_unreadable", &state.model.model).await;
+            fail_turn(&state.sessions, &stream, "dispatcher", &generation, "log_unreadable", &state.model.model).await;
             return;
         }
     };
     let operator = operator_label(&events);
 
-    let turn = match project_context(&events, &state.root) {
-        Ok(turn) => turn,
-        Err(ProjectionError::BootDrift { path }) => {
-            if let Err(code) = rerecord_boot(&state, &stream, &path).await {
-                fail_turn(&state.sessions, &stream, &operator, &generation, code, &state.model.model).await;
+    // Text produced by rounds already finished. The provider restarts its own
+    // accumulator on every call, so without this the phone's bubble would jump
+    // backwards at each round boundary. I-4 still holds: every transient
+    // carries a snapshot of the whole turn so far, never an increment.
+    let mut turn_text = String::new();
+    let mut round = 0usize;
+    let mut stalled = 0usize;
+    // Per-tool failure memory. letta's legacy loop dropped a just-failed tool
+    // from the offered set and halted when the set emptied; that mechanism was
+    // lost in their rewrite with no successor. It is the difference between a
+    // bound that ESCALATES and one that lets a model retry the same denied path
+    // until the round cap eats the budget.
+    let mut failed_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    loop {
+        round += 1;
+
+        // A stop that arrives between rounds is observed here. Inside a round
+        // the provider owns the signal; between them nothing else was watching.
+        if *cancel_rx.borrow() {
+            record_interrupt(&state, &stream, &operator, &generation, &turn_text).await;
+            return;
+        }
+
+        let turn = match project_healing(&state, &stream, &operator, &generation).await {
+            Some(turn) => turn,
+            None => return, // fail_turn already recorded the reason
+        };
+
+        // At a bound the tools come off and `tool_choice: none` forces prose,
+        // so the person always gets an answer instead of a turn that stops
+        // mid-investigation. Measured: accepted on this engine's model with
+        // adaptive thinking on.
+        let at_bound = round >= MAX_ROUNDS || stalled >= MAX_STALLED_ROUNDS;
+        let offered: Vec<serde_json::Value> = if at_bound {
+            Vec::new()
+        } else {
+            crate::tools::definitions()
+                .into_iter()
+                .filter(|d| {
+                    d.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|n| !failed_tools.contains(n))
+                        .unwrap_or(true)
+                })
+                .collect()
+        };
+        let force_text = at_bound || offered.is_empty();
+        let req = crate::provider::TurnRequest {
+            turn,
+            tools: offered,
+            tool_choice: force_text.then(|| serde_json::json!({ "type": "none" })),
+        };
+
+        // A fresh channel per round, and the relay prefixes what earlier rounds
+        // produced. Hoisting one channel across the whole turn would keep a
+        // sender alive that nothing drops, so the relay's `recv` never returns
+        // `None`, `run_turn` never returns, `EndTurnGuard` never fires, and the
+        // stream 409s on every later send for the life of the process.
+        let (tx, mut rx) = mpsc::channel::<String>(32);
+        let relay_sessions = state.sessions.clone();
+        let relay_stream = stream.clone();
+        let relay_operator = operator.clone();
+        let relay_generation = generation.clone();
+        let prefix = turn_text.clone();
+        let relay = tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                let snapshot = format!("{prefix}{chunk}");
+                let ev = transient_delta_envelope(&relay_stream, &relay_operator, &relay_generation, &snapshot);
+                relay_sessions.broadcast_transient(&relay_stream, ev);
+            }
+        });
+
+        let outcome = state.provider.run_turn(req, tx, cancel_rx.clone()).await;
+        let _ = relay.await;
+
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                let code = machine_code_for_provider_error(&e);
+                fail_turn(&state.sessions, &stream, &operator, &generation, &code, &state.model.model).await;
                 return;
             }
-            let events = match read_all(&state.sessions, &stream).await {
-                Ok(events) => events,
-                Err(e) => {
-                    eprintln!("failed to re-read stream {stream:?} after re-recording boot: {e}");
-                    fail_turn(&state.sessions, &stream, &operator, &generation, "boot_unreadable", &state.model.model).await;
-                    return;
+        };
+
+        let calls: Vec<(String, String, serde_json::Value)> = outcome
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                crate::projection::ContentBlock::ToolUse { id, name, input } => {
+                    Some((id.clone(), name.clone(), input.clone()))
                 }
+                _ => None,
+            })
+            .collect();
+
+        if !outcome.text.is_empty() {
+            turn_text.push_str(&outcome.text);
+        }
+
+        // Interrupted mid-generation. The `interrupt` event is recorded BEFORE
+        // the partial assistant message — a pinned ordering, and the honest
+        // one: the record reads "the user stopped it, and this is what had been
+        // produced", not the reverse.
+        if outcome.stopped {
+            let ev = NewEvent {
+                actor: Actor { role: Role::User, instance: None },
+                event_type: "interrupt".to_string(),
+                data: serde_json::json!({}),
             };
-            match project_context(&events, &state.root) {
-                Ok(turn) => turn,
-                Err(_) => {
-                    fail_turn(&state.sessions, &stream, &operator, &generation, "boot_unreadable", &state.model.model).await;
-                    return;
-                }
+            if let Err(e) = append_blocking(&state.sessions, &stream, ev).await {
+                eprintln!("log_write_failed appending interrupt for stream {stream:?}: {e:?}");
             }
-        }
-        // Unreachable in production today: nothing appends a `tool_use` event
-        // yet, so a projection cannot find one unanswered. It is a hard failure
-        // rather than a silent skip because I-5 forbids swallowing, and because
-        // reaching it would mean the log holds a shape the provider refuses.
-        //
-        // The real handling is heal-forward, and it belongs with the loop that
-        // can append: on detecting orphans, write a real `tool_result` per id
-        // with an `interrupted`-class status, then re-project. Doing that here
-        // now would be a recovery for a state this build cannot produce.
-        Err(ProjectionError::UnansweredToolUses { ids }) => {
-            eprintln!(
-                "projection found {} unanswered tool_use id(s) on stream {stream:?}: {ids:?} \
-                 — no producer exists at this build, so this indicates a hand-edited log",
-                ids.len()
-            );
-            fail_turn(
-                &state.sessions,
-                &stream,
-                &operator,
-                &generation,
-                "unanswered_tool_use",
-                &state.model.model,
-            )
-            .await;
-            return;
-        }
-        Err(ProjectionError::BootUnreadable { .. }) | Err(ProjectionError::Transient) => {
-            fail_turn(&state.sessions, &stream, &operator, &generation, "boot_unreadable", &state.model.model).await;
-            return;
-        }
-    };
-
-    // Each sink snapshot -> a transient assistant_delta (I-4: seq 0, never
-    // persisted). A separate task drains the channel concurrently with
-    // `run_turn` below so the provider's sink sends never block on a slow
-    // broadcast.
-    let (tx, mut rx) = mpsc::channel::<String>(32);
-    let relay_sessions = state.sessions.clone();
-    let relay_stream = stream.clone();
-    let relay_operator = operator.clone();
-    let relay_generation = generation.clone();
-    let relay = tokio::spawn(async move {
-        while let Some(text_so_far) = rx.recv().await {
-            let ev = transient_delta_envelope(&relay_stream, &relay_operator, &relay_generation, &text_so_far);
-            relay_sessions.broadcast_transient(&relay_stream, ev);
-        }
-    });
-
-    let outcome = state.provider.run_turn(turn, tx, cancel_rx).await;
-    // `tx` was moved into `run_turn` and dropped when it returned, so the
-    // relay's `rx.recv()` has already (or is about to) observe `None` —
-    // awaiting it here just makes sure every transient it already queued is
-    // broadcast before this function's caller (nothing — `tokio::spawn`) sees
-    // this task end.
-    let _ = relay.await;
-
-    match outcome {
-        // `..` discards `blocks` and `stop_reason` ON PURPOSE. They exist now so
-        // the loop *can* see a tool call, but consuming them means becoming a
-        // multi-round loop — and that carries the orphan-repair, batch-eviction
-        // and cancel-across-rounds decisions that are not settled yet. Reading
-        // them here without those would give a turn that can start a tool call
-        // and cannot finish one. This turn stays single-call by design.
-        Ok(TurnOutcome { text, stopped, model, .. }) => {
-            if stopped {
-                // Step 5: the `interrupt` event is recorded BEFORE the
-                // partial assistant_message — actor user, since a stop is
-                // always user-initiated in this loop (there is no other
-                // source of `cancel: true` yet).
-                let interrupt_ev = NewEvent {
-                    actor: Actor {
-                        role: Role::User,
-                        instance: None,
-                    },
-                    event_type: "interrupt".to_string(),
-                    data: serde_json::json!({}),
-                };
-                if let Err(e) = append_blocking(&state.sessions, &stream, interrupt_ev).await {
-                    eprintln!("log_write_failed appending interrupt for stream {stream:?}: {e:?}");
-                }
-            }
-            // `interrupted` is always present (rather than omitted when
-            // false) — one consistent shape for both branches, matching the
-            // brief's "pick one and be consistent" allowance.
-            let data = serde_json::json!({
-                "text": text,
-                "generation": generation,
-                "interrupted": stopped,
-                "model": model,
-            });
-            let assistant_ev = NewEvent {
+            let partial = NewEvent {
                 actor: assistant_actor(&operator),
                 event_type: "assistant_message".to_string(),
-                data,
+                data: serde_json::json!({
+                    "text": outcome.text,
+                    "generation": generation,
+                    "interrupted": true,
+                    "model": outcome.model,
+                }),
             };
-            if let Err(e) = append_blocking(&state.sessions, &stream, assistant_ev).await {
+            match append_blocking(&state.sessions, &stream, partial).await {
+                // Any call the model had begun is answered before the turn
+                // closes. An unanswered `tool_use` is a 400 that kills every
+                // later turn on this stream, so an interrupt must not be able
+                // to leave one behind.
+                Ok(ev) => answer_all(&state, &stream, &ev.id, &calls, "interrupted").await,
+                Err(e) => eprintln!(
+                    "log_write_failed appending interrupted assistant_message for stream {stream:?}: {e:?}"
+                ),
+            }
+            return;
+        }
+
+        // The assistant event is always recorded — it is what happened, and its
+        // id is the batch parent for this round's calls. An empty `text` is
+        // honest and contributes no block to the projection; synthesizing prose
+        // to fill it would put words in the operator's mouth in a durable record.
+        let assistant_id = match append_blocking(
+            &state.sessions,
+            &stream,
+            NewEvent {
+                actor: assistant_actor(&operator),
+                event_type: "assistant_message".to_string(),
+                data: serde_json::json!({
+                    "text": outcome.text,
+                    "generation": generation,
+                    "interrupted": outcome.stopped,
+                    "model": outcome.model,
+                }),
+            },
+        )
+        .await
+        {
+            Ok(ev) => ev.id,
+            Err(e) => {
                 eprintln!("log_write_failed appending assistant_message for stream {stream:?}: {e:?}");
+                return;
+            }
+        };
+
+        if calls.is_empty() {
+            return; // the model spoke; the turn is over
+        }
+
+        // The bound already withheld the tools and set `tool_choice: none` for
+        // the round just finished — that was the last chance to produce prose.
+        // If a call came back anyway, answer it so the log stays valid and then
+        // stop. A loop whose only bound is the provider honouring its own
+        // request is not bounded; a hostile or buggy provider would run forever.
+        if force_text {
+            answer_all(&state, &stream, &assistant_id, &calls, "bound_reached").await;
+            eprintln!(
+                "stream {stream:?}: provider returned a tool call after tools were withheld \
+                 at round {round}; ending the turn"
+            );
+            return;
+        }
+
+        // Record every call, then execute. Both carry `parent` so the batch is
+        // a filter rather than a positional walk.
+        let mut produced_content = false;
+        for (id, name, input) in &calls {
+            let use_ev = NewEvent {
+                actor: assistant_actor(&operator),
+                event_type: "tool_use".to_string(),
+                data: serde_json::json!({ "id": id, "name": name, "input": input }),
+            };
+            if let Err(e) = append_child(&state, &stream, &assistant_id, use_ev).await {
+                eprintln!("log_write_failed appending tool_use for stream {stream:?}: {e:?}");
+                return;
+            }
+
+            let root = state.root.clone();
+            let (n, i) = (name.clone(), input.clone());
+            let executed = tokio::task::spawn_blocking(move || crate::tools::dispatch(&n, &i, &root))
+                .await
+                .unwrap_or_else(|_| Err(crate::tools::ToolError { status: "tool_panicked", detail: String::new() }));
+
+            let (status, content, is_error) = match executed {
+                Ok(out) => {
+                    produced_content |= !out.is_empty();
+                    ("ok".to_string(), out, false)
+                }
+                Err(err) => {
+                    // Escalate rather than repeat: a tool that just failed is
+                    // not offered again this turn.
+                    failed_tools.insert(name.clone());
+                    (err.status.to_string(), err.detail, true)
+                }
+            };
+            if let Err(e) = append_tool_result(&state, &stream, &assistant_id, id, &status, &content, is_error).await {
+                eprintln!("log_write_failed appending tool_result for stream {stream:?}: {e:?}");
+                return;
             }
         }
-        Err(e) => {
-            let code = machine_code_for_provider_error(&e);
-            fail_turn(&state.sessions, &stream, &operator, &generation, &code, &state.model.model).await;
+
+        stalled = if produced_content { 0 } else { stalled + 1 };
+    }
+}
+
+/// The runaway guard.
+///
+/// Deliberately high. Every surveyed harness sets this between 50 and infinity,
+/// and ycc's source argues the case directly: a small cap guillotines ordinary
+/// multi-step work mid-task. This is a cost backstop against a degenerate loop,
+/// not a budget — the no-progress detector below is what catches a model going
+/// in circles, and it fires far sooner.
+pub const MAX_ROUNDS: usize = 64;
+
+/// Consecutive rounds yielding no new tool output before the loop calls it stuck.
+///
+/// A bare round counter never notices a model reading the same empty directory
+/// four times; every specimen pairs its cap with a detector that RESETS on
+/// progress, and this is that.
+const MAX_STALLED_ROUNDS: usize = 3;
+
+/// Append an event that belongs to a tool batch, linked to the assistant event
+/// that owns it.
+async fn append_child(
+    state: &SharedState,
+    stream: &str,
+    parent: &str,
+    ev: NewEvent,
+) -> Result<EventEnvelope, SessionError> {
+    let sessions = state.sessions.clone();
+    let stream = stream.to_string();
+    let parent = parent.to_string();
+    match tokio::task::spawn_blocking(move || sessions.append_child(&stream, &parent, ev)).await {
+        Ok(result) => result,
+        Err(_) => Err(SessionError::Log(io::Error::other("append blocking task panicked"))),
+    }
+}
+
+async fn append_tool_result(
+    state: &SharedState,
+    stream: &str,
+    parent: &str,
+    tool_use_id: &str,
+    status: &str,
+    content: &str,
+    is_error: bool,
+) -> Result<EventEnvelope, SessionError> {
+    append_child(
+        state,
+        stream,
+        parent,
+        NewEvent {
+            // D21: `Role::Tool` has been in the schema since v0.1 and
+            // constructed nowhere. The alternative — reusing the operator
+            // actor — would make the log assert the model produced its own
+            // tool results, which is false and undercuts the whole point of a
+            // status the model cannot overwrite.
+            actor: Actor { role: Role::Tool, instance: None },
+            event_type: "tool_result".to_string(),
+            data: serde_json::json!({
+                "toolUseId": tool_use_id,
+                "status": status,
+                "content": content,
+                "isError": is_error,
+            }),
+        },
+    )
+    .await
+}
+
+/// Answer every call in `calls` with the same status — the interrupt and
+/// crash paths, where no tool ran.
+async fn answer_all(
+    state: &SharedState,
+    stream: &str,
+    parent: &str,
+    calls: &[(String, String, serde_json::Value)],
+    status: &str,
+) {
+    for (id, _, _) in calls {
+        if let Err(e) = append_tool_result(state, stream, parent, id, status, "the call did not run", true).await {
+            eprintln!("log_write_failed answering {id} on stream {stream:?}: {e:?}");
         }
     }
+}
+
+async fn record_interrupt(
+    state: &SharedState,
+    stream: &str,
+    operator: &str,
+    generation: &str,
+    text_so_far: &str,
+) {
+    let ev = NewEvent {
+        actor: Actor { role: Role::User, instance: None },
+        event_type: "interrupt".to_string(),
+        data: serde_json::json!({}),
+    };
+    if let Err(e) = append_blocking(&state.sessions, stream, ev).await {
+        eprintln!("log_write_failed appending interrupt for stream {stream:?}: {e:?}");
+    }
+    let ev = NewEvent {
+        actor: assistant_actor(operator),
+        event_type: "assistant_message".to_string(),
+        data: serde_json::json!({
+            "text": text_so_far,
+            "generation": generation,
+            "interrupted": true,
+            "model": state.model.model,
+        }),
+    };
+    if let Err(e) = append_blocking(&state.sessions, stream, ev).await {
+        eprintln!("log_write_failed appending interrupted assistant_message for stream {stream:?}: {e:?}");
+    }
+}
+
+/// Read, project, and heal until the projection is something the provider will
+/// accept — or give up loudly.
+///
+/// Two repairs, both heal-FORWARD: they append a real event and re-project,
+/// rather than manufacturing a block the log has no record of. P-2 wants
+/// injected content recorded first, I-1 says correction is a new event, and a
+/// repair invisible in the log is one nobody can audit.
+async fn project_healing(
+    state: &SharedState,
+    stream: &str,
+    operator: &str,
+    generation: &str,
+) -> Option<crate::projection::ModelTurn> {
+    // Bounded: each pass must consume at least one distinct fault, so a
+    // repair that fails to make progress cannot spin.
+    for _ in 0..4 {
+        let events = match read_all(&state.sessions, stream).await {
+            Ok(events) => events,
+            Err(e) => {
+                eprintln!("failed to read stream {stream:?}: {e}");
+                fail_turn(&state.sessions, stream, operator, generation, "log_unreadable", &state.model.model).await;
+                return None;
+            }
+        };
+
+        match project_context(&events, &state.root) {
+            Ok(turn) => return Some(turn),
+
+            Err(ProjectionError::BootDrift { path }) => {
+                if let Err(code) = rerecord_boot(state, stream, &path).await {
+                    fail_turn(&state.sessions, stream, operator, generation, code, &state.model.model).await;
+                    return None;
+                }
+            }
+
+            // The crash case: the engine died between appending a call and
+            // appending its answer, so the log holds a shape the provider
+            // refuses. Every stranded id is answered, not just the first.
+            Err(ProjectionError::UnansweredToolUses { ids }) => {
+                for id in ids {
+                    let parent = events
+                        .iter()
+                        .find(|e| {
+                            e.event_type == "tool_use"
+                                && e.data.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
+                        })
+                        .and_then(|e| e.parent.clone())
+                        .unwrap_or_default();
+                    if let Err(e) = append_tool_result(
+                        state, stream, &parent, &id,
+                        "no_result_recorded",
+                        "the engine stopped before this call completed",
+                        true,
+                    )
+                    .await
+                    {
+                        eprintln!("log_write_failed healing {id} on stream {stream:?}: {e:?}");
+                        fail_turn(&state.sessions, stream, operator, generation, "heal_failed", &state.model.model).await;
+                        return None;
+                    }
+                }
+            }
+
+            Err(ProjectionError::BootUnreadable { .. }) | Err(ProjectionError::Transient) => {
+                fail_turn(&state.sessions, stream, operator, generation, "boot_unreadable", &state.model.model).await;
+                return None;
+            }
+        }
+    }
+
+    eprintln!("projection did not converge after repairs on stream {stream:?}");
+    fail_turn(&state.sessions, stream, operator, generation, "projection_unstable", &state.model.model).await;
+    None
 }
 
 #[cfg(test)]
@@ -424,6 +703,331 @@ mod tests {
             )
             .unwrap();
         id
+    }
+
+    /// One scripted outcome per provider call, so a test can drive a
+    /// multi-round turn. `ScriptedProvider` replays the same script on every
+    /// call, which would make round 2 identical to round 1 — and trip the
+    /// no-progress detector on a healthy turn.
+    #[derive(Debug)]
+    struct RoundScript {
+        rounds: std::sync::Mutex<std::collections::VecDeque<TurnOutcome>>,
+    }
+
+    impl RoundScript {
+        fn new(rounds: Vec<TurnOutcome>) -> Self {
+            RoundScript {
+                rounds: std::sync::Mutex::new(rounds.into()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::ModelProvider for RoundScript {
+        async fn run_turn(
+            &self,
+            _req: crate::provider::TurnRequest,
+            _sink: mpsc::Sender<String>,
+            _cancel: watch::Receiver<bool>,
+        ) -> Result<TurnOutcome, crate::provider::ProviderError> {
+            // A real provider cannot call a tool that was not offered. The
+            // double must not either, or the loop's bound looks effective when
+            // it is only being obeyed.
+            if _req.tools.is_empty() {
+                return Ok(TurnOutcome {
+                    text: "forced to speak".to_string(),
+                    blocks: vec![crate::projection::ContentBlock::text("forced to speak")],
+                    stop_reason: Some("end_turn".to_string()),
+                    stopped: false,
+                    model: "round-script".to_string(),
+                });
+            }
+            let next = self.rounds.lock().unwrap().pop_front();
+            Ok(next.unwrap_or(TurnOutcome {
+                text: "script exhausted".to_string(),
+                blocks: vec![crate::projection::ContentBlock::text("script exhausted")],
+                stop_reason: Some("end_turn".to_string()),
+                stopped: false,
+                model: "round-script".to_string(),
+            }))
+        }
+    }
+
+    fn says(text: &str) -> TurnOutcome {
+        TurnOutcome {
+            text: text.to_string(),
+            blocks: vec![crate::projection::ContentBlock::text(text)],
+            stop_reason: Some("end_turn".to_string()),
+            stopped: false,
+            model: "round-script".to_string(),
+        }
+    }
+
+    fn calls(id: &str, name: &str) -> TurnOutcome {
+        TurnOutcome {
+            text: String::new(),
+            blocks: vec![crate::projection::ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input: serde_json::json!({}),
+            }],
+            stop_reason: Some("tool_use".to_string()),
+            stopped: false,
+            model: "round-script".to_string(),
+        }
+    }
+
+    async fn state_with(
+        provider: std::sync::Arc<dyn crate::provider::ModelProvider>,
+        sessions: Arc<Sessions>,
+        root: &std::path::Path,
+    ) -> SharedState {
+        Arc::new(AppState {
+            root: root.canonicalize().unwrap(),
+            sessions,
+            model: model_config(),
+            provider,
+            boot: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_is_executed_and_answered_and_the_turn_continues() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("modules.toml"), "[[repos]]\nname='r'\npath='p'\n")
+            .unwrap();
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance(&sessions, Some("tycho")).await;
+
+        let provider = std::sync::Arc::new(RoundScript::new(vec![
+            calls("toolu_01A", "get_composition"),
+            says("there is one repo, r"),
+        ]));
+        let state = state_with(provider, sessions.clone(), root.path()).await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+
+        let events = sessions.store().read_from(&id, 0).unwrap();
+        let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+        // The assistant event precedes its calls and is their batch parent. Its
+        // `text` is empty here — the model called a tool without speaking — and
+        // the projection contributes no block for it, because an empty text
+        // block is a 400 and an assistant message of pure tool_use is legal.
+        assert_eq!(
+            types,
+            vec![
+                "instance_created",
+                "user_message",
+                "assistant_message",
+                "tool_use",
+                "tool_result",
+                "assistant_message"
+            ],
+            "{types:?}"
+        );
+
+        let tool_use = events.iter().find(|e| e.event_type == "tool_use").unwrap();
+        let tool_result = events.iter().find(|e| e.event_type == "tool_result").unwrap();
+
+        assert_eq!(tool_use.data["id"], "toolu_01A");
+        assert_eq!(tool_result.data["toolUseId"], "toolu_01A");
+        assert_eq!(tool_result.data["status"], "ok");
+        assert_eq!(tool_result.data["isError"], false);
+        assert!(
+            tool_result.data["content"].as_str().unwrap().contains("\"r\""),
+            "the real composition should have been read: {}",
+            tool_result.data["content"]
+        );
+
+        // D21: the log must not claim the operator produced the tool result.
+        assert_eq!(tool_use.actor.role, Role::Operator, "the model asked");
+        assert_eq!(tool_result.actor.role, Role::Tool, "the tool answered");
+
+        // The batch link that makes eviction and orphan repair work.
+        assert!(tool_use.parent.is_some(), "tool_use needs a batch parent");
+        assert_eq!(tool_use.parent, tool_result.parent, "same batch");
+
+        let last = events.last().unwrap();
+        assert_eq!(last.data["text"], "there is one repo, r");
+    }
+
+    #[tokio::test]
+    async fn a_failing_tool_is_answered_with_its_machine_code_and_the_turn_continues() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance(&sessions, None).await;
+
+        let provider = std::sync::Arc::new(RoundScript::new(vec![
+            calls("toolu_01B", "no_such_tool"),
+            says("that tool does not exist"),
+        ]));
+        let state = state_with(provider, sessions.clone(), root.path()).await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+
+        let events = sessions.store().read_from(&id, 0).unwrap();
+        let result = events.iter().find(|e| e.event_type == "tool_result").unwrap();
+
+        assert_eq!(result.data["status"], "unknown_tool");
+        assert_eq!(result.data["isError"], true);
+        assert!(
+            !result.data["content"].as_str().unwrap().is_empty(),
+            "is_error with empty content is a 400 — every failure must render something"
+        );
+        // Success criterion 2: a refusal does not end the turn.
+        assert_eq!(events.last().unwrap().event_type, "assistant_message");
+        assert_eq!(events.last().unwrap().data["text"], "that tool does not exist");
+    }
+
+    #[tokio::test]
+    async fn the_runaway_bound_forces_text_rather_than_looping_forever() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance(&sessions, None).await;
+
+        // A model that only ever calls tools. Without a bound this never ends.
+        let endless: Vec<TurnOutcome> = (0..200)
+            .map(|i| calls(&format!("toolu_{i}"), "get_composition"))
+            .collect();
+        let provider = std::sync::Arc::new(RoundScript::new(endless));
+        let state = state_with(provider, sessions.clone(), root.path()).await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+
+        let events = sessions.store().read_from(&id, 0).unwrap();
+        let rounds = events.iter().filter(|e| e.event_type == "tool_use").count();
+
+        assert!(rounds > 1, "it should have looped at all: {rounds}");
+        assert!(
+            rounds <= MAX_ROUNDS,
+            "the runaway guard did not hold: {rounds} rounds"
+        );
+        assert_eq!(
+            events.last().unwrap().event_type,
+            "assistant_message",
+            "the turn must end with something the person can read"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_tool_round_survives_the_validating_provider() {
+        // The test that makes the others mean something. `RoundScript` answers
+        // anything, so "the turn completed" says nothing about whether the
+        // message list we built would survive the API. Wrapping it in
+        // `ValidatingProvider` enforces the five measured 400s on every round —
+        // orphaned calls, orphaned results, results that do not lead their
+        // turn, empty text blocks, and is_error with empty content.
+        let data_dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("modules.toml"), "[[repos]]\nname='r'\npath='p'\n")
+            .unwrap();
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance(&sessions, Some("tycho")).await;
+
+        let provider = std::sync::Arc::new(crate::provider::ValidatingProvider::new(
+            RoundScript::new(vec![
+                calls("toolu_01A", "get_composition"),
+                calls("toolu_01B", "no_such_tool"),
+                says("one repo, and that other tool does not exist"),
+            ]),
+        ));
+        let state = state_with(provider, sessions.clone(), root.path()).await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+
+        let events = sessions.store().read_from(&id, 0).unwrap();
+        let last = events.last().unwrap();
+
+        // A refusal from the validator surfaces as provider_api_400. Reaching
+        // the scripted final answer means every intermediate projection was
+        // one the real API would have accepted.
+        assert_eq!(
+            last.data.get("error"),
+            None,
+            "a round built an invalid message list: {:?}",
+            last.data
+        );
+        assert_eq!(
+            last.data["text"],
+            "one repo, and that other tool does not exist"
+        );
+        // Both rounds happened, including the one whose tool failed.
+        assert_eq!(events.iter().filter(|e| e.event_type == "tool_result").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_call_stranded_by_a_crash_is_healed_and_the_next_turn_runs() {
+        // Success criterion 3. The engine dies between appending a `tool_use`
+        // and appending its answer; the log then holds a shape the provider
+        // refuses. Heal-forward: a real `tool_result` is APPENDED and the turn
+        // proceeds — the repair is in the log where it can be audited, not
+        // manufactured inside the projection where nothing records it.
+        let data_dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance(&sessions, None).await;
+
+        // Hand-append the wreckage a killed engine leaves behind.
+        let assistant = sessions
+            .append(
+                &id,
+                NewEvent {
+                    actor: assistant_actor("dispatcher"),
+                    event_type: "assistant_message".to_string(),
+                    data: serde_json::json!({"text": "", "generation": "g0", "interrupted": false}),
+                },
+            )
+            .unwrap();
+        sessions
+            .append_child(
+                &id,
+                &assistant.id,
+                NewEvent {
+                    actor: assistant_actor("dispatcher"),
+                    event_type: "tool_use".to_string(),
+                    data: serde_json::json!({"id": "toolu_orphan", "name": "get_composition", "input": {}}),
+                },
+            )
+            .unwrap();
+
+        let provider = std::sync::Arc::new(crate::provider::ValidatingProvider::new(
+            RoundScript::new(vec![says("picking up where that left off")]),
+        ));
+        let state = state_with(provider, sessions.clone(), root.path()).await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+
+        let events = sessions.store().read_from(&id, 0).unwrap();
+        let heal = events
+            .iter()
+            .find(|e| e.event_type == "tool_result")
+            .expect("the orphan must be answered by a real appended event");
+
+        assert_eq!(heal.data["toolUseId"], "toolu_orphan");
+        assert_eq!(heal.data["status"], "no_result_recorded");
+        assert_eq!(heal.data["isError"], true);
+        assert_eq!(
+            heal.parent.as_deref(),
+            Some(assistant.id.as_str()),
+            "the heal joins the batch it repairs"
+        );
+
+        let last = events.last().unwrap();
+        assert_eq!(last.data.get("error"), None, "the turn should have run: {:?}", last.data);
+        assert_eq!(last.data["text"], "picking up where that left off");
     }
 
     #[tokio::test]
