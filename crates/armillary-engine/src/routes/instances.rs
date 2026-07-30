@@ -228,6 +228,58 @@ async fn append_boot_event(state: &SharedState, stream: &str, rel: &str) {
     }
 }
 
+/// **DD-1 — record the composition as its own durable event.**
+///
+/// The one writer, used both at instance creation and by the loop's
+/// drift repair, so "what a composition event contains" cannot come to depend
+/// on which path wrote it.
+///
+/// C-3 as running code: the manifests are parsed by a TOML parser and the
+/// answer is recorded, so a model never re-derives it from raw bytes — a local
+/// model once read commented-out examples as a live composition. P-2: recorded
+/// before it is ever projected. I-1: the drift repair appends a new event
+/// rather than editing the old one.
+///
+/// `Role::System`, like `boot` — the engine determined this, and the log must
+/// not claim the operator did.
+pub(crate) async fn append_composition_event(
+    state: &SharedState,
+    stream: &str,
+) -> Result<(), &'static str> {
+    let root = state.root.clone();
+    let data = match tokio::task::spawn_blocking(move || crate::tools::composition_event_data(&root))
+        .await
+    {
+        Ok(Ok(data)) => data,
+        // Presence-gated (C-4): a workspace whose manifests will not parse is a
+        // misconfiguration, not a reason to refuse a session. A bare clone
+        // parses to "nothing composed", which is a true and useful answer.
+        _ => return Err("composition_unreadable"),
+    };
+
+    let sessions = state.sessions.clone();
+    let stream_owned = stream.to_string();
+    let appended = tokio::task::spawn_blocking(move || {
+        sessions.append(
+            &stream_owned,
+            NewEvent {
+                actor: Actor {
+                    role: Role::System,
+                    instance: None,
+                },
+                event_type: "composition".to_string(),
+                data,
+            },
+        )
+    })
+    .await;
+
+    match appended {
+        Ok(Ok(_)) => Ok(()),
+        _ => Err("log_write_failed"),
+    }
+}
+
 pub async fn create(
     State(state): State<SharedState>,
     Json(body): Json<CreateRequest>,
@@ -261,6 +313,15 @@ pub async fn create(
     // invisible to the list screen.
     if let Some(rel) = state.boot.as_deref() {
         append_boot_event(&state, &id, rel).await;
+    }
+
+    // DD-1, and after boot for the same reason boot comes after
+    // instance_created: the earlier events' seq numbers are documented and
+    // referenced, and there is no reason to renumber them. Skip-never-fail —
+    // a workspace whose manifests will not parse still gets a session, it just
+    // gets one that has to read them with a tool.
+    if let Err(code) = append_composition_event(&state, &id).await {
+        eprintln!("warning: no composition event for {id} ({code})");
     }
 
     // last_seq stays ev.seq (1, from instance_created) even when a boot event

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 pub const DURABLE_TYPES: &[&str] = &[
     "instance_created",
     "boot",
+    "composition",
     "user_message",
     "assistant_message",
     "interrupt",

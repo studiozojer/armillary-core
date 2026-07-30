@@ -619,6 +619,19 @@ async fn project_healing(
                 }
             }
 
+            // DD-1: a manifest moved under the session. Re-derive and append a
+            // fresh event — I-1, correction is a new event — through the same
+            // writer instance creation uses, so the repair cannot produce a
+            // differently-shaped composition than the original.
+            Err(ProjectionError::CompositionDrift) => {
+                if let Err(code) =
+                    crate::routes::instances::append_composition_event(state, stream).await
+                {
+                    fail_turn(&state.sessions, stream, operator, generation, code, &state.model.model).await;
+                    return None;
+                }
+            }
+
             // The crash case: the engine died between appending a call and
             // appending its answer, so the log holds a shape the provider
             // refuses. Every stranded id is answered, not just the first.

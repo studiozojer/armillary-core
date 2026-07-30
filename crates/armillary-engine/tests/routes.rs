@@ -152,6 +152,24 @@ async fn create_and_attach(router: axum::Router) -> serde_json::Value {
     attach
 }
 
+/// Assert a stream holds exactly the two events creation writes, and no boot.
+///
+/// The four boot-skip tests below used to say "boot was skipped" as
+/// `headSeq == 1`. Once creation also appends DD-1's composition event, a bare
+/// count stops distinguishing "boot was skipped" from "boot landed and
+/// something else didn't" — so they assert the thing they were always about.
+fn assert_no_boot_event(data_dir: &std::path::Path, attach: &serde_json::Value) {
+    let id = attach["instance"]["id"].as_str().unwrap();
+    let store = LogStore::open(data_dir).unwrap();
+    let types: Vec<String> = store
+        .read_from(id, 0)
+        .unwrap()
+        .iter()
+        .map(|e| e.event_type.clone())
+        .collect();
+    assert_eq!(types, vec!["instance_created", "composition"], "{types:?}");
+}
+
 /// Error responses are `(StatusCode, String)` — plain text, not JSON — so
 /// `get_json` reads them back as `Null`. Two different refusals can share a
 /// status code (`not_openable` and `not_text` are both 415), so the body is
@@ -415,7 +433,8 @@ async fn create_instance_returns_201_and_logs_instance_created_at_seq_1() {
     let (status, attach) = get_json(router, &format!("/instances/{id}")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(attach["earliestSeq"], 1);
-    assert_eq!(attach["headSeq"], 1);
+    // seq 2 is DD-1's composition event.
+    assert_eq!(attach["headSeq"], 2);
 }
 
 #[tokio::test]
@@ -462,7 +481,7 @@ async fn attach_returns_earliest_and_head_seq_and_the_instance() {
     let (status, attach) = get_json(router, &format!("/instances/{id}")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(attach["earliestSeq"], 1);
-    assert_eq!(attach["headSeq"], 1);
+    assert_eq!(attach["headSeq"], 2);
     assert_eq!(attach["instance"]["id"], id);
     assert_eq!(attach["instance"]["operator"], "tycho");
 }
@@ -504,10 +523,11 @@ async fn create_appends_a_boot_event_after_instance_created() {
     let contents = "# Getting started\n\nAn operator is an identity.\n";
     let (router, _root, data_dir) = app_with_boot("getting-started.md", contents);
     let attach = create_and_attach(router).await;
-    // instance_created is seq 1, boot is seq 2 — the ordering the instance
-    // registry depends on (instance_from_first_event requires seq 1 to be
-    // instance_created).
-    assert_eq!(attach["headSeq"], 2);
+    // instance_created is seq 1, boot is seq 2, DD-1's composition is seq 3 —
+    // the ordering the instance registry depends on
+    // (instance_from_first_event requires seq 1 to be instance_created), with
+    // composition last so the earlier numbers stay where they were documented.
+    assert_eq!(attach["headSeq"], 3);
     assert_eq!(attach["earliestSeq"], 1);
 
     // `headSeq == 2` alone would pass if `create` appended ANY second event
@@ -518,9 +538,8 @@ async fn create_appends_a_boot_event_after_instance_created() {
     let id = attach["instance"]["id"].as_str().unwrap().to_string();
     let store = LogStore::open(&data_dir).unwrap();
     let events = store.read_from(&id, 0).unwrap();
-    assert_eq!(events.len(), 2);
-    assert_eq!(events[0].event_type, "instance_created");
-    assert_eq!(events[1].event_type, "boot");
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(types, vec!["instance_created", "boot", "composition"]);
     assert_eq!(events[1].data["path"], "getting-started.md");
     assert_eq!(
         events[1].data["sha256"],
@@ -549,10 +568,53 @@ async fn a_created_instances_boot_event_projects_to_a_system_prompt() {
 }
 
 #[tokio::test]
-async fn create_without_a_declared_boot_appends_only_instance_created() {
-    // C-4: presence-gated. A bare clone must behave exactly as before.
+async fn create_records_the_composition_so_a_session_knows_what_it_was_booted_into() {
+    // DD-1. The resolved manifest is the one thing a session cannot work out
+    // for itself: C-3 forbids handing a model raw TOML to re-derive, because a
+    // local model once read commented-out examples as a live composition.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.keep();
+    std::fs::write(
+        root.join("modules.toml"),
+        "# [[repos]]\n# name = \"ghost\"\n[[repos]]\nname = \"kairos-engine\"\npath = \"p\"\n",
+    )
+    .unwrap();
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let store = LogStore::open(&data_dir).unwrap();
+    let router = app(AppState {
+        root: root.canonicalize().unwrap(),
+        sessions: Arc::new(Sessions::new(store)),
+        model: model_config(),
+        provider: Arc::new(KeylessProvider),
+        boot: None,
+    });
+
+    let (status, created) =
+        post_json(router, "/instances", serde_json::json!({ "operator": null })).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let store = LogStore::open(&data_dir).unwrap();
+    let events = store.read_from(&id, 0).unwrap();
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(types, vec!["instance_created", "composition"]);
+
+    // It reaches the model as a turn, not as an event nobody projects.
+    let turn = armillary_engine::projection::project_context(&events, &root).unwrap();
+    let text = format!("{:?}", turn.messages);
+    assert!(text.contains("kairos-engine"), "{text}");
+    assert!(!text.contains("ghost"), "a commented-out repo reached the model: {text}");
+}
+
+#[tokio::test]
+async fn a_bare_clone_is_told_that_nothing_is_composed_rather_than_told_nothing() {
+    // C-4: presence-gated, and this is what presence-gating means HERE — not
+    // "stay silent" but "say what is actually the case". A session given no
+    // composition event cannot tell "nothing is composed" from "the engine
+    // never said", and the second is a reason to go looking for what isn't
+    // there. Same argument as `truncated` on a listing.
     let attach = create_and_attach(app_over(|_root| {})).await;
-    assert_eq!(attach["headSeq"], 1);
+    assert_eq!(attach["headSeq"], 2);
 }
 
 #[tokio::test]
@@ -571,7 +633,7 @@ async fn an_unreadable_boot_source_still_creates_the_instance() {
         boot: Some("does-not-exist.md".to_string()),
     });
     let attach = create_and_attach(router).await;
-    assert_eq!(attach["headSeq"], 1);
+    assert_no_boot_event(&data_dir, &attach);
 }
 
 #[tokio::test]
@@ -594,7 +656,7 @@ async fn a_non_utf8_boot_source_is_skipped_not_appended() {
         boot: Some("boot.md".to_string()),
     });
     let attach = create_and_attach(router).await;
-    assert_eq!(attach["headSeq"], 1);
+    assert_no_boot_event(&data_dir, &attach);
 }
 
 #[tokio::test]
@@ -617,7 +679,7 @@ async fn a_boot_path_declared_absolute_is_refused_not_relativized() {
         boot: Some(root.join("boot.md").to_string_lossy().to_string()),
     });
     let attach = create_and_attach(router).await;
-    assert_eq!(attach["headSeq"], 1);
+    assert_no_boot_event(&data_dir, &attach);
 }
 
 #[tokio::test]
@@ -647,5 +709,5 @@ async fn a_boot_path_escaping_root_is_skipped_not_honored() {
         boot: Some(escape_path),
     });
     let attach = create_and_attach(router).await;
-    assert_eq!(attach["headSeq"], 1);
+    assert_no_boot_event(&data_dir, &attach);
 }

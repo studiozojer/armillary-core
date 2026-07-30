@@ -252,8 +252,9 @@ async fn send_returns_the_user_events_id_and_seq() {
     assert_eq!(response.status(), reqwest::StatusCode::CREATED);
     let receipt: serde_json::Value = response.json().await.unwrap();
 
-    // seq 1 is instance_created; seq 2 is this user_message.
-    assert_eq!(receipt["seq"], 2);
+    // seq 1 is instance_created, seq 2 the composition event DD-1 records at
+    // creation, and seq 3 is this user_message.
+    assert_eq!(receipt["seq"], 3);
     assert!(receipt["id"].as_str().is_some_and(|s| !s.is_empty()));
 
     // Proven over the log directly, not just the response: the receipt's id
@@ -500,7 +501,10 @@ async fn crash_resume_the_log_survives_dropping_and_rebuilding_the_whole_process
     wait_for_assistant_message(&sessions, &id, 1).await;
 
     let head_before = sessions.store().head_seq(&id).unwrap();
-    assert_eq!(head_before, 3, "instance_created, user_message, assistant_message");
+    assert_eq!(
+        head_before, 4,
+        "instance_created, composition, user_message, assistant_message"
+    );
 
     // "Crash": drop every in-process handle this test holds onto the first
     // `Sessions`/`AppState` — the server task itself is left running (there
@@ -516,12 +520,13 @@ async fn crash_resume_the_log_survives_dropping_and_rebuilding_the_whole_process
     assert_eq!(fresh_sessions.store().head_seq(&id).unwrap(), head_before, "headSeq survives the rebuild");
 
     let replayed = fresh_sessions.store().read_from(&id, 0).unwrap();
-    assert_eq!(replayed.len(), 3);
+    assert_eq!(replayed.len(), 4);
     assert_eq!(replayed[0].event_type, "instance_created");
-    assert_eq!(replayed[1].event_type, "user_message");
-    assert_eq!(replayed[1].data["text"], "hello");
-    assert_eq!(replayed[2].event_type, "assistant_message");
-    assert_eq!(replayed[2].data["text"], "done");
+    assert_eq!(replayed[1].event_type, "composition");
+    assert_eq!(replayed[2].event_type, "user_message");
+    assert_eq!(replayed[2].data["text"], "hello");
+    assert_eq!(replayed[3].event_type, "assistant_message");
+    assert_eq!(replayed[3].data["text"], "done");
 
     // And over HTTP, via a brand-new server built on the SAME data dir and a
     // brand-new AppState — attach reports the identical headSeq.
@@ -581,6 +586,83 @@ async fn a_drifted_boot_event_is_rerecorded_fresh_before_the_turn_runs() {
 
     let assistant = events.iter().find(|e| e.event_type == "assistant_message").unwrap();
     assert_eq!(assistant.data["interrupted"], false, "the turn recovers and completes normally");
+}
+
+#[tokio::test]
+async fn a_manifest_edited_mid_session_is_re_derived_before_the_next_turn() {
+    // DD-1's drift half, end to end, on a real stream with both writers: the
+    // event `create` wrote, then the repair `run_turn` writes when the file
+    // moves under it. Without this the session goes on describing a workspace
+    // that no longer exists — which is the failure D3 shipped silently,
+    // because a forged tool result had no hash to check.
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let provider = Arc::new(ScriptedProvider::new(vec!["ok"]));
+
+    let store = LogStore::open(&data_dir).unwrap();
+    let sessions = Arc::new(Sessions::new(store));
+    let root = tempfile::tempdir().unwrap().keep();
+    std::fs::write(root.join("modules.toml"), "[[repos]]\nname='before'\npath='p'\n").unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = AppState {
+        root: root.canonicalize().unwrap(),
+        sessions: sessions.clone(),
+        model: model_config(),
+        provider,
+        boot: None,
+    };
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app(state)).await;
+    });
+
+    let client = reqwest::Client::new();
+    let id = create_instance(&client, addr).await;
+
+    // The workspace is recomposed while the session is open — a repo added to
+    // `modules.toml` is the ordinary case, not an exotic one.
+    std::fs::write(
+        root.join("modules.toml"),
+        "[[repos]]\nname='before'\npath='p'\n[[repos]]\nname='after'\npath='q'\n",
+    )
+    .unwrap();
+
+    client
+        .post(format!("http://{addr}/instances/{id}/send"))
+        .json(&serde_json::json!({ "text": "what is composed?", "clientKey": "c1" }))
+        .send()
+        .await
+        .unwrap();
+    wait_for_assistant_message(&sessions, &id, 1).await;
+
+    let events = sessions.store().read_from(&id, 0).unwrap();
+    let compositions: Vec<&EventEnvelope> = events
+        .iter()
+        .filter(|e| e.event_type == "composition")
+        .collect();
+    assert_eq!(
+        compositions.len(),
+        2,
+        "I-1: the correction is a NEW event, never an edit of the first"
+    );
+
+    // The fresh one describes the workspace as it now is, and the projection
+    // lands on it rather than on the stale predecessor.
+    let fresh = format!("{}", compositions[1].data);
+    assert!(fresh.contains("after"), "{fresh}");
+    let turn = armillary_engine::projection::project_context(&events, &root.canonicalize().unwrap())
+        .expect("the superseded event must not fail the projection");
+    let rendered = format!("{:?}", turn.messages);
+    assert!(rendered.contains("after"), "{rendered}");
+
+    let assistant = events
+        .iter()
+        .find(|e| e.event_type == "assistant_message")
+        .unwrap();
+    assert_eq!(
+        assistant.data["interrupted"], false,
+        "the turn recovers and completes normally"
+    );
 }
 
 // --- the two `boot` writers on ONE real stream ---
