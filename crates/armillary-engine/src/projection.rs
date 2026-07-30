@@ -128,6 +128,22 @@ pub enum ProjectionError {
     /// `root`. A boot path has no legitimate reason to leave the workspace
     /// root, so "escaped" and "unreadable" are one caller-visible outcome.
     BootUnreadable { path: String },
+    /// One or more `tool_use` events in this projection have no answering
+    /// `tool_result`. The provider rejects that outright, so the caller must
+    /// heal before it can take a turn.
+    ///
+    /// **Carries every unanswered id, not one.** The `BootDrift` precedent
+    /// recovers a single failure per cycle, which is fine when there is only
+    /// ever one boot event — but a batch can strand several calls at once (an
+    /// engine killed after appending two `tool_use` events and no results), and
+    /// a one-at-a-time recovery would heal one per round while the projection
+    /// keeps failing.
+    ///
+    /// Heal-forward: the caller appends a real `tool_result` event per id and
+    /// re-projects. It does not synthesize a block here — P-2 wants the
+    /// injected content recorded first, I-1 says correction is a new event, and
+    /// a repair invisible in the log is a repair nobody can audit.
+    UnansweredToolUses { ids: Vec<String> },
     /// A transient (`seq == 0`, I-4) event reached the reducer. Durable-only
     /// is a caller invariant (transients are never persisted, so a `seq`
     /// slice pulled from the log never contains one) — this is the
@@ -337,6 +353,70 @@ pub fn project_context(
                 evicted.insert(target);
             }
         }
+    }
+
+    // D14 — the eviction unit is the assistant turn plus its complete tool
+    // batch, never a lone event.
+    //
+    // Measured both ways: a `tool_use` with no `tool_result` is a 400, and a
+    // `tool_result` with no `tool_use` is a 400. So removing half a pair from a
+    // projection kills every subsequent turn on the stream. The evict route
+    // takes ONE event id and does not check its type, which makes that one
+    // HTTP call away.
+    //
+    // Membership comes from `parent` — declared on the envelope since v0.1 and
+    // constructed nowhere until now. A tool event's `parent` names the
+    // assistant event that owns its batch, so membership is a filter. The
+    // alternative, walking positionally from the assistant event, breaks the
+    // moment anything else in the batch has already been evicted.
+    fn batch_root(e: &EventEnvelope) -> Option<&str> {
+        match e.event_type.as_str() {
+            "tool_use" | "tool_result" => e.parent.as_deref(),
+            _ => None,
+        }
+    }
+
+    // Which batches lost a member? Evicting a tool event condemns its siblings;
+    // evicting the owning assistant event condemns the whole batch under it.
+    let mut condemned: HashSet<&str> = HashSet::new();
+    for e in events {
+        if !evicted.contains(e.id.as_str()) {
+            continue;
+        }
+        match batch_root(e) {
+            Some(root) => {
+                condemned.insert(root);
+            }
+            None => {
+                condemned.insert(e.id.as_str());
+            }
+        }
+    }
+    for e in events {
+        if let Some(root) = batch_root(e) {
+            if condemned.contains(root) {
+                evicted.insert(e.id.as_str());
+            }
+        }
+    }
+
+    // Every surviving call must have a surviving answer. Eviction above is
+    // batch-atomic so it cannot produce an orphan; what does is a crash between
+    // the two appends, an interrupt, or a bound firing mid-batch.
+    let answered: HashSet<&str> = events
+        .iter()
+        .filter(|e| e.event_type == "tool_result" && !evicted.contains(e.id.as_str()))
+        .filter_map(|e| e.data.get("toolUseId").and_then(|v| v.as_str()))
+        .collect();
+    let unanswered: Vec<String> = events
+        .iter()
+        .filter(|e| e.event_type == "tool_use" && !evicted.contains(e.id.as_str()))
+        .filter_map(|e| e.data.get("id").and_then(|v| v.as_str()))
+        .filter(|id| !answered.contains(id))
+        .map(str::to_string)
+        .collect();
+    if !unanswered.is_empty() {
+        return Err(ProjectionError::UnansweredToolUses { ids: unanswered });
     }
 
     // "Last one wins" (see the `"boot"` arm below) extends to VALIDITY, not
@@ -886,6 +966,107 @@ mod tests {
             }
             other => panic!("expected a tool_result block, got {other:?}"),
         }
+    }
+
+    /// A tool event carrying `parent` — the assistant event that owns the batch.
+    fn child(seq: u64, id: &str, parent: &str, t: &str, data: serde_json::Value) -> EventEnvelope {
+        let mut e = ev(seq, id, t, data);
+        e.parent = Some(parent.to_string());
+        e
+    }
+
+    fn a_batch_of_two() -> Vec<EventEnvelope> {
+        vec![
+            ev(1, "u1", "user_message", json!({"text": "look at two things"})),
+            ev(2, "a1", "assistant_message", json!({"text": "on it"})),
+            child(3, "tu1", "a1", "tool_use", json!({"id": "t1", "name": "get_composition", "input": {}})),
+            child(4, "tu2", "a1", "tool_use", json!({"id": "t2", "name": "get_composition", "input": {}})),
+            child(5, "tr1", "a1", "tool_result", json!({"toolUseId": "t1", "status": "ok", "content": "one", "isError": false})),
+            child(6, "tr2", "a1", "tool_result", json!({"toolUseId": "t2", "status": "ok", "content": "two", "isError": false})),
+        ]
+    }
+
+    #[test]
+    fn evicting_one_tool_use_evicts_the_whole_batch_including_its_results() {
+        // Measured: a tool_use with no result is a 400, and so is a result with
+        // no use. So a batch is the eviction unit — the route takes one event
+        // id, and every member has to go with it or the stream is dead.
+        let mut events = a_batch_of_two();
+        events.push(ev(7, "e1", "context_evict", json!({"target": "tu1"})));
+
+        let turn = project_context(&events, Path::new(".")).unwrap();
+
+        for m in &turn.messages {
+            for block in &m.content {
+                assert!(
+                    !matches!(block, ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }),
+                    "a batch member survived eviction: {block:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn evicting_one_tool_result_also_takes_the_call_it_answered() {
+        // The other direction. D14 as first written only covered results whose
+        // use was absent; evicting the RESULT strands the use, which fails just
+        // as hard.
+        let mut events = a_batch_of_two();
+        events.push(ev(7, "e1", "context_evict", json!({"target": "tr2"})));
+
+        let turn = project_context(&events, Path::new(".")).unwrap();
+
+        for m in &turn.messages {
+            for block in &m.content {
+                assert!(
+                    !matches!(block, ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }),
+                    "a batch member survived eviction: {block:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn evicting_the_assistant_event_evicts_the_batch_it_owns() {
+        let mut events = a_batch_of_two();
+        events.push(ev(7, "e1", "context_evict", json!({"target": "a1"})));
+
+        let turn = project_context(&events, Path::new(".")).unwrap();
+
+        assert_eq!(
+            turn.messages.len(),
+            1,
+            "only the user message should remain: {:#?}",
+            turn.messages
+        );
+    }
+
+    #[test]
+    fn every_unanswered_call_in_a_batch_is_reported_not_just_the_first() {
+        // The BootDrift precedent handles one failure per recovery cycle. A
+        // batch can strand several at once — an engine killed after appending
+        // two calls and no results — so the error has to carry all of them or
+        // the loop heals one per round forever.
+        let events = vec![
+            ev(1, "u1", "user_message", json!({"text": "look at two things"})),
+            ev(2, "a1", "assistant_message", json!({"text": "on it"})),
+            child(3, "tu1", "a1", "tool_use", json!({"id": "t1", "name": "get_composition", "input": {}})),
+            child(4, "tu2", "a1", "tool_use", json!({"id": "t2", "name": "get_composition", "input": {}})),
+        ];
+
+        let err = project_context(&events, Path::new(".")).unwrap_err();
+
+        assert_eq!(
+            err,
+            ProjectionError::UnansweredToolUses {
+                ids: vec!["t1".to_string(), "t2".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn an_answered_batch_does_not_report_orphans() {
+        assert!(project_context(&a_batch_of_two(), Path::new(".")).is_ok());
     }
 
     #[test]

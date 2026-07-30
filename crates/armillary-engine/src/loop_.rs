@@ -274,6 +274,32 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
                 }
             }
         }
+        // Unreachable in production today: nothing appends a `tool_use` event
+        // yet, so a projection cannot find one unanswered. It is a hard failure
+        // rather than a silent skip because I-5 forbids swallowing, and because
+        // reaching it would mean the log holds a shape the provider refuses.
+        //
+        // The real handling is heal-forward, and it belongs with the loop that
+        // can append: on detecting orphans, write a real `tool_result` per id
+        // with an `interrupted`-class status, then re-project. Doing that here
+        // now would be a recovery for a state this build cannot produce.
+        Err(ProjectionError::UnansweredToolUses { ids }) => {
+            eprintln!(
+                "projection found {} unanswered tool_use id(s) on stream {stream:?}: {ids:?} \
+                 — no producer exists at this build, so this indicates a hand-edited log",
+                ids.len()
+            );
+            fail_turn(
+                &state.sessions,
+                &stream,
+                &operator,
+                &generation,
+                "unanswered_tool_use",
+                &state.model.model,
+            )
+            .await;
+            return;
+        }
         Err(ProjectionError::BootUnreadable { .. }) | Err(ProjectionError::Transient) => {
             fail_turn(&state.sessions, &stream, &operator, &generation, "boot_unreadable", &state.model.model).await;
             return;
