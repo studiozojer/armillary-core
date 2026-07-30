@@ -16,7 +16,10 @@
 //! not which verbs exist. That is a recorded debt, not an oversight — a second
 //! engine could ship a different surface and both would pass conformance today.
 
-use std::path::Path;
+use axum::http::StatusCode;
+use serde::Serialize;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 
 /// A tool call that did not succeed.
 ///
@@ -40,6 +43,34 @@ impl ToolError {
             detail: detail.into(),
         }
     }
+
+    /// The HTTP status the same failure carries when it reaches a route.
+    ///
+    /// The routes and the tools now share their bodies, so they must agree
+    /// about what each failure *is*. This is the one place that mapping lives,
+    /// and it reproduces exactly what `/tree` and `/file` returned before the
+    /// share — the Explorer is a shipped consumer and none of these codes is
+    /// ours to change on the way past.
+    pub fn http_status(&self) -> StatusCode {
+        match self.status {
+            "malformed_path" => StatusCode::BAD_REQUEST,
+            "outside_workspace" | "denied_credential" | "denied_noise" => StatusCode::FORBIDDEN,
+            "not_found" => StatusCode::NOT_FOUND,
+            "is_a_directory" | "not_a_directory" | "invalid_input" => StatusCode::BAD_REQUEST,
+            "not_openable" | "not_text" => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+impl From<crate::guard::GuardError> for ToolError {
+    /// The guard's machine code passes through verbatim. D6′ turns on this:
+    /// the transcript, the log, and the HTTP response all say the same word,
+    /// so a denial read on a phone can be grepped in the log.
+    fn from(e: crate::guard::GuardError) -> Self {
+        ToolError::new(e.code(), String::new())
+    }
 }
 
 /// The tool definitions sent with every request.
@@ -49,20 +80,72 @@ impl ToolError {
 /// between requests invalidates the whole cached prefix. It costs nothing to
 /// fix that now with one tool and is awkward to retrofit later.
 pub fn definitions() -> Vec<serde_json::Value> {
-    vec![serde_json::json!({
-        "name": "get_composition",
-        "description": "Return what this workspace is composed of: the operators, \
-                        the commons, the repos, and the protocols declared in its \
-                        manifests, along with which protocol sources are actually \
-                        present on disk. Call this to find out what exists before \
-                        reasoning about it — the answer is derived from the \
-                        manifest files, not from memory.",
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
-    })]
+    vec![
+        serde_json::json!({
+            "name": "get_composition",
+            "description": "Return what this workspace is composed of: the operators, \
+                            the commons, the repos, and the protocols declared in its \
+                            manifests, along with which protocol sources are actually \
+                            present on disk. Call this to find out what exists before \
+                            reasoning about it — the answer is derived from the \
+                            manifest files, not from memory.",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        }),
+        serde_json::json!({
+            "name": "list_directory",
+            "description": "List the entries of one directory in the workspace. \
+                            Directories are marked with a trailing slash. Paths are \
+                            relative to the workspace root; pass an empty string for \
+                            the root itself. Credentials and build output are never \
+                            listed. Use this to find out what is there before reading \
+                            a file.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path relative to the workspace root; \
+                                        \"\" for the root.",
+                    },
+                },
+                "required": ["path"],
+            },
+        }),
+        serde_json::json!({
+            "name": "read_file",
+            "description": "Read a page of one text file in the workspace, with line \
+                            numbers so you can cite what you read. Paths are relative \
+                            to the workspace root. Reads are paginated: if the page \
+                            ends before the file does, the result says so and gives \
+                            the offset to continue from. No file is too large to \
+                            read — it is only too large to read at once.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to the workspace root.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "1-based line number to start at. Defaults to 1.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": format!(
+                            "How many lines to read. Defaults to {DEFAULT_LINES}, \
+                             capped at {MAX_LINES}."
+                        ),
+                    },
+                },
+                "required": ["path"],
+            },
+        }),
+    ]
 }
 
 /// Execute one tool call.
@@ -72,9 +155,16 @@ pub fn definitions() -> Vec<serde_json::Value> {
 /// dangle, and they are right for a reason measured here: a `tool_use` with no
 /// `tool_result` is a 400 that kills every later turn. A stale or misspelled
 /// name must come back as a refusal the model can read.
-pub fn dispatch(name: &str, _input: &serde_json::Value, root: &Path) -> Result<String, ToolError> {
+pub fn dispatch(name: &str, input: &serde_json::Value, root: &Path) -> Result<String, ToolError> {
     match name {
         "get_composition" => get_composition(root),
+        "list_directory" => list_directory(root, required_str(input, "path", name)?),
+        "read_file" => read_page(
+            root,
+            required_str(input, "path", name)?,
+            optional_usize(input, "offset", 1)?,
+            optional_usize(input, "limit", DEFAULT_LINES)?,
+        ),
         other => Err(ToolError::new(
             "unknown_tool",
             format!("no tool named {other}"),
@@ -166,6 +256,351 @@ fn get_composition(root: &Path) -> Result<String, ToolError> {
 
     serde_json::to_string_pretty(&body)
         .map_err(|e| ToolError::new("composition_unreadable", e.to_string()))
+}
+
+/// A directory listing is a thing a phone renders and a thing a model pays
+/// for. Unbounded, one response can carry every entry of a build-index store —
+/// 1,147 in this workspace's largest.
+pub const MAX_ENTRIES: usize = 500;
+
+/// How many lines `read_file` returns when the caller does not say.
+pub const DEFAULT_LINES: usize = 500;
+
+/// The most lines one page may carry, however large a `limit` asks for.
+pub const MAX_LINES: usize = 2000;
+
+#[derive(Serialize)]
+pub struct Entry {
+    pub name: String,
+    pub dir: bool,
+}
+
+/// One directory listing, shared by `/tree` and by `list_directory`.
+///
+/// Synchronous and self-contained so it can be handed to a thread that is
+/// allowed to block — `metadata()` follows symlinks, so one entry pointing at
+/// a disconnected volume blocks for the mount timeout.
+///
+/// Returns the capped entries and the total the directory actually holds. The
+/// caller decides how to say "this is a prefix"; both callers must say it.
+pub fn list_entries(root: &Path, path: &str) -> Result<(Vec<Entry>, usize), ToolError> {
+    let resolved = crate::guard::resolve(root, path)?;
+
+    let read = std::fs::read_dir(&resolved)
+        .map_err(|_| ToolError::new("not_a_directory", format!("{path} is not a directory")))?;
+
+    let mut entries: Vec<Entry> = Vec::new();
+    for item in read.flatten() {
+        let name = item.file_name().to_string_lossy().to_string();
+        if crate::guard::is_hidden_from_listings(&name) {
+            continue;
+        }
+        // `file_type` does not follow symlinks; `metadata` does. A symlinked
+        // directory should browse as a directory — this workspace routes real
+        // content through symlinks (`models -> operators`, CLAUDE.local.md into
+        // the commons). A dangling link resolves to nothing and is simply not
+        // an entry, which is the presence-gated reading.
+        let Ok(meta) = item.path().metadata() else {
+            continue;
+        };
+        entries.push(Entry {
+            name,
+            dir: meta.is_dir(),
+        });
+    }
+
+    entries.sort_by(|a, b| {
+        b.dir
+            .cmp(&a.dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    // Sorted before truncating, so the prefix is stable and meaningful rather
+    // than whatever the filesystem happened to return first.
+    let total = entries.len();
+    entries.truncate(MAX_ENTRIES);
+    Ok((entries, total))
+}
+
+/// The model-facing listing.
+///
+/// **D7 — `total` and the prefix warning are rendered, not dropped.** `tree.rs`
+/// already argues why the fields exist for the Explorer: a silently short list
+/// reads exactly like a complete one. A model has strictly less recourse than
+/// a human scrolling, so the same rule applies with more force, and the
+/// warning names the recovery (narrow the path) rather than just the fact.
+fn list_directory(root: &Path, path: &str) -> Result<String, ToolError> {
+    let (entries, total) = list_entries(root, path)?;
+
+    let shown = entries.len();
+    let where_ = if path.is_empty() { "." } else { path };
+    let mut out = format!("{where_} — {total} entries\n");
+    for e in entries {
+        out.push_str(&e.name);
+        if e.dir {
+            out.push('/');
+        }
+        out.push('\n');
+    }
+    if shown < total {
+        out.push_str(&format!(
+            "[showing the first {shown} of {total}; list a subdirectory to narrow]\n"
+        ));
+    }
+    Ok(out)
+}
+
+/// 1 MiB. The whole-file ceiling, and **the route's alone**: `/file` is
+/// all-or-nothing because the Explorer has nowhere to put a second page, so
+/// over the ceiling it still refuses. The tool pages instead and never meets
+/// this constant — which is the point of D15. No file is too large for a model
+/// to read; it is only too large to read at once.
+const MAX_BYTES: u64 = 1024 * 1024;
+
+/// The most bytes one line may contribute before it is cut.
+///
+/// A minified bundle or a base64 blob is one line of several megabytes. Without
+/// this, a single line defeats every other cap on this page.
+const MAX_LINE_BYTES: usize = 4000;
+
+/// The most bytes one page may carry, whatever the line budget allows.
+///
+/// ~16k tokens. This is the cap that usually binds, and it binds for a reason
+/// the line count cannot see: a tool result is **durable** and re-projected
+/// every round (D9), so its cost is paid once per round for the rest of the
+/// turn, not once.
+const MAX_PAGE_BYTES: usize = 64 * 1024;
+
+/// The gate every file read passes, whichever caller asked.
+///
+/// Resolve through the guard (D2), refuse a directory, then refuse a type that
+/// is not served as text. **Ordering is load-bearing and inherited from
+/// `file.rs`:** the type check comes before any size check, so a 300 MB `.zip`
+/// reads as "can't open this type" rather than "too large" — the type is the
+/// true reason and the size would be a misleading one.
+fn open_readable(root: &Path, path: &str) -> Result<(PathBuf, u64), ToolError> {
+    let resolved = crate::guard::resolve(root, path)?;
+
+    let meta = resolved
+        .metadata()
+        .map_err(|_| ToolError::new("not_found", format!("nothing at {path}")))?;
+    if meta.is_dir() {
+        return Err(ToolError::new(
+            "is_a_directory",
+            format!("{path} is a directory"),
+        ));
+    }
+
+    let name = resolved
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if !crate::guard::is_openable(&name) {
+        return Err(ToolError::new(
+            "not_openable",
+            format!("{path} is not a type served as text"),
+        ));
+    }
+
+    Ok((resolved, meta.len()))
+}
+
+/// One whole file, for the `/file` route. Unchanged behaviour, shared gate.
+pub fn read_whole(root: &Path, path: &str) -> Result<(String, u64, String), ToolError> {
+    let (resolved, bytes) = open_readable(root, path)?;
+
+    // Checked from metadata, so an oversized file is never loaded in order to
+    // be rejected.
+    if bytes > MAX_BYTES {
+        return Err(ToolError::new("too_large", format!("{bytes} bytes")));
+    }
+
+    let raw = std::fs::read(&resolved)
+        .map_err(|_| ToolError::new("not_found", format!("nothing at {path}")))?;
+    let sha256 = crate::hash::sha256_hex(&raw);
+
+    // Binary gets a refusal rather than a guess. Inventing an encoding would be
+    // less honest than saying no.
+    let text = String::from_utf8(raw)
+        .map_err(|_| ToolError::new("not_text", format!("{path} is not valid UTF-8")))?;
+
+    Ok((sha256, bytes, text))
+}
+
+/// One line, read with a byte cap so a single line cannot defeat the page cap.
+struct Line {
+    text: String,
+    truncated: bool,
+}
+
+/// Consume the remainder of an over-long line. Bounded per read so a
+/// multi-megabyte line is skipped without ever being held in memory.
+fn discard_to_newline(reader: &mut impl BufRead) -> std::io::Result<()> {
+    let mut sink = Vec::new();
+    loop {
+        sink.clear();
+        let n = reader.by_ref().take(64 * 1024).read_until(b'\n', &mut sink)?;
+        if n == 0 || sink.ends_with(b"\n") {
+            return Ok(());
+        }
+    }
+}
+
+/// The next line, or `None` at end of file.
+///
+/// Reads `MAX_LINE_BYTES + 1` so "at the cap" and "over the cap" are
+/// distinguishable, and never holds more than that regardless of line length.
+fn next_line(reader: &mut impl BufRead, path: &str) -> Result<Option<Line>, ToolError> {
+    let unreadable = || ToolError::new("read_failed", format!("could not read {path}"));
+
+    let mut buf = Vec::new();
+    let n = reader
+        .by_ref()
+        .take(MAX_LINE_BYTES as u64 + 1)
+        .read_until(b'\n', &mut buf)
+        .map_err(|_| unreadable())?;
+    if n == 0 {
+        return Ok(None);
+    }
+
+    let mut truncated = false;
+    if !buf.ends_with(b"\n") && n > MAX_LINE_BYTES {
+        truncated = true;
+        buf.truncate(MAX_LINE_BYTES);
+        discard_to_newline(reader).map_err(|_| unreadable())?;
+    }
+
+    while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+        buf.pop();
+    }
+
+    let text = match std::str::from_utf8(&buf) {
+        Ok(s) => s.to_string(),
+        // A cut in the middle of a character is the one invalid sequence this
+        // function creates itself, and it can only ever be in the last three
+        // bytes. Anything earlier is the file's own, and gets the honest
+        // refusal rather than a silent prefix of binary.
+        Err(e) if truncated && e.valid_up_to() + 4 > buf.len() => {
+            String::from_utf8_lossy(&buf[..e.valid_up_to()]).into_owned()
+        }
+        Err(_) => {
+            return Err(ToolError::new(
+                "not_text",
+                format!("{path} is not valid UTF-8"),
+            ))
+        }
+    };
+
+    Ok(Some(Line { text, truncated }))
+}
+
+/// **D15 — one page of a file, with line numbers, and no terminal refusal.**
+///
+/// Before this, `/file` was all-or-nothing: over the ceiling `too_large` was
+/// permanent and the model could never read that file, while under it a 900 KB
+/// read was durable, re-projected every round, and removable only by evicting
+/// the whole turn plus its batch. **One bad read bricked the stream.** Paging
+/// removes that whole class of unrecoverable session death.
+///
+/// Three caps, each announced when it bites, each with the offset to continue
+/// from — a cap the model cannot see is a cap it cannot work around.
+fn read_page(root: &Path, path: &str, offset: usize, limit: usize) -> Result<String, ToolError> {
+    let (resolved, _) = open_readable(root, path)?;
+    let file = std::fs::File::open(&resolved)
+        .map_err(|_| ToolError::new("not_found", format!("nothing at {path}")))?;
+    let mut reader = BufReader::new(file);
+
+    // Offsets are 1-based and a model will send 0. Refusing would be correct
+    // and useless.
+    let start = offset.max(1);
+    let limit = limit.clamp(1, MAX_LINES);
+
+    let mut seen = 0usize;
+    let mut emitted = 0usize;
+    let mut body = String::new();
+    let mut more = false;
+
+    while let Some(line) = next_line(&mut reader, path)? {
+        seen += 1;
+        if seen < start {
+            continue;
+        }
+        if emitted == limit {
+            more = true;
+            break;
+        }
+        let mut rendered = format!("{seen:>6}\t{}", line.text);
+        if line.truncated {
+            rendered.push_str(" …[line truncated]");
+        }
+        rendered.push('\n');
+
+        // `emitted > 0` so a single line larger than the whole page budget is
+        // still served rather than producing an empty page forever.
+        if emitted > 0 && body.len() + rendered.len() > MAX_PAGE_BYTES {
+            more = true;
+            break;
+        }
+        body.push_str(&rendered);
+        emitted += 1;
+    }
+
+    // Every branch below returns non-empty content: an empty text block is a
+    // 400, so "there is nothing here" must still be something.
+    if seen == 0 {
+        return Ok(format!("{path} — the file is empty\n"));
+    }
+    if emitted == 0 {
+        return Ok(format!(
+            "{path} — {seen} lines; offset {start} is past the end of the file\n"
+        ));
+    }
+
+    let last = start + emitted - 1;
+    let footer = if more {
+        format!("[more lines follow; call read_file with offset={}]\n", last + 1)
+    } else {
+        "[end of file]\n".to_string()
+    };
+    Ok(format!("{path} lines {start}-{last}\n{body}{footer}"))
+}
+
+/// Pull a required string argument, or refuse in a way the model can act on.
+///
+/// A missing argument must never panic and must never reach the filesystem as
+/// an empty string: `path: ""` is a *legal* request for the workspace root, so
+/// defaulting would silently answer a question nobody asked.
+fn required_str<'a>(
+    input: &'a serde_json::Value,
+    key: &str,
+    tool: &str,
+) -> Result<&'a str, ToolError> {
+    input
+        .get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::new("invalid_input", format!("{tool} requires a `{key}` string")))
+}
+
+/// An optional whole-number argument.
+///
+/// A key that is present but not a number is a **refusal, not a default**. A
+/// model that sends `offset: "10"` and silently gets page one would read the
+/// wrong window and have no way to know it.
+fn optional_usize(
+    input: &serde_json::Value,
+    key: &str,
+    default: usize,
+) -> Result<usize, ToolError> {
+    match input.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(v) => v.as_u64().map(|n| n as usize).ok_or_else(|| {
+            ToolError::new(
+                "invalid_input",
+                format!("`{key}` must be a whole number, not {v}"),
+            )
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -301,12 +736,365 @@ mod tests {
     #[test]
     fn the_definition_set_is_ordered_and_schema_shaped() {
         let defs = definitions();
-        assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0]["name"], "get_composition");
-        assert_eq!(defs[0]["input_schema"]["type"], "object");
+        let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
+
+        // Order is part of the cached prefix, so it is pinned rather than
+        // incidental.
+        assert_eq!(names, ["get_composition", "list_directory", "read_file"]);
+        for d in &defs {
+            assert_eq!(d["input_schema"]["type"], "object");
+            assert!(
+                d["description"].as_str().unwrap().len() > 40,
+                "the description is what decides whether a model calls it: {d}"
+            );
+        }
+    }
+
+    // ---- list_directory ----
+
+    /// A small tree with one subdirectory, one prose file, and the two shapes
+    /// the guard refuses: a credential and a build directory.
+    fn tree_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("commons")).unwrap();
+        fs::write(dir.path().join("README.md"), "# hello").unwrap();
+        fs::write(dir.path().join(".env"), "TOKEN=hunter2").unwrap();
+        fs::create_dir(dir.path().join("node_modules")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn list_directory_names_entries_and_marks_which_are_directories() {
+        let dir = tree_fixture();
+        let out = dispatch(
+            "list_directory",
+            &serde_json::json!({ "path": "" }),
+            dir.path(),
+        )
+        .unwrap();
+
+        assert!(out.contains("commons/"), "a directory is marked: {out}");
+        assert!(out.contains("README.md"), "{out}");
         assert!(
-            defs[0]["description"].as_str().unwrap().len() > 40,
-            "the description is what decides whether a model calls it"
+            !out.contains("README.md/"),
+            "a file must not be marked as a directory: {out}"
         );
+    }
+
+    #[test]
+    fn a_listing_reports_its_total_and_says_so_when_it_is_a_prefix() {
+        // D7, and `tree.rs`'s own argument for why the fields exist: a silently
+        // short list reads exactly like a complete one.
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..MAX_ENTRIES + 11 {
+            fs::write(dir.path().join(format!("note-{n:04}.md")), "x").unwrap();
+        }
+        let out = dispatch("list_directory", &serde_json::json!({ "path": "" }), dir.path())
+            .unwrap();
+
+        assert!(
+            out.contains(&(MAX_ENTRIES + 11).to_string()),
+            "the total must survive into the text: {out}"
+        );
+        assert!(
+            out.to_lowercase().contains("first"),
+            "a truncated listing must say it is a prefix: {out}"
+        );
+    }
+
+    #[test]
+    fn a_complete_listing_reports_its_total_without_claiming_to_be_truncated() {
+        // Mutation-found gap: with the total only asserted on the truncated
+        // path, the truncation footer's own "of 511" satisfied it and the
+        // header's count was tested by nothing.
+        let dir = tree_fixture();
+        let out = dispatch("list_directory", &serde_json::json!({ "path": "" }), dir.path())
+            .unwrap();
+
+        assert!(out.contains("2 entries"), "commons/ and README.md: {out}");
+        assert!(!out.to_lowercase().contains("first"), "{out}");
+    }
+
+    #[test]
+    fn credentials_and_build_output_never_reach_a_listing() {
+        let dir = tree_fixture();
+        let out = dispatch("list_directory", &serde_json::json!({ "path": "" }), dir.path())
+            .unwrap();
+
+        assert!(!out.contains(".env"), "{out}");
+        assert!(!out.contains("node_modules"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_directory_still_produces_non_empty_content() {
+        // An empty text block is a 400 (measured). "Nothing here" must still be
+        // something.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("empty")).unwrap();
+        let out = dispatch(
+            "list_directory",
+            &serde_json::json!({ "path": "empty" }),
+            dir.path(),
+        )
+        .unwrap();
+
+        assert!(!out.trim().is_empty(), "an empty listing rendered to nothing");
+    }
+
+    #[test]
+    fn list_directory_refuses_a_file_and_names_the_recovery() {
+        let dir = tree_fixture();
+        let err = dispatch(
+            "list_directory",
+            &serde_json::json!({ "path": "README.md" }),
+            dir.path(),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.status, "not_a_directory");
+    }
+
+    #[test]
+    fn list_directory_carries_the_guards_own_code_for_a_denied_path() {
+        let dir = tree_fixture();
+        let err = dispatch(
+            "list_directory",
+            &serde_json::json!({ "path": "node_modules" }),
+            dir.path(),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.status, "denied_noise");
+    }
+
+    #[test]
+    fn a_tool_call_missing_its_required_path_is_an_error_result_not_a_panic() {
+        let dir = tree_fixture();
+        for name in ["list_directory", "read_file"] {
+            let err = dispatch(name, &serde_json::json!({}), dir.path()).unwrap_err();
+            assert_eq!(err.status, "invalid_input", "{name}");
+            assert!(err.detail.contains("path"), "{name}: {}", err.detail);
+        }
+    }
+
+    // ---- read_file (D15) ----
+
+    fn read(dir: &Path, input: serde_json::Value) -> String {
+        dispatch("read_file", &input, dir).unwrap()
+    }
+
+    /// A file of `n` lines, each `line-0001`-shaped so a window is identifiable.
+    fn lined_file(dir: &Path, name: &str, n: usize) {
+        let body: String = (1..=n).map(|i| format!("line-{i:04}\n")).collect();
+        fs::write(dir.join(name), body).unwrap();
+    }
+
+    #[test]
+    fn read_file_numbers_its_lines_so_a_model_can_cite_one() {
+        // ycc's affordance, and the reason it matters here: without numbers a
+        // model can quote a file but cannot point at it.
+        let dir = tempfile::tempdir().unwrap();
+        lined_file(dir.path(), "notes.md", 3);
+        let out = read(dir.path(), serde_json::json!({ "path": "notes.md" }));
+
+        assert!(out.contains("1\tline-0001"), "{out}");
+        assert!(out.contains("3\tline-0003"), "{out}");
+    }
+
+    #[test]
+    fn read_file_returns_the_window_it_was_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        lined_file(dir.path(), "notes.md", 50);
+        let out = read(
+            dir.path(),
+            serde_json::json!({ "path": "notes.md", "offset": 10, "limit": 3 }),
+        );
+
+        assert!(out.contains("line-0010"), "{out}");
+        assert!(out.contains("line-0012"), "{out}");
+        assert!(!out.contains("line-0009"), "before the window: {out}");
+        assert!(!out.contains("line-0013"), "after the window: {out}");
+    }
+
+    #[test]
+    fn a_page_that_ends_short_of_the_file_gives_the_offset_to_continue_from() {
+        // D6′: render the recovery action, not just the fact. A page that says
+        // "there is more" and not "ask for line 13" leaves the model guessing.
+        let dir = tempfile::tempdir().unwrap();
+        lined_file(dir.path(), "notes.md", 50);
+        let out = read(
+            dir.path(),
+            serde_json::json!({ "path": "notes.md", "offset": 10, "limit": 3 }),
+        );
+
+        assert!(out.contains("offset=13"), "{out}");
+    }
+
+    #[test]
+    fn the_last_page_says_it_is_the_last_rather_than_inviting_another_call() {
+        let dir = tempfile::tempdir().unwrap();
+        lined_file(dir.path(), "notes.md", 3);
+        let out = read(dir.path(), serde_json::json!({ "path": "notes.md" }));
+
+        assert!(out.contains("end of file"), "{out}");
+        assert!(!out.contains("offset="), "no next page exists: {out}");
+    }
+
+    #[test]
+    fn a_file_over_the_byte_ceiling_returns_a_page_rather_than_a_terminal_refusal() {
+        // The whole of D15. `/file` answers `too_large` and the model can never
+        // read that file again — one bad read used to brick the stream.
+        let dir = tempfile::tempdir().unwrap();
+        let big: String = (1..=40_000)
+            .map(|i| format!("line-{i:04} {}\n", "x".repeat(40)))
+            .collect();
+        fs::write(dir.path().join("huge.md"), &big).unwrap();
+        assert!(big.len() as u64 > super::MAX_BYTES, "fixture must exceed the ceiling");
+
+        let out = read(dir.path(), serde_json::json!({ "path": "huge.md" }));
+
+        assert!(out.contains("line-0001"), "{out}");
+        assert!(out.contains("offset="), "a page must invite the next one: {out}");
+    }
+
+    #[test]
+    fn a_page_stops_at_the_byte_cap_before_it_spends_its_line_budget() {
+        // A tool result is durable and re-projected every round (D9), so the
+        // cap that binds first must be bytes, not lines.
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=DEFAULT_LINES).map(|i| format!("{i:04} {}\n", "y".repeat(300))).collect();
+        fs::write(dir.path().join("dense.md"), &body).unwrap();
+
+        let out = read(dir.path(), serde_json::json!({ "path": "dense.md" }));
+
+        assert!(out.len() < body.len(), "the whole file came through: {} bytes", out.len());
+        assert!(out.contains("offset="), "a capped page must say how to continue: {out}");
+    }
+
+    #[test]
+    fn an_over_long_line_is_truncated_and_the_line_admits_it() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("wide.md"),
+            format!("{}\nshort\n", "z".repeat(MAX_LINE_BYTES * 2)),
+        )
+        .unwrap();
+
+        let out = read(dir.path(), serde_json::json!({ "path": "wide.md" }));
+
+        assert!(out.contains("line truncated"), "{out}");
+        // The next line must still be reachable — a long line must not eat the
+        // rest of the page.
+        assert!(out.contains("short"), "{out}");
+    }
+
+    #[test]
+    fn truncating_an_over_long_line_never_splits_a_character() {
+        // The cap is measured in bytes and this workspace writes `.爻` files:
+        // three bytes per character, so the cap lands mid-character by default.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("wide.爻"),
+            format!("{}\n", "爻".repeat(MAX_LINE_BYTES)),
+        )
+        .unwrap();
+
+        let out = read(dir.path(), serde_json::json!({ "path": "wide.爻" }));
+
+        assert!(
+            !out.contains('\u{FFFD}'),
+            "a character was split and lossily replaced: {out}"
+        );
+    }
+
+    #[test]
+    fn an_empty_file_says_so_rather_than_rendering_to_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("empty.md"), "").unwrap();
+
+        let out = read(dir.path(), serde_json::json!({ "path": "empty.md" }));
+
+        assert!(!out.trim().is_empty(), "an empty text block is a 400");
+        assert!(out.contains("empty"), "{out}");
+    }
+
+    #[test]
+    fn an_offset_past_the_end_reports_the_length_rather_than_an_empty_page() {
+        let dir = tempfile::tempdir().unwrap();
+        lined_file(dir.path(), "notes.md", 5);
+
+        let out = read(
+            dir.path(),
+            serde_json::json!({ "path": "notes.md", "offset": 99 }),
+        );
+
+        assert!(out.contains('5'), "the real length must be reported: {out}");
+        assert!(!out.trim().is_empty());
+    }
+
+    #[test]
+    fn an_offset_of_zero_reads_from_the_first_line() {
+        // Offsets are 1-based and a model will send 0. Refusing would be
+        // correct and useless.
+        let dir = tempfile::tempdir().unwrap();
+        lined_file(dir.path(), "notes.md", 3);
+
+        let out = read(
+            dir.path(),
+            serde_json::json!({ "path": "notes.md", "offset": 0 }),
+        );
+
+        assert!(out.contains("line-0001"), "{out}");
+        assert!(
+            out.contains("lines 1-3"),
+            "the header must report the line it actually started at: {out}"
+        );
+    }
+
+    #[test]
+    fn a_limit_above_the_cap_is_clamped_rather_than_honoured() {
+        let dir = tempfile::tempdir().unwrap();
+        lined_file(dir.path(), "notes.md", MAX_LINES + 100);
+
+        let out = read(
+            dir.path(),
+            serde_json::json!({ "path": "notes.md", "limit": 99_999 }),
+        );
+        let last = MAX_LINES + 1;
+        assert!(!out.contains(&format!("line-{last:04}")), "the cap did not hold");
+    }
+
+    #[test]
+    fn read_file_refuses_what_the_guard_and_the_type_gate_refuse() {
+        let dir = tree_fixture();
+        fs::write(dir.path().join("icon.png"), [0x89, 0x50, 0x4e, 0x47]).unwrap();
+        fs::write(dir.path().join("bad.md"), [0xff, 0xfe, 0x00]).unwrap();
+
+        for (path, status) in [
+            ("commons", "is_a_directory"),
+            (".env", "denied_credential"),
+            ("icon.png", "not_openable"),
+            ("bad.md", "not_text"),
+            ("nope.md", "not_found"),
+            ("../escape.md", "outside_workspace"),
+        ] {
+            let err = dispatch("read_file", &serde_json::json!({ "path": path }), dir.path())
+                .unwrap_err();
+            assert_eq!(err.status, status, "{path}");
+        }
+    }
+
+    #[test]
+    fn the_route_and_the_tool_share_one_gate() {
+        // Not a style point. The gate is `guard::resolve` plus the openable
+        // check, and two copies would eventually disagree about which of them
+        // serves a credential.
+        let dir = tree_fixture();
+        let via_route = read_whole(dir.path(), ".env").unwrap_err();
+        let via_tool = dispatch("read_file", &serde_json::json!({ "path": ".env" }), dir.path())
+            .unwrap_err();
+
+        assert_eq!(via_route.status, via_tool.status);
+        assert_eq!(via_route.status, "denied_credential");
     }
 }

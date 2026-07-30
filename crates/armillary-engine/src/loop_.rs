@@ -764,12 +764,16 @@ mod tests {
     }
 
     fn calls(id: &str, name: &str) -> TurnOutcome {
+        calls_with(id, name, serde_json::json!({}))
+    }
+
+    fn calls_with(id: &str, name: &str, input: serde_json::Value) -> TurnOutcome {
         TurnOutcome {
             text: String::new(),
             blocks: vec![crate::projection::ContentBlock::ToolUse {
                 id: id.to_string(),
                 name: name.to_string(),
-                input: serde_json::json!({}),
+                input,
             }],
             stop_reason: Some("tool_use".to_string()),
             stopped: false,
@@ -852,6 +856,75 @@ mod tests {
 
         let last = events.last().unwrap();
         assert_eq!(last.data["text"], "there is one repo, r");
+    }
+
+    #[tokio::test]
+    async fn a_session_can_find_a_file_and_read_a_string_no_earlier_event_carried() {
+        // **Success criterion 1**, and the reason it replaced v1's: the
+        // composition carries every repo's `note`, so "the model named a repo"
+        // was satisfiable by reciting. A string that exists only inside a file
+        // the model chose to open is not. This is the whole of 2b in one test —
+        // list to discover, read to know.
+        let data_dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("modules.toml"), "[[repos]]\nname='r'\npath='p'\n")
+            .unwrap();
+        std::fs::create_dir(root.path().join("notes")).unwrap();
+        std::fs::write(
+            root.path().join("notes/board.md"),
+            "# board\n\nthe cormorant dries its wings\n",
+        )
+        .unwrap();
+
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance(&sessions, Some("tycho")).await;
+
+        let provider = std::sync::Arc::new(RoundScript::new(vec![
+            calls_with("t1", "list_directory", serde_json::json!({ "path": "notes" })),
+            calls_with(
+                "t2",
+                "read_file",
+                serde_json::json!({ "path": "notes/board.md" }),
+            ),
+            says("the board says the cormorant dries its wings"),
+        ]));
+        let state = state_with(provider, sessions.clone(), root.path()).await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+
+        let events = sessions.store().read_from(&id, 0).unwrap();
+        let results: Vec<&EventEnvelope> = events
+            .iter()
+            .filter(|e| e.event_type == "tool_result")
+            .collect();
+        assert_eq!(results.len(), 2, "both calls must be answered");
+
+        // The listing is what makes the file findable without being told.
+        let listing = results[0].data["content"].as_str().unwrap();
+        assert_eq!(results[0].data["status"], "ok", "{listing}");
+        assert!(listing.contains("board.md"), "{listing}");
+
+        let secret = "cormorant dries its wings";
+        let read = results[1].data["content"].as_str().unwrap();
+        assert!(read.contains(secret), "the file was not actually read: {read}");
+        assert!(read.contains("[end of file]"), "{read}");
+
+        // The ungameable half: nothing before the read carried the string, so
+        // it cannot have been recited.
+        let read_at = events
+            .iter()
+            .position(|e| e.id == results[1].id)
+            .expect("the result is in the log");
+        for earlier in &events[..read_at] {
+            assert!(
+                !earlier.data.to_string().contains(secret),
+                "{} carried the string before the read: {}",
+                earlier.event_type,
+                earlier.data
+            );
+        }
     }
 
     #[tokio::test]
