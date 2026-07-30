@@ -125,6 +125,37 @@ fn role_str(role: ProviderRole) -> &'static str {
     }
 }
 
+/// Build the `/v1/messages` request body for one turn.
+///
+/// Extracted from `AnthropicProvider::run_turn` so the body is inspectable
+/// without a network call. It is the seam the golden tests pin: the block-list
+/// migration has to leave this function's output byte-identical for a
+/// text-only turn, and there is no way to check that while the body is built
+/// inline and handed straight to `reqwest`.
+fn build_request_body(model: &str, turn: &ModelTurn) -> serde_json::Value {
+    let messages: Vec<serde_json::Value> = turn
+        .messages
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "role": role_str(m.role),
+                "content": m.content,
+            })
+        })
+        .collect();
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "max_tokens": MAX_TOKENS,
+        "messages": messages,
+        "stream": true,
+    });
+    if let Some(system) = &turn.system {
+        body["system"] = serde_json::json!(system);
+    }
+    body
+}
+
 #[async_trait::async_trait]
 impl ModelProvider for AnthropicProvider {
     async fn run_turn(
@@ -141,26 +172,7 @@ impl ModelProvider for AnthropicProvider {
             });
         }
 
-        let messages: Vec<serde_json::Value> = turn
-            .messages
-            .iter()
-            .map(|m| {
-                serde_json::json!({
-                    "role": role_str(m.role),
-                    "content": m.content,
-                })
-            })
-            .collect();
-
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "max_tokens": MAX_TOKENS,
-            "messages": messages,
-            "stream": true,
-        });
-        if let Some(system) = &turn.system {
-            body["system"] = serde_json::json!(system);
-        }
+        let body = build_request_body(&self.model, &turn);
 
         let client = reqwest::Client::new();
         let response = client
@@ -528,6 +540,78 @@ mod tests {
         let err = provider.run_turn(empty_turn(), tx, cancel_rx).await.unwrap_err();
 
         assert_eq!(err, ProviderError::NoApiKey);
+    }
+
+    // --- the request body, pinned ---
+    //
+    // These two goldens are captured against the PRE-migration build and must
+    // not be regenerated afterwards. Their whole job is to let the block-list
+    // migration prove it is inert rather than assert it: a golden written after
+    // the change would pass by construction and prove nothing, which is the
+    // "regression test that passes identically with the bug present" defect this
+    // repo has already shipped once.
+
+    #[test]
+    fn request_body_for_a_text_only_turn_is_the_pinned_shape() {
+        let turn = ModelTurn {
+            system: Some("# boot".to_string()),
+            messages: vec![
+                ProviderMessage {
+                    role: ProviderRole::User,
+                    content: "hi".to_string(),
+                },
+                ProviderMessage {
+                    role: ProviderRole::Assistant,
+                    content: "hello".to_string(),
+                },
+                ProviderMessage {
+                    role: ProviderRole::User,
+                    content: "bye".to_string(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            build_request_body("claude-sonnet-5", &turn),
+            serde_json::json!({
+                "model": "claude-sonnet-5",
+                "max_tokens": 4096,
+                "stream": true,
+                "system": "# boot",
+                "messages": [
+                    { "role": "user", "content": "hi" },
+                    { "role": "assistant", "content": "hello" },
+                    { "role": "user", "content": "bye" },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn request_body_omits_system_entirely_when_no_boot_event_stands() {
+        // Not `"system": null` — the key is absent. A bare clone declares no
+        // boot file, and this is the shape that has been in production since
+        // the boot channel shipped.
+        let turn = ModelTurn {
+            system: None,
+            messages: vec![ProviderMessage {
+                role: ProviderRole::User,
+                content: "hi".to_string(),
+            }],
+        };
+
+        let body = build_request_body("claude-sonnet-5", &turn);
+
+        assert!(body.get("system").is_none(), "system must be absent, got: {body}");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "model": "claude-sonnet-5",
+                "max_tokens": 4096,
+                "stream": true,
+                "messages": [{ "role": "user", "content": "hi" }],
+            })
+        );
     }
 
     // --- AnthropicProvider ---
