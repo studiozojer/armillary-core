@@ -90,6 +90,37 @@ pub enum ProviderError {
     NoApiKey,
 }
 
+/// One request to the provider: what the model sees, plus what it may do.
+///
+/// `turn` is the projection's output and nothing else — P-4's flattened shape.
+/// `tools` and `tool_choice` are **not** projections of the log; the loop
+/// attaches them per round, which is why they live beside the turn rather than
+/// inside it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnRequest {
+    pub turn: ModelTurn,
+    /// Sent only when non-empty. Tool definitions render at the very front of
+    /// the prompt, so a set that changes between requests invalidates the whole
+    /// cached prefix — keep the order fixed.
+    pub tools: Vec<serde_json::Value>,
+    /// `{"type":"none"}` at a bound to force text; `{"type":"tool","name":…}` to
+    /// compel a specific call. Measured: both are accepted on `claude-sonnet-5`
+    /// with adaptive thinking on, which is this engine's default.
+    pub tool_choice: Option<serde_json::Value>,
+}
+
+impl TurnRequest {
+    /// A turn with no tools offered — the pre-tool shape, and what the request
+    /// goldens pin.
+    pub fn bare(turn: ModelTurn) -> Self {
+        TurnRequest {
+            turn,
+            tools: Vec::new(),
+            tool_choice: None,
+        }
+    }
+}
+
 /// Streams one turn's model output. `sink` receives the full accumulated
 /// text on every emission (a snapshot — see the module doc); `cancel`
 /// carries the loop's stop signal (Task 11 flips it to interrupt a
@@ -99,7 +130,7 @@ pub enum ProviderError {
 pub trait ModelProvider: Send + Sync + 'static {
     async fn run_turn(
         &self,
-        turn: ModelTurn,
+        req: TurnRequest,
         sink: mpsc::Sender<String>,
         cancel: watch::Receiver<bool>,
     ) -> Result<TurnOutcome, ProviderError>;
@@ -363,7 +394,8 @@ fn flatten_content(blocks: &[ContentBlock]) -> serde_json::Value {
 /// migration has to leave this function's output byte-identical for a
 /// text-only turn, and there is no way to check that while the body is built
 /// inline and handed straight to `reqwest`.
-fn build_request_body(model: &str, turn: &ModelTurn) -> serde_json::Value {
+fn build_request_body(model: &str, req: &TurnRequest) -> serde_json::Value {
+    let turn = &req.turn;
     let messages: Vec<serde_json::Value> = turn
         .messages
         .iter()
@@ -383,6 +415,16 @@ fn build_request_body(model: &str, turn: &ModelTurn) -> serde_json::Value {
     });
     if let Some(system) = &turn.system {
         body["system"] = serde_json::json!(system);
+    }
+    // Omitted entirely when empty, not sent as `[]`. That is what keeps a
+    // no-tools turn byte-identical to the pre-tool build, which the goldens
+    // pin — the claim is about the flattening, not about the engine never
+    // offering tools.
+    if !req.tools.is_empty() {
+        body["tools"] = serde_json::json!(req.tools);
+    }
+    if let Some(choice) = &req.tool_choice {
+        body["tool_choice"] = choice.clone();
     }
     body
 }
@@ -405,7 +447,7 @@ impl AnthropicProvider {
 impl ModelProvider for AnthropicProvider {
     async fn run_turn(
         &self,
-        turn: ModelTurn,
+        req: TurnRequest,
         sink: mpsc::Sender<String>,
         mut cancel: watch::Receiver<bool>,
     ) -> Result<TurnOutcome, ProviderError> {
@@ -419,7 +461,7 @@ impl ModelProvider for AnthropicProvider {
             });
         }
 
-        let body = build_request_body(&self.model, &turn);
+        let body = build_request_body(&self.model, &req);
 
         let client = reqwest::Client::new();
         let response = client
@@ -505,7 +547,7 @@ pub struct KeylessProvider;
 impl ModelProvider for KeylessProvider {
     async fn run_turn(
         &self,
-        _turn: ModelTurn,
+        _req: TurnRequest,
         _sink: mpsc::Sender<String>,
         _cancel: watch::Receiver<bool>,
     ) -> Result<TurnOutcome, ProviderError> {
@@ -652,11 +694,11 @@ impl<P> ValidatingProvider<P> {
 impl<P: ModelProvider> ModelProvider for ValidatingProvider<P> {
     async fn run_turn(
         &self,
-        turn: ModelTurn,
+        req: TurnRequest,
         sink: mpsc::Sender<String>,
         cancel: watch::Receiver<bool>,
     ) -> Result<TurnOutcome, ProviderError> {
-        if let Err(violation) = validate_turn(&turn) {
+        if let Err(violation) = validate_turn(&req.turn) {
             // Shaped like the real refusal so a caller's error handling is
             // exercised by the double rather than bypassed.
             return Err(ProviderError::Api {
@@ -666,7 +708,7 @@ impl<P: ModelProvider> ModelProvider for ValidatingProvider<P> {
                 ),
             });
         }
-        self.inner.run_turn(turn, sink, cancel).await
+        self.inner.run_turn(req, sink, cancel).await
     }
 }
 
@@ -714,7 +756,7 @@ impl ScriptedProvider {
 impl ModelProvider for ScriptedProvider {
     async fn run_turn(
         &self,
-        _turn: ModelTurn,
+        _req: TurnRequest,
         sink: mpsc::Sender<String>,
         cancel: watch::Receiver<bool>,
     ) -> Result<TurnOutcome, ProviderError> {
@@ -757,11 +799,11 @@ mod tests {
     use super::*;
     use crate::projection::ProviderMessage;
 
-    fn empty_turn() -> ModelTurn {
-        ModelTurn {
+    fn empty_turn() -> TurnRequest {
+        TurnRequest::bare(ModelTurn {
             system: None,
             messages: vec![],
-        }
+        })
     }
 
     // --- ScriptedProvider ---
@@ -1237,7 +1279,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let (_c, cancel_rx) = watch::channel(false);
 
-        let err = provider.run_turn(bad, tx, cancel_rx).await.unwrap_err();
+        let err = provider.run_turn(TurnRequest::bare(bad), tx, cancel_rx).await.unwrap_err();
 
         match err {
             ProviderError::Api { status, body } => {
@@ -1291,7 +1333,7 @@ mod tests {
         };
 
         assert_eq!(
-            build_request_body("claude-sonnet-5", &turn),
+            build_request_body("claude-sonnet-5", &TurnRequest::bare(turn)),
             serde_json::json!({
                 "model": "claude-sonnet-5",
                 "max_tokens": 64000,
@@ -1319,7 +1361,7 @@ mod tests {
             }],
         };
 
-        let body = build_request_body("claude-sonnet-5", &turn);
+        let body = build_request_body("claude-sonnet-5", &TurnRequest::bare(turn));
 
         assert!(body.get("system").is_none(), "system must be absent, got: {body}");
         assert_eq!(
@@ -1354,7 +1396,7 @@ mod tests {
         };
 
         assert_eq!(
-            build_request_body("m", &turn)["messages"][0]["content"],
+            build_request_body("m", &TurnRequest::bare(turn))["messages"][0]["content"],
             serde_json::json!("hi")
         );
     }
@@ -1377,7 +1419,7 @@ mod tests {
         };
 
         assert_eq!(
-            build_request_body("m", &turn)["messages"][0]["content"],
+            build_request_body("m", &TurnRequest::bare(turn))["messages"][0]["content"],
             serde_json::json!([
                 { "type": "text", "text": "reading it" },
                 {
@@ -1410,7 +1452,7 @@ mod tests {
             }],
         };
 
-        let block = &build_request_body("m", &turn)["messages"][0]["content"][0];
+        let block = &build_request_body("m", &TurnRequest::bare(turn))["messages"][0]["content"][0];
 
         assert!(
             block.get("status").is_none(),
@@ -1466,7 +1508,7 @@ mod tests {
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
         let outcome = provider
-            .run_turn(turn, tx, cancel_rx)
+            .run_turn(TurnRequest::bare(turn), tx, cancel_rx)
             .await
             .expect("live call should succeed with a valid key");
 

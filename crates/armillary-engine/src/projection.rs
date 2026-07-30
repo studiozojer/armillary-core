@@ -128,6 +128,22 @@ pub enum ProjectionError {
     /// `root`. A boot path has no legitimate reason to leave the workspace
     /// root, so "escaped" and "unreadable" are one caller-visible outcome.
     BootUnreadable { path: String },
+    /// One or more `tool_use` events in this projection have no answering
+    /// `tool_result`. The provider rejects that outright, so the caller must
+    /// heal before it can take a turn.
+    ///
+    /// **Carries every unanswered id, not one.** The `BootDrift` precedent
+    /// recovers a single failure per cycle, which is fine when there is only
+    /// ever one boot event — but a batch can strand several calls at once (an
+    /// engine killed after appending two `tool_use` events and no results), and
+    /// a one-at-a-time recovery would heal one per round while the projection
+    /// keeps failing.
+    ///
+    /// Heal-forward: the caller appends a real `tool_result` event per id and
+    /// re-projects. It does not synthesize a block here — P-2 wants the
+    /// injected content recorded first, I-1 says correction is a new event, and
+    /// a repair invisible in the log is a repair nobody can audit.
+    UnansweredToolUses { ids: Vec<String> },
     /// A transient (`seq == 0`, I-4) event reached the reducer. Durable-only
     /// is a caller invariant (transients are never persisted, so a `seq`
     /// slice pulled from the log never contains one) — this is the
@@ -156,6 +172,8 @@ const HANDLED_TYPES: &[&str] = &[
     "context_evict",
     "dispatch",
     "return",
+    "tool_use",
+    "tool_result",
 ];
 
 /// Join `rel` under `root` and require the canonical result to stay under
@@ -269,6 +287,48 @@ fn ensure_opens_on_user(mut messages: Vec<ProviderMessage>) -> Vec<ProviderMessa
     messages
 }
 
+/// What a model should try instead, per guard/route machine code.
+///
+/// D6′'s "render the recovery action, not just the code" is not a pedagogic
+/// preference — it is load-bearing twice. A bare `denied_credential` tells the
+/// model nothing about what to do next, and (measured) `is_error: true` with
+/// **empty** content is a 400, so the error path must render *something* or it
+/// bricks the stream.
+fn recovery_hint(status: &str) -> &'static str {
+    match status {
+        "denied_credential" => "this path holds credential material and is never served; read something else",
+        "denied_noise" => "this path is build output or the engine's own data; read something else",
+        "outside_workspace" => "paths are relative and must stay inside the workspace root",
+        "not_found" => "nothing is at that path; list the parent directory first",
+        "not_openable" => "that file type is not served as text; try .md, .爻, .toml, .json or a source file",
+        "too_large" => "the file exceeds the byte ceiling; re-read a page of it",
+        "not_text" => "the file is not valid UTF-8 and cannot be served as text",
+        "is_a_directory" => "that is a directory; list it instead of reading it",
+        "not_a_directory" => "that is a file; read it instead of listing it",
+        "malformed_path" => "the path is not usable as written",
+        // An unknown code still renders non-empty, which is what the wire needs.
+        _ => "the call did not succeed",
+    }
+}
+
+/// Render a tool result's model-visible content.
+///
+/// On success the tool's own output crosses unchanged (an empty successful
+/// result is legal). On failure the machine code is preserved **verbatim** —
+/// so a human reading the transcript sees the same string the log holds — and
+/// is followed by the recovery hint, guaranteeing non-empty content.
+fn render_tool_result(status: &str, body: &str, is_error: bool) -> String {
+    if !is_error {
+        return body.to_string();
+    }
+    let hint = recovery_hint(status);
+    if body.is_empty() {
+        format!("{status}: {hint}")
+    } else {
+        format!("{status}: {hint}\n{body}")
+    }
+}
+
 fn text_field(data: &serde_json::Value, key: &str) -> String {
     data.get(key)
         .and_then(|v| v.as_str())
@@ -293,6 +353,70 @@ pub fn project_context(
                 evicted.insert(target);
             }
         }
+    }
+
+    // D14 — the eviction unit is the assistant turn plus its complete tool
+    // batch, never a lone event.
+    //
+    // Measured both ways: a `tool_use` with no `tool_result` is a 400, and a
+    // `tool_result` with no `tool_use` is a 400. So removing half a pair from a
+    // projection kills every subsequent turn on the stream. The evict route
+    // takes ONE event id and does not check its type, which makes that one
+    // HTTP call away.
+    //
+    // Membership comes from `parent` — declared on the envelope since v0.1 and
+    // constructed nowhere until now. A tool event's `parent` names the
+    // assistant event that owns its batch, so membership is a filter. The
+    // alternative, walking positionally from the assistant event, breaks the
+    // moment anything else in the batch has already been evicted.
+    fn batch_root(e: &EventEnvelope) -> Option<&str> {
+        match e.event_type.as_str() {
+            "tool_use" | "tool_result" => e.parent.as_deref(),
+            _ => None,
+        }
+    }
+
+    // Which batches lost a member? Evicting a tool event condemns its siblings;
+    // evicting the owning assistant event condemns the whole batch under it.
+    let mut condemned: HashSet<&str> = HashSet::new();
+    for e in events {
+        if !evicted.contains(e.id.as_str()) {
+            continue;
+        }
+        match batch_root(e) {
+            Some(root) => {
+                condemned.insert(root);
+            }
+            None => {
+                condemned.insert(e.id.as_str());
+            }
+        }
+    }
+    for e in events {
+        if let Some(root) = batch_root(e) {
+            if condemned.contains(root) {
+                evicted.insert(e.id.as_str());
+            }
+        }
+    }
+
+    // Every surviving call must have a surviving answer. Eviction above is
+    // batch-atomic so it cannot produce an orphan; what does is a crash between
+    // the two appends, an interrupt, or a bound firing mid-batch.
+    let answered: HashSet<&str> = events
+        .iter()
+        .filter(|e| e.event_type == "tool_result" && !evicted.contains(e.id.as_str()))
+        .filter_map(|e| e.data.get("toolUseId").and_then(|v| v.as_str()))
+        .collect();
+    let unanswered: Vec<String> = events
+        .iter()
+        .filter(|e| e.event_type == "tool_use" && !evicted.contains(e.id.as_str()))
+        .filter_map(|e| e.data.get("id").and_then(|v| v.as_str()))
+        .filter(|id| !answered.contains(id))
+        .map(str::to_string)
+        .collect();
+    if !unanswered.is_empty() {
+        return Err(ProjectionError::UnansweredToolUses { ids: unanswered });
     }
 
     // "Last one wins" (see the `"boot"` arm below) extends to VALIDITY, not
@@ -376,7 +500,16 @@ pub fn project_context(
                     // carrier, so the marker belongs here, not there.
                     content.push_str("\n[generation stopped by user]");
                 }
-                raw.push(text_message(ProviderRole::Assistant, content));
+                // An assistant turn that only called tools has no text, and an
+                // empty text block is a 400 (measured). Legal alternative,
+                // also measured: an assistant message carrying only `tool_use`
+                // blocks. So contribute nothing here and let the `tool_use`
+                // arm stand the message up — rather than synthesizing prose
+                // the model never produced, which would put words in the
+                // operator's mouth in a durable record.
+                if !content.is_empty() {
+                    raw.push(text_message(ProviderRole::Assistant, content));
+                }
             }
 
             // The interrupted flag on the assistant_message carries this;
@@ -428,6 +561,54 @@ pub fn project_context(
                     None => format!("[child {child} returned]"),
                 };
                 raw.push(text_message(ProviderRole::User, content));
+            }
+
+            // Assistant-role, so `merge_consecutive` folds it into the
+            // `assistant_message` that preceded it — one assistant turn
+            // carrying its text and its calls, which is the shape the API
+            // requires. No new assembly logic; the merge pass does it.
+            "tool_use" => {
+                raw.push(ProviderMessage {
+                    role: ProviderRole::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: text_field(&ev.data, "id"),
+                        name: text_field(&ev.data, "name"),
+                        input: ev
+                            .data
+                            .get("input")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
+                    }],
+                });
+            }
+
+            // User-role: the wire has no tool role, and `tool_result` blocks
+            // ride in the user turn that answers the call.
+            //
+            // `status` is read here and NOT forwarded — the block type has no
+            // field for it and the API rejects one. It survives to the model
+            // only through `is_error` and the rendered content, which is P-4's
+            // "as far toward the boundary as the channel allows". The typed
+            // value stays in `data`, where eviction, the client and loop
+            // control read it.
+            "tool_result" => {
+                let is_error = ev
+                    .data
+                    .get("isError")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                raw.push(ProviderMessage {
+                    role: ProviderRole::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: text_field(&ev.data, "toolUseId"),
+                        content: render_tool_result(
+                            &text_field(&ev.data, "status"),
+                            &text_field(&ev.data, "content"),
+                            is_error,
+                        ),
+                        is_error,
+                    }],
+                });
             }
 
             // Never silent (P-3): visible in the transcript rather than
@@ -689,6 +870,215 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_round_projects_as_one_assistant_turn_and_one_answering_user_turn() {
+        // The shape the API requires, assembled by the existing merge pass
+        // rather than by new assembly logic: `tool_use` projects Assistant-role
+        // so it folds into the assistant message that preceded it, and
+        // `tool_result` projects User-role so it opens the answering turn.
+        let events = vec![
+            ev(1, "u1", "user_message", json!({"text": "what is composed?"})),
+            ev(
+                2,
+                "a1",
+                "assistant_message",
+                json!({"text": "let me look", "interrupted": false}),
+            ),
+            ev(
+                3,
+                "tu1",
+                "tool_use",
+                json!({"id": "toolu_01AAA", "name": "get_composition", "input": {}}),
+            ),
+            ev(
+                4,
+                "tr1",
+                "tool_result",
+                json!({
+                    "toolUseId": "toolu_01AAA",
+                    "status": "ok",
+                    "content": "4 operators, 17 repos",
+                    "isError": false,
+                }),
+            ),
+        ];
+
+        let turn = project_context(&events, Path::new(".")).unwrap();
+
+        assert_eq!(turn.messages.len(), 3, "{:#?}", turn.messages);
+        assert_eq!(turn.messages[1].role, ProviderRole::Assistant);
+        assert_eq!(
+            turn.messages[1].content,
+            vec![
+                ContentBlock::Text("let me look".to_string()),
+                ContentBlock::ToolUse {
+                    id: "toolu_01AAA".to_string(),
+                    name: "get_composition".to_string(),
+                    input: json!({}),
+                },
+            ]
+        );
+        assert_eq!(turn.messages[2].role, ProviderRole::User);
+        assert_eq!(
+            turn.messages[2].content,
+            vec![ContentBlock::ToolResult {
+                tool_use_id: "toolu_01AAA".to_string(),
+                content: "4 operators, 17 repos".to_string(),
+                is_error: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn the_typed_status_stays_in_the_log_and_renders_into_the_result_content() {
+        // S-1's split, made concrete. `status` is sovereign in `data` — eviction,
+        // the client and loop control all read it — but the wire has no slot for
+        // it (measured: a `status` key in a tool_result block is a 400). What
+        // crosses is `is_error` plus a rendered prefix naming the refusal AND the
+        // recovery, because `is_error` with empty content is itself a 400.
+        let events = vec![
+            ev(1, "u1", "user_message", json!({"text": "read the env file"})),
+            ev(
+                2,
+                "tu1",
+                "tool_use",
+                json!({"id": "t1", "name": "read_file", "input": {"path": "repos/app/.env"}}),
+            ),
+            ev(
+                3,
+                "tr1",
+                "tool_result",
+                json!({
+                    "toolUseId": "t1",
+                    "status": "denied_credential",
+                    "content": "",
+                    "isError": true,
+                }),
+            ),
+        ];
+
+        let turn = project_context(&events, Path::new(".")).unwrap();
+        let last = turn.messages.last().unwrap();
+
+        match &last.content[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert!(*is_error);
+                assert!(
+                    content.contains("denied_credential"),
+                    "the machine code must survive verbatim: {content}"
+                );
+                assert!(
+                    !content.is_empty(),
+                    "is_error with empty content is a 400 — the render must never produce one"
+                );
+            }
+            other => panic!("expected a tool_result block, got {other:?}"),
+        }
+    }
+
+    /// A tool event carrying `parent` — the assistant event that owns the batch.
+    fn child(seq: u64, id: &str, parent: &str, t: &str, data: serde_json::Value) -> EventEnvelope {
+        let mut e = ev(seq, id, t, data);
+        e.parent = Some(parent.to_string());
+        e
+    }
+
+    fn a_batch_of_two() -> Vec<EventEnvelope> {
+        vec![
+            ev(1, "u1", "user_message", json!({"text": "look at two things"})),
+            ev(2, "a1", "assistant_message", json!({"text": "on it"})),
+            child(3, "tu1", "a1", "tool_use", json!({"id": "t1", "name": "get_composition", "input": {}})),
+            child(4, "tu2", "a1", "tool_use", json!({"id": "t2", "name": "get_composition", "input": {}})),
+            child(5, "tr1", "a1", "tool_result", json!({"toolUseId": "t1", "status": "ok", "content": "one", "isError": false})),
+            child(6, "tr2", "a1", "tool_result", json!({"toolUseId": "t2", "status": "ok", "content": "two", "isError": false})),
+        ]
+    }
+
+    #[test]
+    fn evicting_one_tool_use_evicts_the_whole_batch_including_its_results() {
+        // Measured: a tool_use with no result is a 400, and so is a result with
+        // no use. So a batch is the eviction unit — the route takes one event
+        // id, and every member has to go with it or the stream is dead.
+        let mut events = a_batch_of_two();
+        events.push(ev(7, "e1", "context_evict", json!({"target": "tu1"})));
+
+        let turn = project_context(&events, Path::new(".")).unwrap();
+
+        for m in &turn.messages {
+            for block in &m.content {
+                assert!(
+                    !matches!(block, ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }),
+                    "a batch member survived eviction: {block:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn evicting_one_tool_result_also_takes_the_call_it_answered() {
+        // The other direction. D14 as first written only covered results whose
+        // use was absent; evicting the RESULT strands the use, which fails just
+        // as hard.
+        let mut events = a_batch_of_two();
+        events.push(ev(7, "e1", "context_evict", json!({"target": "tr2"})));
+
+        let turn = project_context(&events, Path::new(".")).unwrap();
+
+        for m in &turn.messages {
+            for block in &m.content {
+                assert!(
+                    !matches!(block, ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }),
+                    "a batch member survived eviction: {block:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn evicting_the_assistant_event_evicts_the_batch_it_owns() {
+        let mut events = a_batch_of_two();
+        events.push(ev(7, "e1", "context_evict", json!({"target": "a1"})));
+
+        let turn = project_context(&events, Path::new(".")).unwrap();
+
+        assert_eq!(
+            turn.messages.len(),
+            1,
+            "only the user message should remain: {:#?}",
+            turn.messages
+        );
+    }
+
+    #[test]
+    fn every_unanswered_call_in_a_batch_is_reported_not_just_the_first() {
+        // The BootDrift precedent handles one failure per recovery cycle. A
+        // batch can strand several at once — an engine killed after appending
+        // two calls and no results — so the error has to carry all of them or
+        // the loop heals one per round forever.
+        let events = vec![
+            ev(1, "u1", "user_message", json!({"text": "look at two things"})),
+            ev(2, "a1", "assistant_message", json!({"text": "on it"})),
+            child(3, "tu1", "a1", "tool_use", json!({"id": "t1", "name": "get_composition", "input": {}})),
+            child(4, "tu2", "a1", "tool_use", json!({"id": "t2", "name": "get_composition", "input": {}})),
+        ];
+
+        let err = project_context(&events, Path::new(".")).unwrap_err();
+
+        assert_eq!(
+            err,
+            ProjectionError::UnansweredToolUses {
+                ids: vec!["t1".to_string(), "t2".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn an_answered_batch_does_not_report_orphans() {
+        assert!(project_context(&a_batch_of_two(), Path::new(".")).is_ok());
+    }
+
+    #[test]
     fn handled_types_cover_every_durable_type() {
         // P-3: the compile-time-adjacent guard. `event_type` is a `String`
         // (I-2), so the match in `project_context` cannot be exhaustive in
@@ -724,6 +1114,13 @@ mod tests {
                 "context_evict" => json!({"target": "nonexistent-id"}),
                 "dispatch" => json!({"operator": "tycho", "childStream": "child-1"}),
                 "return" => json!({"child": "child-1", "summary": "done"}),
+                "tool_use" => json!({"id": "toolu_fixture", "name": "get_composition", "input": {}}),
+                "tool_result" => json!({
+                    "toolUseId": "toolu_fixture",
+                    "status": "ok",
+                    "content": "fixture result",
+                    "isError": false,
+                }),
                 other => panic!("test fixture missing a data payload for durable type {other}"),
             };
             events.push(ev(seq, &id, t, data));
@@ -734,11 +1131,17 @@ mod tests {
 
         assert!(turn.system.as_deref().unwrap_or("").contains("boot content"));
         for m in &turn.messages {
-            assert!(
-                !text_of(m).contains("[unhandled"),
-                "unexpected unhandled marker for a known durable type: {}",
-                text_of(m)
-            );
+            // Scans text blocks rather than requiring one — a durable type may
+            // now legitimately project as a tool block, and the marker this
+            // test hunts for is only ever emitted as text.
+            for block in &m.content {
+                if let ContentBlock::Text(t) = block {
+                    assert!(
+                        !t.contains("[unhandled"),
+                        "unexpected unhandled marker for a known durable type: {t}"
+                    );
+                }
+            }
         }
     }
 
