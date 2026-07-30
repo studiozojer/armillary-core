@@ -306,6 +306,17 @@ fn recovery_hint(status: &str) -> &'static str {
         "is_a_directory" => "that is a directory; list it instead of reading it",
         "not_a_directory" => "that is a file; read it instead of listing it",
         "malformed_path" => "the path is not usable as written",
+        "unknown_tool" => "no tool by that name exists; use one of the tools declared in this request",
+        "invalid_input" => "the arguments did not match the tool's schema; check the names and types and call it again",
+        "read_failed" => "the file could not be read from disk; try again or read something else",
+        "composition_unreadable" => "the workspace manifests could not be parsed; read them as files instead",
+        // The three ways a call ends without its tool ever running. Each says
+        // whether repeating it is worth anything — `interrupted` and
+        // `no_result_recorded` are retryable, `bound_reached` is not.
+        "interrupted" => "the turn was stopped before this call ran; ask again if you still need it",
+        "no_result_recorded" => "this call was never answered — the engine restarted mid-turn; call it again if you still need it",
+        "bound_reached" => "this turn hit its tool-call limit; answer with what you have rather than calling again",
+        "tool_panicked" => "the tool crashed on this input; try different arguments or a different tool",
         // An unknown code still renders non-empty, which is what the wire needs.
         _ => "the call did not succeed",
     }
@@ -974,6 +985,40 @@ mod tests {
                 );
             }
             other => panic!("expected a tool_result block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_status_the_engine_can_emit_names_its_own_recovery() {
+        // The sibling of `handled_types_cover_every_durable_type`, for the
+        // status vocabulary. The fallback keeps an unlisted code non-empty —
+        // which is what the wire needs — but a code that renders as "the call
+        // did not succeed" is a dead end: the model learns that something
+        // failed and nothing about what to do instead.
+        //
+        // Hand-maintained against the emitters, which are `tools.rs`
+        // (`ToolError::new` plus everything `guard::GuardError::code` returns)
+        // and `loop_.rs` (`append_tool_result` / `answer_all`). Grep for
+        // `status:` and `answer_all(` when adding one.
+        let emitted = [
+            // guard
+            "malformed_path", "outside_workspace", "not_found",
+            "denied_credential", "denied_noise",
+            // tools
+            "unknown_tool", "invalid_input", "composition_unreadable",
+            "is_a_directory", "not_a_directory", "not_openable", "not_text",
+            "too_large", "read_failed",
+            // loop
+            "interrupted", "no_result_recorded", "bound_reached", "tool_panicked",
+        ];
+        let fallback = recovery_hint("__a_status_no_one_emits__");
+
+        for status in emitted {
+            assert_ne!(
+                recovery_hint(status),
+                fallback,
+                "`{status}` renders as the fallback, so it tells the model nothing to do"
+            );
         }
     }
 
