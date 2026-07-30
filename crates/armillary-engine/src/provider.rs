@@ -513,6 +513,163 @@ impl ModelProvider for KeylessProvider {
     }
 }
 
+/// A request shape the Anthropic API rejects with a 400.
+///
+/// Every variant here was **measured**, not inferred — each corresponds to a
+/// probe against the live API that came back `invalid_request_error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireViolation {
+    /// A `tool_use` with no `tool_result` immediately after it.
+    UnansweredToolUse { id: String },
+    /// A `tool_result` whose `tool_use_id` matches no `tool_use` in the
+    /// preceding assistant message.
+    OrphanToolResult { tool_use_id: String },
+    /// `tool_result` blocks must form an uninterrupted *leading* sequence in
+    /// the turn that answers a `tool_use`. Trailing text is fine; text before
+    /// or between results is not.
+    ToolResultsNotLeading,
+    /// `text content blocks must be non-empty`.
+    EmptyTextBlock,
+    /// `content cannot be empty if is_error is true`. Empty content alone is
+    /// legal; `is_error` with content is legal; the pair is not.
+    EmptyErrorResult { tool_use_id: String },
+}
+
+impl std::fmt::Display for WireViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WireViolation::UnansweredToolUse { id } => {
+                write!(f, "`tool_use` ids were found without `tool_result` blocks immediately after: {id}")
+            }
+            WireViolation::OrphanToolResult { tool_use_id } => write!(
+                f,
+                "unexpected `tool_use_id` found in `tool_result` blocks: {tool_use_id}"
+            ),
+            WireViolation::ToolResultsNotLeading => write!(
+                f,
+                "`tool_result` blocks must lead the turn, uninterrupted"
+            ),
+            WireViolation::EmptyTextBlock => write!(f, "text content blocks must be non-empty"),
+            WireViolation::EmptyErrorResult { tool_use_id } => write!(
+                f,
+                "content cannot be empty if `is_error` is true: {tool_use_id}"
+            ),
+        }
+    }
+}
+
+/// Check a turn against the request-validity rules the API enforces.
+///
+/// This is the piece that makes a scripted test mean something. A test double
+/// that answers anything will happily answer a message list the real API would
+/// refuse — so an assertion like "the stream still projects and takes a turn"
+/// passes over a broken projection. That is the same defect as a regression
+/// test that passes identically with the bug present, and this repo has shipped
+/// one already.
+pub fn validate_turn(turn: &ModelTurn) -> Result<(), WireViolation> {
+    for (i, message) in turn.messages.iter().enumerate() {
+        // Empty text is rejected wherever it appears.
+        if message
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.is_empty()))
+        {
+            return Err(WireViolation::EmptyTextBlock);
+        }
+
+        // Results must lead their turn, uninterrupted: once a non-result block
+        // is seen, no further result may appear in this message.
+        let mut seen_non_result = false;
+        for block in &message.content {
+            match block {
+                ContentBlock::ToolResult { .. } if seen_non_result => {
+                    return Err(WireViolation::ToolResultsNotLeading)
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    if *is_error && content.is_empty() {
+                        return Err(WireViolation::EmptyErrorResult {
+                            tool_use_id: tool_use_id.clone(),
+                        });
+                    }
+                    // Every result must answer a call in the message before it.
+                    let answered = i
+                        .checked_sub(1)
+                        .and_then(|p| turn.messages.get(p))
+                        .is_some_and(|prev| {
+                            prev.content.iter().any(|b| {
+                                matches!(b, ContentBlock::ToolUse { id, .. } if id == tool_use_id)
+                            })
+                        });
+                    if !answered {
+                        return Err(WireViolation::OrphanToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                        });
+                    }
+                }
+                _ => seen_non_result = true,
+            }
+        }
+
+        // Every call must be answered by the message immediately after.
+        for block in &message.content {
+            let ContentBlock::ToolUse { id, .. } = block else {
+                continue;
+            };
+            let answered = turn.messages.get(i + 1).is_some_and(|next| {
+                next.content.iter().any(|b| {
+                    matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id)
+                })
+            });
+            if !answered {
+                return Err(WireViolation::UnansweredToolUse { id: id.clone() });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Wraps another provider and refuses, exactly as the API would, any turn that
+/// violates a measured request-validity rule.
+///
+/// A sibling of `ScriptedProvider` — a test double that ships in the library
+/// because the integration tests in `tests/` need it, same as that one.
+#[derive(Debug)]
+pub struct ValidatingProvider<P> {
+    inner: P,
+}
+
+impl<P> ValidatingProvider<P> {
+    pub fn new(inner: P) -> Self {
+        ValidatingProvider { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl<P: ModelProvider> ModelProvider for ValidatingProvider<P> {
+    async fn run_turn(
+        &self,
+        turn: ModelTurn,
+        sink: mpsc::Sender<String>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<TurnOutcome, ProviderError> {
+        if let Err(violation) = validate_turn(&turn) {
+            // Shaped like the real refusal so a caller's error handling is
+            // exercised by the double rather than bypassed.
+            return Err(ProviderError::Api {
+                status: 400,
+                body: format!(
+                    r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"{violation}"}}}}"#
+                ),
+            });
+        }
+        self.inner.run_turn(turn, sink, cancel).await
+    }
+}
+
 /// A scripted turn's block list: one `Text` block, or none when the script
 /// produced nothing. Mirrors what the accumulator would build from a text-only
 /// stream, so a test written against the double exercises the same shape the
@@ -938,6 +1095,157 @@ mod tests {
             outcome.blocks,
             vec![ContentBlock::Text("The engine hums".to_string())]
         );
+    }
+
+    // --- the validating double ---
+    //
+    // Each case below is a shape MEASURED against the live API as a 400. A
+    // scripted provider validates nothing, so a test asserting "the stream
+    // still projects and takes a turn" passes over a projection the real API
+    // would refuse. These are what stop that.
+
+    fn user(blocks: Vec<ContentBlock>) -> ProviderMessage {
+        ProviderMessage {
+            role: ProviderRole::User,
+            content: blocks,
+        }
+    }
+    fn assistant(blocks: Vec<ContentBlock>) -> ProviderMessage {
+        ProviderMessage {
+            role: ProviderRole::Assistant,
+            content: blocks,
+        }
+    }
+    fn tool_use(id: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({ "path": "x.md" }),
+        }
+    }
+    fn tool_result(id: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: "contents".to_string(),
+            is_error: false,
+        }
+    }
+    fn turn_of(messages: Vec<ProviderMessage>) -> ModelTurn {
+        ModelTurn {
+            system: None,
+            messages,
+        }
+    }
+
+    #[test]
+    fn a_well_formed_tool_round_validates() {
+        let turn = turn_of(vec![
+            user(vec![ContentBlock::text("read x")]),
+            assistant(vec![ContentBlock::text("on it"), tool_use("t1")]),
+            user(vec![tool_result("t1")]),
+        ]);
+        assert_eq!(validate_turn(&turn), Ok(()));
+    }
+
+    #[test]
+    fn an_unanswered_tool_use_is_refused() {
+        let turn = turn_of(vec![
+            user(vec![ContentBlock::text("read x")]),
+            assistant(vec![tool_use("t1")]),
+            user(vec![ContentBlock::text("never mind")]),
+        ]);
+        assert_eq!(
+            validate_turn(&turn),
+            Err(WireViolation::UnansweredToolUse { id: "t1".into() })
+        );
+    }
+
+    #[test]
+    fn a_tool_result_with_no_preceding_tool_use_is_refused() {
+        // This is the shape a boot-time composition pushed as a tool_result
+        // would have had. The API rejects it outright.
+        let turn = turn_of(vec![user(vec![
+            tool_result("t-nonexistent"),
+            ContentBlock::text("what repos exist?"),
+        ])]);
+        assert_eq!(
+            validate_turn(&turn),
+            Err(WireViolation::OrphanToolResult {
+                tool_use_id: "t-nonexistent".into()
+            })
+        );
+    }
+
+    #[test]
+    fn tool_results_must_lead_their_turn_uninterrupted() {
+        let turn = turn_of(vec![
+            user(vec![ContentBlock::text("read x")]),
+            assistant(vec![tool_use("t1"), tool_use("t2")]),
+            user(vec![
+                tool_result("t1"),
+                ContentBlock::text("also, hello"),
+                tool_result("t2"),
+            ]),
+        ]);
+        assert_eq!(
+            validate_turn(&turn),
+            Err(WireViolation::ToolResultsNotLeading)
+        );
+    }
+
+    #[test]
+    fn an_empty_text_block_is_refused() {
+        let turn = turn_of(vec![
+            user(vec![ContentBlock::text("hi")]),
+            assistant(vec![ContentBlock::text(""), tool_use("t1")]),
+            user(vec![tool_result("t1")]),
+        ]);
+        assert_eq!(validate_turn(&turn), Err(WireViolation::EmptyTextBlock));
+    }
+
+    #[test]
+    fn an_error_result_with_empty_content_is_refused() {
+        // The combination is the illegal one: empty content alone is fine, and
+        // is_error with content is fine. Every error path the loop can take has
+        // to render something, which is why "name the recovery action" is a
+        // wire requirement and not a style preference.
+        let turn = turn_of(vec![
+            user(vec![ContentBlock::text("read x")]),
+            assistant(vec![tool_use("t1")]),
+            user(vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                content: String::new(),
+                is_error: true,
+            }]),
+        ]);
+        assert_eq!(
+            validate_turn(&turn),
+            Err(WireViolation::EmptyErrorResult {
+                tool_use_id: "t1".into()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn the_validating_provider_refuses_rather_than_answering() {
+        let provider = ValidatingProvider::new(ScriptedProvider::new(vec!["ok"]));
+        let bad = turn_of(vec![
+            user(vec![ContentBlock::text("read x")]),
+            assistant(vec![tool_use("t1")]),
+            user(vec![ContentBlock::text("never mind")]),
+        ]);
+        let (tx, _rx) = mpsc::channel(8);
+        let (_c, cancel_rx) = watch::channel(false);
+
+        let err = provider.run_turn(bad, tx, cancel_rx).await.unwrap_err();
+
+        match err {
+            ProviderError::Api { status, body } => {
+                assert_eq!(status, 400);
+                assert!(body.contains("t1"), "the violation should name it: {body}");
+            }
+            other => panic!("expected a 400 like the real API, got {other:?}"),
+        }
     }
 
     // --- KeylessProvider ---
