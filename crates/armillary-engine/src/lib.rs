@@ -19,6 +19,7 @@ pub mod provider;
 pub mod routes;
 pub mod sessions;
 pub mod state;
+pub mod tools;
 
 use axum::{
     routing::{get, post},
