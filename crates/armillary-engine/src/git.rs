@@ -154,6 +154,124 @@ pub async fn newest_commit(repo: &Path, timeout: Duration) -> Result<Option<Stri
     Ok(Some(out.stdout))
 }
 
+/// What a repo's local state permits.
+///
+/// Exactly one verdict per repo, and the precedence below is load-bearing
+/// because several are simultaneously true in practice.
+///
+/// **Detached → NoUpstream → Diverged → Dirty → Behind → Current.**
+///
+/// `Detached` first because there is no branch to reason about at all.
+/// `NoUpstream` next because nothing downstream is computable without one.
+/// `Diverged` above `Dirty` because divergence is a durable fact about history
+/// that survives cleaning the working tree — reporting "dirty" for a repo that
+/// is also diverged sends the reader to fix the thing that was not the problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Current,
+    Behind { commits: u32 },
+    Diverged,
+    Dirty,
+    NoUpstream,
+    Detached,
+}
+
+/// `git fetch --prune`.
+///
+/// Touches no working tree and no branch, which is why the sweep runs it
+/// unconditionally — on the dirty feature branch too. It is what makes the
+/// report *true* rather than a reading of whatever the last fetch happened to
+/// leave behind.
+///
+/// A repo with no remote configured is an `Err`, not a silent success: the
+/// sweep reports it rather than counting it as fetched.
+///
+/// The `git remote` pre-check exists because `git fetch --prune` on a repo
+/// with zero remotes configured is not itself a failure — it exits 0 with no
+/// output, having correctly done nothing. That is the right answer to "did
+/// the fetch fail," but the wrong one to "is there anything here to sync,"
+/// which is the question this function actually answers for the sweep.
+pub async fn fetch(repo: &Path, timeout: Duration) -> Result<(), GitError> {
+    let remotes = run_git(repo, &["remote"], timeout).await?;
+    if !remotes.ok() {
+        return Err(GitError::Failed(remotes.stderr));
+    }
+    if remotes.stdout.trim().is_empty() {
+        return Err(GitError::Failed("no remote configured".to_string()));
+    }
+
+    let out = run_git(repo, &["fetch", "--prune"], timeout).await?;
+    if !out.ok() {
+        return Err(GitError::Failed(if out.stderr.is_empty() {
+            format!("git fetch exited {}", out.code)
+        } else {
+            out.stderr
+        }));
+    }
+    Ok(())
+}
+
+/// Classify the repo against its upstream, using only local refs.
+///
+/// Deliberately does NOT fetch. The caller decides whether the refs it reads
+/// are fresh — `POST /sync` fetches first, `GET /sync` does not and says so.
+pub async fn verdict(repo: &Path, timeout: Duration) -> Result<Verdict, GitError> {
+    if branch(repo, timeout).await?.is_none() {
+        return Ok(Verdict::Detached);
+    }
+    if upstream(repo, timeout).await?.is_none() {
+        return Ok(Verdict::NoUpstream);
+    }
+
+    // `HEAD...@{u}` with --left-right --count prints "<ahead>\t<behind>":
+    // left side is commits in HEAD and not upstream, right side the reverse.
+    let out = run_git(
+        repo,
+        &["rev-list", "--left-right", "--count", "HEAD...@{u}"],
+        timeout,
+    )
+    .await?;
+    if !out.ok() {
+        return Err(GitError::Failed(out.stderr));
+    }
+    let mut parts = out.stdout.split_whitespace();
+    let ahead: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let behind: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    if ahead > 0 && behind > 0 {
+        return Ok(Verdict::Diverged);
+    }
+    if is_dirty(repo, timeout).await? {
+        return Ok(Verdict::Dirty);
+    }
+    if behind > 0 {
+        return Ok(Verdict::Behind { commits: behind });
+    }
+    Ok(Verdict::Current)
+}
+
+/// `git merge --ff-only @{u}`.
+///
+/// The whole safety argument of this feature is this one flag. The merge
+/// succeeds only when the local branch is a strict ancestor of upstream, so a
+/// conflict is structurally impossible rather than handled, no merge commit is
+/// ever created, and a diverged branch is refused with HEAD unmoved.
+///
+/// Callers must only reach this for `Verdict::Behind`. It is safe if they do
+/// not — git refuses — but the report would then carry a failure the sweep
+/// could have predicted.
+pub async fn fast_forward(repo: &Path, timeout: Duration) -> Result<(), GitError> {
+    let out = run_git(repo, &["merge", "--ff-only", "@{u}"], timeout).await?;
+    if !out.ok() {
+        return Err(GitError::Failed(if out.stderr.is_empty() {
+            format!("git merge --ff-only exited {}", out.code)
+        } else {
+            out.stderr
+        }));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +454,128 @@ mod tests {
         assert!(ts.len() >= 20, "expected an ISO timestamp, got {ts:?}");
         assert_eq!(&ts[4..5], "-");
         assert!(ts.contains('T'));
+    }
+
+    /// Push a new commit into the bare remote from a second clone, so the
+    /// first clone becomes genuinely behind — as opposed to being told it is.
+    fn advance_remote(remote: &std::path::Path) {
+        let other = tempfile::tempdir().unwrap().keep();
+        git_sync(
+            &other,
+            &["clone", remote.to_str().unwrap(), other.to_str().unwrap()],
+        );
+        commit(&other, "from-elsewhere.md", "two");
+        git_sync(&other, &["push", "origin", "main"]);
+    }
+
+    #[tokio::test]
+    async fn verdict_is_current_on_a_clone_nobody_moved() {
+        let (_remote, clone) = remote_and_clone();
+        fetch(&clone, DEFAULT_TIMEOUT).await.unwrap();
+        assert_eq!(verdict(&clone, DEFAULT_TIMEOUT).await.unwrap(), Verdict::Current);
+    }
+
+    #[tokio::test]
+    async fn verdict_is_behind_after_the_remote_moves() {
+        let (remote, clone) = remote_and_clone();
+        advance_remote(&remote);
+        fetch(&clone, DEFAULT_TIMEOUT).await.unwrap();
+        assert_eq!(
+            verdict(&clone, DEFAULT_TIMEOUT).await.unwrap(),
+            Verdict::Behind { commits: 1 }
+        );
+    }
+
+    #[tokio::test]
+    async fn verdict_is_diverged_when_both_sides_moved() {
+        let (remote, clone) = remote_and_clone();
+        advance_remote(&remote);
+        commit(&clone, "local-only.md", "mine");
+        fetch(&clone, DEFAULT_TIMEOUT).await.unwrap();
+        assert_eq!(verdict(&clone, DEFAULT_TIMEOUT).await.unwrap(), Verdict::Diverged);
+    }
+
+    #[tokio::test]
+    async fn verdict_is_dirty_and_dirty_outranks_behind() {
+        let (remote, clone) = remote_and_clone();
+        advance_remote(&remote);
+        std::fs::write(clone.join("seed.md"), "edited").unwrap();
+        fetch(&clone, DEFAULT_TIMEOUT).await.unwrap();
+        // Behind AND dirty. Dirty is the verdict, because it is the one that
+        // blocks the fast-forward.
+        assert_eq!(verdict(&clone, DEFAULT_TIMEOUT).await.unwrap(), Verdict::Dirty);
+    }
+
+    #[tokio::test]
+    async fn verdict_is_diverged_and_diverged_outranks_dirty() {
+        // Both true. Diverged wins: it is a durable fact about history that
+        // will still be there after the working tree is cleaned, so reporting
+        // "dirty" would send you to fix the wrong thing.
+        let (remote, clone) = remote_and_clone();
+        advance_remote(&remote);
+        commit(&clone, "local-only.md", "mine");
+        std::fs::write(clone.join("seed.md"), "edited").unwrap();
+        fetch(&clone, DEFAULT_TIMEOUT).await.unwrap();
+        assert_eq!(verdict(&clone, DEFAULT_TIMEOUT).await.unwrap(), Verdict::Diverged);
+    }
+
+    #[tokio::test]
+    async fn verdict_is_no_upstream_on_an_untracked_branch() {
+        let (_remote, clone) = remote_and_clone();
+        git_sync(&clone, &["checkout", "-b", "feat/local-only"]);
+        assert_eq!(verdict(&clone, DEFAULT_TIMEOUT).await.unwrap(), Verdict::NoUpstream);
+    }
+
+    #[tokio::test]
+    async fn verdict_is_detached_before_it_is_anything_else() {
+        let (_remote, clone) = remote_and_clone();
+        let head = run_git(&clone, &["rev-parse", "HEAD"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap()
+            .stdout;
+        std::fs::write(clone.join("seed.md"), "edited").unwrap();
+        git_sync(&clone, &["checkout", "--detach", &head]);
+        assert_eq!(verdict(&clone, DEFAULT_TIMEOUT).await.unwrap(), Verdict::Detached);
+    }
+
+    #[tokio::test]
+    async fn fast_forward_applies_the_remote_commits() {
+        let (remote, clone) = remote_and_clone();
+        advance_remote(&remote);
+        fetch(&clone, DEFAULT_TIMEOUT).await.unwrap();
+        fast_forward(&clone, DEFAULT_TIMEOUT).await.unwrap();
+        assert!(clone.join("from-elsewhere.md").exists());
+        assert_eq!(verdict(&clone, DEFAULT_TIMEOUT).await.unwrap(), Verdict::Current);
+    }
+
+    #[tokio::test]
+    async fn fast_forward_refuses_a_diverged_branch_and_leaves_head_unmoved() {
+        let (remote, clone) = remote_and_clone();
+        advance_remote(&remote);
+        commit(&clone, "local-only.md", "mine");
+        fetch(&clone, DEFAULT_TIMEOUT).await.unwrap();
+
+        let before = run_git(&clone, &["rev-parse", "HEAD"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap()
+            .stdout;
+        assert!(fast_forward(&clone, DEFAULT_TIMEOUT).await.is_err());
+        let after = run_git(&clone, &["rev-parse", "HEAD"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap()
+            .stdout;
+
+        assert_eq!(before, after, "a refused fast-forward must not move HEAD");
+        // And no merge was created behind our back.
+        assert!(!clone.join("from-elsewhere.md").exists());
+    }
+
+    #[tokio::test]
+    async fn fetch_is_an_error_on_a_repo_with_no_remote() {
+        // Not a panic and not a silent success — the sweep needs to report it.
+        let solo = tempfile::tempdir().unwrap().keep();
+        git_sync(&solo, &["init", "--initial-branch=main", "."]);
+        commit(&solo, "alone.md", "solo");
+        assert!(fetch(&solo, DEFAULT_TIMEOUT).await.is_err());
     }
 }
