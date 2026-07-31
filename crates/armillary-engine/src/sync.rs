@@ -208,8 +208,12 @@ pub async fn sweep(root: &Path, perform: bool) -> SyncReport {
 
     let permits = Arc::new(Semaphore::new(CONCURRENCY));
     let mut handles = Vec::with_capacity(declared.len());
+    let mut labels = Vec::with_capacity(declared.len());
 
     for module in declared {
+        // Kept out of the spawn so a task that dies still has a name and a path
+        // to be reported under.
+        labels.push(module.clone());
         let permits = permits.clone();
         let abs = root.join(&module.path);
         handles.push(tokio::spawn(async move {
@@ -220,15 +224,38 @@ pub async fn sweep(root: &Path, perform: bool) -> SyncReport {
     }
 
     let mut repos = Vec::with_capacity(handles.len());
-    for handle in handles {
-        if let Ok(report) = handle.await {
-            repos.push(report);
+    for (module, handle) in labels.into_iter().zip(handles) {
+        match handle.await {
+            Ok(report) => repos.push(report),
+            // A panicked or cancelled task must not disappear. The contract is
+            // that a repo which fails is a LINE, and a silently absent row
+            // reads as "not composed" — the exact confusion section four of the
+            // report exists to prevent.
+            //
+            // Unreachable by construction today: `one_repo` has no panic sites,
+            // and the semaphore is never closed. It therefore carries NO test
+            // rather than a faked one — the same call made about
+            // `.stdin(Stdio::null())` in git.rs.
+            Err(_) => repos.push(RepoReport {
+                name: module.name,
+                path: module.path,
+                branch: None,
+                status: "error",
+                reason: Some("task-failed"),
+                commits: None,
+                newest_commit: None,
+                submodules: None,
+                fetch_error: None,
+            }),
         }
     }
 
-    // Manifest order, restored: the tasks finish out of order, and the app
-    // renders modules in the order the manifest declares them.
-    repos.sort_by_key(|r| r.path.clone());
+    // No sort. `handles` was pushed in `declared_modules` order and is awaited
+    // by index, so `repos` is already in manifest-declared order — operators,
+    // then commons, then repos, which is the order the app renders. The
+    // `sort_by_key(|r| r.path.clone())` that used to sit here re-ordered
+    // alphabetically and silently replaced the right answer with a plausible
+    // one, while its own comment claimed to be restoring it.
 
     SyncReport {
         enabled: gate_enabled(root),
@@ -263,10 +290,7 @@ async fn one_repo(abs: &Path, module: DeclaredModule, perform: bool) -> RepoRepo
         reason: Some("git-error"),
         commits: None,
         newest_commit: None,
-        // `.gitmodules` is a tracked file at the repo root; its presence is the
-        // whole test. Recorded before the verdict, because it is true of the
-        // repo regardless of what happens to it below.
-        submodules: abs.join(".gitmodules").exists().then_some(true),
+        submodules: None,
         fetch_error,
     };
 
@@ -322,11 +346,11 @@ async fn one_repo(abs: &Path, module: DeclaredModule, perform: bool) -> RepoRepo
         }
     }
 
-    // LAST, and deliberately so. Read before the fast-forward this reports the
-    // commit you already had — reassuring, wrong, and shaped identically to a
-    // correct answer, which is the whole failure mode the timestamp exists to
-    // prevent. Pinned by
-    // `the_newest_commit_timestamp_is_read_after_the_fast_forward`.
+    // Both read LAST, and for the same reason. `.gitmodules` can ARRIVE in the
+    // fast-forward, so a pre-merge read reports `None` for a repo that now has
+    // an un-updated submodule pointer — the same read-before-mutation shape
+    // this function is built to get right for `newest_commit`.
+    report.submodules = abs.join(".gitmodules").exists().then_some(true);
     report.newest_commit = git::newest_commit(abs, t).await.ok().flatten();
 
     report
@@ -654,6 +678,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_report_is_in_manifest_order_not_alphabetical() {
+        // Declared order is operators -> commons -> repos. Alphabetical by path
+        // is a DIFFERENT order (zojercommons sorts last, but is declared
+        // second), so this fails against a sort and passes against declaration
+        // order.
+        let (root, _remote) = live_workspace();
+        fs::create_dir_all(root.join("operators/tycho/.git")).unwrap();
+        fs::create_dir_all(root.join("zojercommons/.git")).unwrap();
+        fs::write(
+            root.join("modules.local.toml"),
+            "[router]\nsync = true\n\n\
+             [[operators]]\nname = \"tycho\"\npath = \"operators/tycho\"\n\n\
+             [[commons]]\nname = \"zojercommons\"\npath = \"zojercommons\"\n\n\
+             [[repos]]\nname = \"jianyi\"\npath = \"repos/jianyi\"\n",
+        )
+        .unwrap();
+
+        let report = sweep(&root, false).await;
+        let paths: Vec<&str> = report.repos.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![".", "operators/tycho", "zojercommons", "repos/jianyi"]
+        );
+    }
+
+    #[tokio::test]
     async fn a_repo_with_submodules_says_so_and_they_are_not_updated() {
         // D5. The flag is what keeps a deliberate limit from reading as a bug:
         // the fast-forward moved the pointer, the submodule checkout did not
@@ -670,6 +720,33 @@ mod tests {
         advance_remote(&remote);
 
         let report = sweep(&root, true).await;
+        assert_eq!(repo(&report, "repos/jianyi").submodules, Some(true));
+    }
+
+    #[tokio::test]
+    async fn submodules_arriving_in_the_fast_forward_are_still_reported() {
+        // Pushes .gitmodules into the REMOTE, so the local checkout learns of
+        // it only by fast-forwarding. A pre-merge read of the flag returns None
+        // here; a post-merge read returns Some(true).
+        let (root, remote) = live_workspace();
+        let other = tempfile::tempdir().unwrap().keep();
+        git_sync(
+            &other,
+            &["clone", remote.to_str().unwrap(), other.to_str().unwrap()],
+        );
+        fs::write(
+            other.join(".gitmodules"),
+            "[submodule \"content\"]\n\tpath = content\n\turl = ../content.git\n",
+        )
+        .unwrap();
+        git_sync(&other, &["add", ".gitmodules"]);
+        git_sync(&other, &["commit", "-m", "add submodule decl"]);
+        git_sync(&other, &["push", "origin", "main"]);
+
+        assert!(!root.join("repos/jianyi/.gitmodules").exists());
+
+        let report = sweep(&root, true).await;
+        assert_eq!(repo(&report, "repos/jianyi").status, "synced");
         assert_eq!(repo(&report, "repos/jianyi").submodules, Some(true));
     }
 
