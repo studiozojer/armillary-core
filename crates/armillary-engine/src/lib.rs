@@ -10,6 +10,7 @@
 //! loop is the organ that accreted onto them.
 
 pub mod blocking;
+pub mod git;
 pub mod guard;
 pub mod hash;
 pub mod loop_;
