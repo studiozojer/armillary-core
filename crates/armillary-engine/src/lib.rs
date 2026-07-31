@@ -20,6 +20,7 @@ pub mod provider;
 pub mod routes;
 pub mod sessions;
 pub mod state;
+pub mod sync;
 pub mod tools;
 
 use axum::{
