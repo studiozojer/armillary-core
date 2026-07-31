@@ -546,20 +546,6 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        // `%cI` (committer date, strict ISO 8601) has ONE-SECOND resolution.
-        // On fast hardware the whole fixture above — bare init, seed clone,
-        // commit, push, jianyi clone — completes inside a single wall-clock
-        // second, so without this sleep the commit `advance_remote` is about
-        // to create can land in that same second and print the identical
-        // `%cI` string as `before` even though it is a different commit.
-        // Verified by reproducing this exact sequence standalone: two
-        // distinct commits, one shared timestamp. That made the assertion
-        // below fail for a CORRECT implementation too, not only a buggy one —
-        // this sleep is what actually gives the test the power to
-        // discriminate the ordering it exists to pin, by forcing the
-        // fast-forwarded commit onto the next second.
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-
         advance_remote(&remote);
         let report = sweep(&root, true).await;
         let r = repo(&report, "repos/jianyi");
