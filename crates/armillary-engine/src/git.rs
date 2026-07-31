@@ -200,15 +200,29 @@ pub async fn fetch(repo: &Path, timeout: Duration) -> Result<(), GitError> {
         return Err(GitError::Failed("no remote configured".to_string()));
     }
 
-    let out = run_git(repo, &["fetch", "--prune"], timeout).await?;
-    if !out.ok() {
-        return Err(GitError::Failed(if out.stderr.is_empty() {
-            format!("git fetch exited {}", out.code)
-        } else {
-            out.stderr
-        }));
+    require_ok(
+        run_git(repo, &["fetch", "--prune"], timeout).await?,
+        "git fetch",
+    )
+}
+
+/// Turn a nonzero exit into a `Failed`, naming the command when git itself
+/// said nothing.
+///
+/// One implementation, added 2026-07-31 on David's ruling after a review found
+/// this block written out verbatim in both `fetch` and `fast_forward`. The
+/// module already had an idiom for a hard-fail exit (`is_dirty`, and `fetch`'s
+/// own `git remote` pre-check); a second one inlined in two places is how a
+/// third caller ends up copying the wrong one.
+fn require_ok(out: GitOutput, cmd: &str) -> Result<(), GitError> {
+    if out.ok() {
+        return Ok(());
     }
-    Ok(())
+    Err(GitError::Failed(if out.stderr.is_empty() {
+        format!("{cmd} exited {}", out.code)
+    } else {
+        out.stderr
+    }))
 }
 
 /// Classify the repo against its upstream, using only local refs.
@@ -234,9 +248,20 @@ pub async fn verdict(repo: &Path, timeout: Duration) -> Result<Verdict, GitError
     if !out.ok() {
         return Err(GitError::Failed(out.stderr));
     }
+    // Unparseable output is an error, not a zero. Defaulting to 0/0 would
+    // report `Current` — "nothing to do, all good" — from a function whose
+    // answer gates whether a fast-forward is safe. A silent wrong-and-
+    // reassuring reading is the exact failure this feature's report exists to
+    // prevent, so it must not appear in the machinery underneath it.
     let mut parts = out.stdout.split_whitespace();
-    let ahead: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let behind: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let ahead = parts.next().and_then(|s| s.parse::<u32>().ok());
+    let behind = parts.next().and_then(|s| s.parse::<u32>().ok());
+    let (Some(ahead), Some(behind)) = (ahead, behind) else {
+        return Err(GitError::Failed(format!(
+            "could not parse `rev-list --left-right --count` output: {:?}",
+            out.stdout
+        )));
+    };
 
     if ahead > 0 && behind > 0 {
         return Ok(Verdict::Diverged);
@@ -261,15 +286,10 @@ pub async fn verdict(repo: &Path, timeout: Duration) -> Result<Verdict, GitError
 /// not — git refuses — but the report would then carry a failure the sweep
 /// could have predicted.
 pub async fn fast_forward(repo: &Path, timeout: Duration) -> Result<(), GitError> {
-    let out = run_git(repo, &["merge", "--ff-only", "@{u}"], timeout).await?;
-    if !out.ok() {
-        return Err(GitError::Failed(if out.stderr.is_empty() {
-            format!("git merge --ff-only exited {}", out.code)
-        } else {
-            out.stderr
-        }));
-    }
-    Ok(())
+    require_ok(
+        run_git(repo, &["merge", "--ff-only", "@{u}"], timeout).await?,
+        "git merge --ff-only",
+    )
 }
 
 #[cfg(test)]
