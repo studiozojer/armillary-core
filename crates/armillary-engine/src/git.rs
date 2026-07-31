@@ -295,65 +295,7 @@ pub async fn fast_forward(repo: &Path, timeout: Duration) -> Result<(), GitError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    /// Run git synchronously for test setup, fully isolated from the machine's
-    /// own git configuration.
-    ///
-    /// `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` are neutralized and the identity
-    /// is supplied by environment, so these tests do not depend on the
-    /// developer having a `user.email` set, do not inherit a global
-    /// `commit.gpgsign = true` (which would hang waiting for a passphrase), and
-    /// do not vary with `init.defaultBranch`. Production `run_git` deliberately
-    /// does NOT do this — the real engine needs the user's credential helpers,
-    /// SSH config and `insteadOf` rules to reach a remote at all.
-    fn git_sync(dir: &std::path::Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_AUTHOR_NAME", "test")
-            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
-            .env("GIT_COMMITTER_NAME", "test")
-            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
-            .output()
-            .expect("git must be on PATH for these tests");
-        assert!(
-            out.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    fn commit(repo: &std::path::Path, name: &str, body: &str) {
-        std::fs::write(repo.join(name), body).unwrap();
-        git_sync(repo, &["add", name]);
-        git_sync(repo, &["commit", "-m", name]);
-    }
-
-    /// A bare "remote" with one commit, plus a clone of it. Returned as
-    /// (remote, clone). Both leaked via `keep()` — short-lived test processes,
-    /// and a live path matters more than reclaiming a tempdir.
-    fn remote_and_clone() -> (PathBuf, PathBuf) {
-        let remote = tempfile::tempdir().unwrap().keep();
-        git_sync(&remote, &["init", "--bare", "--initial-branch=main", "."]);
-
-        let seed = tempfile::tempdir().unwrap().keep();
-        git_sync(&seed, &["init", "--initial-branch=main", "."]);
-        commit(&seed, "seed.md", "one");
-        git_sync(&seed, &["remote", "add", "origin", remote.to_str().unwrap()]);
-        git_sync(&seed, &["push", "-u", "origin", "main"]);
-
-        let clone = tempfile::tempdir().unwrap().keep();
-        git_sync(
-            &clone,
-            &["clone", remote.to_str().unwrap(), clone.to_str().unwrap()],
-        );
-        (remote, clone)
-    }
+    use crate::testgit::{advance_remote, commit, git_sync, remote_and_clone};
 
     #[tokio::test]
     async fn run_git_reports_stdout_and_a_zero_code() {
@@ -474,18 +416,6 @@ mod tests {
         assert!(ts.len() >= 20, "expected an ISO timestamp, got {ts:?}");
         assert_eq!(&ts[4..5], "-");
         assert!(ts.contains('T'));
-    }
-
-    /// Push a new commit into the bare remote from a second clone, so the
-    /// first clone becomes genuinely behind — as opposed to being told it is.
-    fn advance_remote(remote: &std::path::Path) {
-        let other = tempfile::tempdir().unwrap().keep();
-        git_sync(
-            &other,
-            &["clone", remote.to_str().unwrap(), other.to_str().unwrap()],
-        );
-        commit(&other, "from-elsewhere.md", "two");
-        git_sync(&other, &["push", "origin", "main"]);
     }
 
     #[tokio::test]

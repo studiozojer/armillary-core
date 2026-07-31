@@ -21,6 +21,8 @@ pub mod routes;
 pub mod sessions;
 pub mod state;
 pub mod sync;
+#[cfg(test)]
+pub mod testgit;
 pub mod tools;
 
 use axum::{
