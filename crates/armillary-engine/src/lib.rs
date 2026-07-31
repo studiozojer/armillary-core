@@ -46,5 +46,6 @@ pub fn app(state: AppState) -> Router {
         .route("/instances/{id}/interrupt", post(routes::session_ops::interrupt))
         .route("/instances/{id}/evict", post(routes::session_ops::evict))
         .route("/streams/{stream}/events", get(routes::subscribe::subscribe))
+        .route("/sync", get(routes::sync::status).post(routes::sync::sweep))
         .with_state(shared)
 }
