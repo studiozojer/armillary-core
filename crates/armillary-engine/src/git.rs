@@ -62,6 +62,15 @@ impl GitOutput {
 /// credential prompt — the one hang a timeout alone would merely convert into a
 /// 30-second stall on every repo.
 ///
+/// **This line has no test, deliberately.** A unit test can only observe it by
+/// running a git that reads stdin and checking it returns — which proves
+/// nothing unless the test binary's own stdin happens to be open, and under CI
+/// it is already `/dev/null`, so such a test passes whether or not this line
+/// survives. Rather than ship a green light that means nothing, the guarantee
+/// is stated here and left unasserted. Delete this and the failure is a hang in
+/// production, not a red suite. (David's ruling, 2026-07-31, after a review
+/// caught the non-discriminating test.)
+///
 /// `kill_on_drop` is what makes the timeout real: `tokio::time::timeout` drops
 /// the future, and without this the child would outlive it and keep running.
 pub async fn run_git(
@@ -118,6 +127,11 @@ pub async fn upstream(repo: &Path, timeout: Duration) -> Result<Option<String>, 
 /// True when the working tree has anything uncommitted, **including untracked
 /// files**. `--porcelain` reports those by default and that is wanted: a new
 /// uncommitted note in the commons is work, and a sweep must not act around it.
+///
+/// Unlike `branch`/`upstream`/`newest_commit`, a git failure here is `Err`, not
+/// folded into `Ok(false)`: `bool` has no natural "no answer" value the way
+/// `Option<String>` does, so silently reporting "not dirty" would misrepresent
+/// a status call that never actually ran.
 pub async fn is_dirty(repo: &Path, timeout: Duration) -> Result<bool, GitError> {
     let out = run_git(repo, &["status", "--porcelain"], timeout).await?;
     if !out.ok() {
@@ -245,26 +259,20 @@ mod tests {
         assert_eq!(err, GitError::Timeout);
     }
 
-    #[tokio::test]
-    async fn run_git_does_not_inherit_stdin() {
-        // The production hang this guards is a git that stops to ask for a
-        // credential. With stdin null it reads EOF and exits instead of
-        // waiting forever; with stdin inherited a timeout would only convert
-        // the hang into a 30-second stall on every repo.
-        //
-        // `hash-object --stdin-paths` reads paths from stdin until EOF, so it
-        // terminates immediately iff stdin is null — and would otherwise
-        // outlive this generous deadline.
-        let (_remote, clone) = remote_and_clone();
-        let out = run_git(
-            &clone,
-            &["hash-object", "--stdin-paths"],
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("must not time out — stdin should be null, not inherited");
-        assert_eq!(out.code, 0);
-    }
+    // There is deliberately NO test for `.stdin(Stdio::null())`.
+    //
+    // Amended 2026-07-31, David ruling, after a task review found the test that
+    // was here could not discriminate. It ran `git hash-object --stdin-paths`
+    // and asserted it returned rather than hanging — which only proves anything
+    // when the TEST BINARY'S OWN stdin is open. Under CI, or any non-interactive
+    // shell, stdin is already `/dev/null`, the child hits EOF either way, and the
+    // test passes against a regression that deletes the very line it guards.
+    //
+    // A green light that means nothing is worse than an absent one, and the
+    // honest fix was to stop claiming the coverage. The reasoning lives on the
+    // production line instead. (Making it real would mean holding a pipe and
+    // `dup2`-ing it onto fd 0 — an `unsafe` block and platform-specific fd
+    // handling in a crate that has neither, to guard one setting.)
 
     #[tokio::test]
     async fn branch_reads_the_current_branch() {
