@@ -231,6 +231,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => eprintln!("boot: no [router] boot declared — sessions start with no system prompt"),
     }
 
+    // Announced for the same reason `boot:` is: the gate lives in
+    // `Router.extra`, which C-5 forbids validating, so a misspelled `snyc`
+    // disables the feature with no error anywhere. One line at startup is what
+    // turns a silent typo into a visible one.
+    if armillary_engine::sync::gate_enabled(&root) {
+        eprintln!("sync: enabled by [router] sync — POST /sync will fetch and fast-forward");
+    } else {
+        eprintln!(
+            "sync: not declared — POST /sync will refuse (add `sync = true` under [router] in modules.local.toml); GET /sync still reads status"
+        );
+    }
+
     let data_dir = args
         .data_dir
         .clone()

@@ -10,6 +10,7 @@
 //! loop is the organ that accreted onto them.
 
 pub mod blocking;
+pub mod git;
 pub mod guard;
 pub mod hash;
 pub mod loop_;
@@ -19,6 +20,9 @@ pub mod provider;
 pub mod routes;
 pub mod sessions;
 pub mod state;
+pub mod sync;
+#[cfg(test)]
+pub mod testgit;
 pub mod tools;
 
 use axum::{
@@ -42,5 +46,6 @@ pub fn app(state: AppState) -> Router {
         .route("/instances/{id}/interrupt", post(routes::session_ops::interrupt))
         .route("/instances/{id}/evict", post(routes::session_ops::evict))
         .route("/streams/{stream}/events", get(routes::subscribe::subscribe))
+        .route("/sync", get(routes::sync::status).post(routes::sync::sweep))
         .with_state(shared)
 }
