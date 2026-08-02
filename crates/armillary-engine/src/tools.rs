@@ -37,7 +37,7 @@ pub struct ToolError {
 }
 
 impl ToolError {
-    fn new(status: &'static str, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(status: &'static str, detail: impl Into<String>) -> Self {
         ToolError {
             status,
             detail: detail.into(),
@@ -56,7 +56,9 @@ impl ToolError {
             "malformed_path" => StatusCode::BAD_REQUEST,
             "outside_workspace" | "denied_credential" | "denied_noise" => StatusCode::FORBIDDEN,
             "not_found" => StatusCode::NOT_FOUND,
-            "is_a_directory" | "not_a_directory" | "invalid_input" => StatusCode::BAD_REQUEST,
+            "is_a_directory" | "not_a_directory" | "invalid_input" | "invalid_pattern" => {
+                StatusCode::BAD_REQUEST
+            }
             "not_openable" | "not_text" => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "too_large" => StatusCode::PAYLOAD_TOO_LARGE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -145,6 +147,71 @@ pub fn definitions() -> Vec<serde_json::Value> {
                 "required": ["path"],
             },
         }),
+        serde_json::json!({
+            "name": "find_files",
+            "description": "Find files by a glob pattern over their path, e.g. \
+                            \"**/2026-07-30-*\" or \"operators/**/*.md\". Lists files \
+                            of any type, including ones `search` cannot read. Covers \
+                            the modules this workspace declares: content the manifest \
+                            does not declare (reference clones under repos/external/, \
+                            for one) is not covered unless you name it with `path`. \
+                            Credentials, build and dependency trees (node_modules, \
+                            target, .build), git worktrees and the engine's own \
+                            .armillary are never listed, at any path — naming one is \
+                            refused rather than widening the search. Use this when you \
+                            know roughly what a file is called and not where it is.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "A glob matched against the workspace-relative path.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional. Restrict the search to this directory, \
+                                        which may be outside the composed modules.",
+                    },
+                },
+                "required": ["pattern"],
+            },
+        }),
+        serde_json::json!({
+            "name": "search",
+            "description": "Search the contents of this workspace's files for a \
+                            regular expression, returning each matching line with \
+                            its path and line number. A plain string is a valid \
+                            regex. Searches the modules this workspace declares: \
+                            content the manifest does not declare (reference clones \
+                            under repos/external/, for one) is not searched unless you \
+                            name it with `path`. Credentials, build and dependency \
+                            trees (node_modules, target, .build), git worktrees and the \
+                            engine's own .armillary are never searched, at any path — \
+                            naming one is refused rather than widening the search. Only \
+                            text file types are read; `find_files` will still list the \
+                            rest. Long lines are windowed around the match. Use this to \
+                            find out where something is said before reading the file \
+                            that says it.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "A regular expression. A literal string works.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional. Restrict the search to this directory, \
+                                        which may be outside the composed modules.",
+                    },
+                    "case_sensitive": {
+                        "type": "boolean",
+                        "description": "Optional. Defaults to false.",
+                    },
+                },
+                "required": ["query"],
+            },
+        }),
     ]
 }
 
@@ -164,6 +231,17 @@ pub fn dispatch(name: &str, input: &serde_json::Value, root: &Path) -> Result<St
             required_str(input, "path", name)?,
             optional_usize(input, "offset", 1)?,
             optional_usize(input, "limit", DEFAULT_LINES)?,
+        ),
+        "find_files" => crate::search::find_files(
+            root,
+            required_str(input, "pattern", name)?,
+            optional_str(input, "path"),
+        ),
+        "search" => crate::search::search(
+            root,
+            required_str(input, "query", name)?,
+            optional_str(input, "path"),
+            input.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false),
         ),
         other => Err(ToolError::new(
             "unknown_tool",
@@ -470,9 +548,9 @@ pub fn read_whole(root: &Path, path: &str) -> Result<(String, u64, String), Tool
 }
 
 /// One line, read with a byte cap so a single line cannot defeat the page cap.
-struct Line {
-    text: String,
-    truncated: bool,
+pub(crate) struct Line {
+    pub(crate) text: String,
+    pub(crate) truncated: bool,
 }
 
 /// Consume the remainder of an over-long line. Bounded per read so a
@@ -492,7 +570,7 @@ fn discard_to_newline(reader: &mut impl BufRead) -> std::io::Result<()> {
 ///
 /// Reads `MAX_LINE_BYTES + 1` so "at the cap" and "over the cap" are
 /// distinguishable, and never holds more than that regardless of line length.
-fn next_line(reader: &mut impl BufRead, path: &str) -> Result<Option<Line>, ToolError> {
+pub(crate) fn next_line(reader: &mut impl BufRead, path: &str) -> Result<Option<Line>, ToolError> {
     let unreadable = || ToolError::new("read_failed", format!("could not read {path}"));
 
     let mut buf = Vec::new();
@@ -644,6 +722,12 @@ fn optional_usize(
     }
 }
 
+/// An optional string argument. Absent and empty are the same thing here —
+/// see `search::resolve_domain` for why `""` must not mean the workspace root.
+fn optional_str<'a>(input: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    input.get(key).and_then(|v| v.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,7 +865,10 @@ mod tests {
 
         // Order is part of the cached prefix, so it is pinned rather than
         // incidental.
-        assert_eq!(names, ["get_composition", "list_directory", "read_file"]);
+        assert_eq!(
+            names,
+            ["get_composition", "list_directory", "read_file", "find_files", "search"]
+        );
         for d in &defs {
             assert_eq!(d["input_schema"]["type"], "object");
             assert!(
@@ -1137,5 +1224,50 @@ mod tests {
 
         assert_eq!(via_route.status, via_tool.status);
         assert_eq!(via_route.status, "denied_credential");
+    }
+
+    // ---- the two search verbs, through dispatch ----
+
+    #[test]
+    fn the_search_verbs_are_reachable_by_the_names_their_definitions_declare() {
+        // A working body behind a misspelled arm is a green suite and a dead
+        // tool. `unknown_tool` is the failure this pins.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("modules.toml"), "[router]\ncontains = [\"a.md\"]\n").unwrap();
+        fs::write(dir.path().join("a.md"), "needle\n").unwrap();
+
+        let found = dispatch(
+            "search",
+            &serde_json::json!({ "query": "needle" }),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(found.contains("a.md"), "{found}");
+
+        let listed = dispatch(
+            "find_files",
+            &serde_json::json!({ "pattern": "*.md" }),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(listed.contains("a.md"), "{listed}");
+    }
+
+    #[test]
+    fn a_search_verb_missing_its_required_argument_is_an_error_not_a_panic() {
+        let dir = tree_fixture();
+        for (name, key) in [("search", "query"), ("find_files", "pattern")] {
+            let err = dispatch(name, &serde_json::json!({}), dir.path()).unwrap_err();
+            assert_eq!(err.status, "invalid_input", "{name}");
+            assert!(err.detail.contains(key), "{name}: {}", err.detail);
+        }
+    }
+
+    #[test]
+    fn an_invalid_pattern_maps_to_a_bad_request() {
+        assert_eq!(
+            ToolError::new("invalid_pattern", "x").http_status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 }

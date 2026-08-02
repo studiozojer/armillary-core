@@ -18,6 +18,7 @@ pub mod log;
 pub mod projection;
 pub mod provider;
 pub mod routes;
+mod search;
 pub mod sessions;
 pub mod state;
 pub mod sync;
