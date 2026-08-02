@@ -171,6 +171,37 @@ pub fn definitions() -> Vec<serde_json::Value> {
                 "required": ["pattern"],
             },
         }),
+        serde_json::json!({
+            "name": "search",
+            "description": "Search the contents of this workspace's files for a \
+                            regular expression, returning each matching line with \
+                            its path and line number. A plain string is a valid \
+                            regex. Searches the modules this workspace declares; \
+                            content that is not composed (reference clones, git \
+                            worktrees) is not searched unless you name it with \
+                            `path`. Long lines are windowed around the match. Use \
+                            this to find out where something is said before reading \
+                            the file that says it.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "A regular expression. A literal string works.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional. Restrict the search to this directory, \
+                                        which may be outside the composed modules.",
+                    },
+                    "case_sensitive": {
+                        "type": "boolean",
+                        "description": "Optional. Defaults to false.",
+                    },
+                },
+                "required": ["query"],
+            },
+        }),
     ]
 }
 
@@ -195,6 +226,12 @@ pub fn dispatch(name: &str, input: &serde_json::Value, root: &Path) -> Result<St
             root,
             required_str(input, "pattern", name)?,
             optional_str(input, "path"),
+        ),
+        "search" => crate::search::search(
+            root,
+            required_str(input, "query", name)?,
+            optional_str(input, "path"),
+            input.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false),
         ),
         other => Err(ToolError::new(
             "unknown_tool",
@@ -820,7 +857,7 @@ mod tests {
         // incidental.
         assert_eq!(
             names,
-            ["get_composition", "list_directory", "read_file", "find_files"]
+            ["get_composition", "list_directory", "read_file", "find_files", "search"]
         );
         for d in &defs {
             assert_eq!(d["input_schema"]["type"], "object");

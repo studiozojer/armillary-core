@@ -242,6 +242,152 @@ pub(crate) fn find_files(
     Ok(out)
 }
 
+/// The most characters one match line may carry.
+pub(crate) const MATCH_WINDOW_CHARS: usize = 200;
+/// The most matches one result may carry, across all files.
+pub(crate) const MAX_MATCHES: usize = 50;
+/// The most matches any single file may contribute.
+pub(crate) const MAX_MATCHES_PER_FILE: usize = 5;
+
+/// A window of at most `MATCH_WINDOW_CHARS` centred on the match.
+///
+/// **Characters, never bytes.** `.爻` is three bytes per character and this
+/// workspace writes node files in it, so a byte-indexed cut lands
+/// mid-character and the line renders `U+FFFD`. Everything below counts and
+/// slices by `char`.
+///
+/// The measured reason this exists: prose here has no hard wrapping, so a
+/// "line" is a paragraph — p99 594 characters, max 5,798 in one `BOARD.md`
+/// entry. Returning whole lines would put no ceiling on a durable, re-projected
+/// tool result.
+fn window(line: &str, match_start_byte: usize, match_end_byte: usize) -> String {
+    let total = line.chars().count();
+    if total <= MATCH_WINDOW_CHARS {
+        return line.to_string();
+    }
+
+    let m_start = line[..match_start_byte].chars().count();
+    let m_end = line[..match_end_byte].chars().count();
+
+    // Centre on the match. When the match is itself longer than the window,
+    // `saturating_sub` collapses the context to zero and the head is kept —
+    // the head is where the model's own query is.
+    let context = MATCH_WINDOW_CHARS.saturating_sub(m_end - m_start) / 2;
+    let mut start = m_start.saturating_sub(context);
+    let end = (start + MATCH_WINDOW_CHARS).min(total);
+    // Re-anchor so a match near the end of the line still fills the window.
+    start = end.saturating_sub(MATCH_WINDOW_CHARS);
+
+    let body: String = line.chars().skip(start).take(end - start).collect();
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.push_str(body.trim());
+    if end < total {
+        out.push('…');
+    }
+    out
+}
+
+/// Search file contents for a regex, returning windowed match lines.
+///
+/// The pattern is a regex via the `regex` crate, whose linear-time guarantee
+/// is the only reason a model-supplied pattern is safe to compile at all —
+/// there is no backtracking to blow up.
+pub(crate) fn search(
+    root: &Path,
+    query: &str,
+    path: Option<&str>,
+    case_sensitive: bool,
+) -> Result<String, ToolError> {
+    let re = regex::RegexBuilder::new(query)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .map_err(|e| ToolError::new("invalid_pattern", e.to_string()))?;
+
+    let (roots, scoped) = resolve_domain(root, path)?;
+    let deadline = Instant::now() + SEARCH_BUDGET;
+
+    let mut hits: Vec<(String, Vec<(usize, String)>)> = Vec::new();
+    let mut total = 0usize;
+    let mut capped = false;
+    let mut skipped = 0usize;
+
+    let stats = walk(root, &roots, deadline, &mut |abs, rel| {
+        let Ok(file) = std::fs::File::open(abs) else {
+            return true;
+        };
+        let mut reader = std::io::BufReader::new(file);
+        let mut per_file: Vec<(usize, String)> = Vec::new();
+        let mut lineno = 0usize;
+
+        loop {
+            match crate::tools::next_line(&mut reader, rel) {
+                Ok(Some(line)) => {
+                    lineno += 1;
+                    if let Some(m) = re.find(&line.text) {
+                        per_file.push((lineno, window(&line.text, m.start(), m.end())));
+                        total += 1;
+                        if total >= MAX_MATCHES {
+                            capped = true;
+                            break;
+                        }
+                        if per_file.len() >= MAX_MATCHES_PER_FILE {
+                            break;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                // `is_openable` gates extensions, not contents. One bad byte in
+                // one file must not fail a 7,788-file search — it is tallied
+                // and the walk continues.
+                Err(_) => {
+                    skipped += 1;
+                    per_file.clear();
+                    break;
+                }
+            }
+        }
+
+        if !per_file.is_empty() {
+            hits.push((rel.to_string(), per_file));
+        }
+        !capped
+    });
+
+    let mut out = String::new();
+    if hits.is_empty() {
+        out.push_str(&format!("no matches for `{query}`\n"));
+    } else {
+        out.push_str(&format!(
+            "{total} matches for `{query}` in {} files\n\n",
+            hits.len()
+        ));
+        for (path, matches) in &hits {
+            out.push_str(path);
+            out.push('\n');
+            for (lineno, text) in matches {
+                out.push_str(&format!("  {lineno}: {text}\n"));
+            }
+        }
+        out.push('\n');
+    }
+    if capped {
+        out.push_str(&format!(
+            "[stopped at {MAX_MATCHES} matches; narrow with `path` or a tighter query]\n"
+        ));
+    }
+    if skipped > 0 {
+        out.push_str(&format!("[{skipped} files skipped: not valid UTF-8]\n"));
+    }
+    if stats.timed_out {
+        out.push_str("[the search budget expired; results are partial]\n");
+    }
+    out.push_str(&domain_note(scoped, roots.len(), stats.files));
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,5 +724,189 @@ mod tests {
 
         assert_eq!(err.status, "invalid_pattern");
         assert!(!err.detail.is_empty(), "the compiler's own message is the repair hint");
+    }
+
+    #[test]
+    fn search_returns_the_matching_line_with_its_number_and_path() {
+        let dir = workspace();
+        let out = search(dir.path(), "needle", None, false).unwrap();
+
+        assert!(out.contains("operators/tycho/self.md"), "{out}");
+        assert!(out.contains("1: needle"), "{out}");
+        // NOT `!out.contains("external")`: `domain_note`'s own boilerplate
+        // names "repos/external/" unconditionally as an example of what SD-2
+        // excludes, so that substring is present in every unscoped result
+        // whether or not anything under `repos/external/` actually matched.
+        // The property under test is that the undeclared file's own path
+        // never appears among the hits.
+        assert!(
+            !out.contains("repos/external/opencode/x.ts"),
+            "undeclared content must not match: {out}"
+        );
+    }
+
+    #[test]
+    fn search_is_case_insensitive_unless_told_otherwise() {
+        let dir = workspace();
+        fs::write(dir.path().join("repos/engine/case.md"), "NEEDLE\n").unwrap();
+
+        assert!(search(dir.path(), "needle", None, false).unwrap().contains("case.md"));
+        assert!(!search(dir.path(), "needle", None, true).unwrap().contains("case.md"));
+    }
+
+    #[test]
+    fn a_long_line_is_windowed_around_the_match() {
+        let dir = workspace();
+        let line = format!("{}NEEDLE{}", "a".repeat(2000), "b".repeat(2000));
+        fs::write(dir.path().join("repos/engine/wide.md"), format!("{line}\n")).unwrap();
+
+        let out = search(dir.path(), "NEEDLE", None, true).unwrap();
+
+        assert!(out.contains("NEEDLE"), "the match itself must survive: {out}");
+        assert!(out.contains('…'), "an elided window must say so: {out}");
+        assert!(out.len() < 1000, "the window did not bind: {} bytes", out.len());
+    }
+
+    #[test]
+    fn a_window_never_splits_a_character() {
+        // MUTATION-CHECKED. The cap is a character count and this workspace
+        // writes `.爻` files at three bytes per character, so a byte-indexed
+        // cut lands mid-character and renders U+FFFD. `read_file` carries the
+        // same test for the same reason.
+        //
+        // 500 repeats, not the brief's 2000: at three bytes each, 2000
+        // repeats puts NEEDLE at byte offset 6000 in the raw line, past
+        // `next_line`'s own `MAX_LINE_BYTES` (4000) truncation — the match is
+        // discarded before `search` ever calls `re.find`, so `window` is
+        // never reached and the assertions below pass on a file with zero
+        // matches (the "no matches for `NEEDLE`" message itself contains the
+        // query text, satisfying `out.contains("NEEDLE")` for a reason that
+        // has nothing to do with windowing). 500 repeats keeps the whole
+        // line under a thousand bytes, well inside the cap, while still far
+        // exceeding `MATCH_WINDOW_CHARS` (200) on both sides of the match so
+        // `window`'s slicing is actually exercised.
+        let dir = workspace();
+        let line = format!("{}NEEDLE{}", "爻".repeat(500), "爻".repeat(500));
+        fs::write(dir.path().join("repos/engine/wide.爻"), format!("{line}\n")).unwrap();
+
+        let out = search(dir.path(), "NEEDLE", None, true).unwrap();
+
+        assert!(!out.contains('\u{FFFD}'), "a character was split: {out}");
+        assert!(out.contains("NEEDLE"), "{out}");
+    }
+
+    #[test]
+    fn one_chatty_file_cannot_consume_the_whole_match_budget() {
+        let dir = workspace();
+        let body: String = (0..100).map(|i| format!("needle {i}\n")).collect();
+        fs::write(dir.path().join("repos/engine/chatty.md"), body).unwrap();
+
+        let out = search(dir.path(), "needle", None, false).unwrap();
+        let from_chatty = out.matches("needle ").count();
+
+        assert!(
+            from_chatty <= MAX_MATCHES_PER_FILE,
+            "one file produced {from_chatty} matches: {out}"
+        );
+    }
+
+    #[test]
+    fn a_bitten_total_cap_announces_itself_without_inventing_a_total() {
+        // Hitting the cap STOPS the walk, so the true total is unknowable
+        // without spending the walk we just saved. Saying "50 of 214" would be
+        // a number nothing measured.
+        let dir = workspace();
+        for n in 0..40 {
+            fs::write(
+                dir.path().join(format!("repos/engine/f-{n:03}.md")),
+                "needle\nneedle\nneedle\n",
+            )
+            .unwrap();
+        }
+        let out = search(dir.path(), "needle", None, false).unwrap();
+
+        assert!(out.contains("stopped at"), "{out}");
+        assert!(!out.contains(" of "), "no invented denominator: {out}");
+
+        // The cap must BIND, not merely announce itself. Without this the test
+        // passes for a cap that fires at the wrong threshold, or that fires and
+        // still leaks extra matches into the body — it only ever proved that a
+        // string appeared somewhere in the tail. (Found by the Task 4 review,
+        // which caught the same shape in `find_files`'s cap test.)
+        //
+        // NOT a literal `": needle"` substring check: `workspace()`'s own
+        // `repos/engine/lib.rs` fixture matches with the line `// needle`, so
+        // its reported line renders as `1: // needle` — a real, counted match
+        // that does not contain `": needle"` because of the comment marker in
+        // between. That undercounts by exactly one every time, regardless of
+        // whether the cap binds correctly. A match-report line is
+        // unambiguous by its own format instead: `  {lineno}: {text}`, i.e.
+        // leading whitespace, then digits, then `": "` — which no path line
+        // or bracketed note in the output can produce.
+        let match_lines = out
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+                !digits.is_empty() && t[digits.len()..].starts_with(": ")
+            })
+            .count();
+        assert_eq!(
+            match_lines, MAX_MATCHES,
+            "the cap announced itself but did not bind: {out}"
+        );
+    }
+
+    #[test]
+    fn a_credential_is_never_matched_however_well_it_matches() {
+        // MUTATION-CHECKED, and `secrets.json` is the assertion that does the
+        // work. `.env` and `Secrets.xcconfig` are excluded by `is_openable`
+        // (neither has an allowlisted extension) whether or not the guard's
+        // prune runs at all — so they pin the extension gate and discriminate
+        // nothing about pruning. `secrets.json` matches `is_credential`
+        // ("secret") AND is openable (`json`), so the prune is the only thing
+        // standing between it and being read. Found in Task 3, where the
+        // equivalent `.env` assertion stayed green under the mutation.
+        let dir = workspace();
+        fs::write(dir.path().join("repos/engine/.env"), "TOKEN=needle\n").unwrap();
+        fs::write(dir.path().join("repos/engine/Secrets.xcconfig"), "KEY=needle\n").unwrap();
+        fs::write(dir.path().join("repos/engine/secrets.json"), "{\"k\":\"needle\"}\n").unwrap();
+
+        let out = search(dir.path(), "needle", None, false).unwrap();
+
+        assert!(!out.contains(".env"), "{out}");
+        assert!(!out.contains("Secrets"), "{out}");
+        assert!(!out.contains("TOKEN"), "{out}");
+        assert!(!out.contains("secrets.json"), "the prune is the only gate here: {out}");
+    }
+
+    #[test]
+    fn one_unreadable_file_is_tallied_rather_than_failing_the_search() {
+        let dir = workspace();
+        fs::write(dir.path().join("repos/engine/bad.md"), [0xff, 0xfe, 0x00]).unwrap();
+
+        let out = search(dir.path(), "needle", None, false).unwrap();
+
+        assert!(out.contains("operators/tycho/self.md"), "the good hits survive: {out}");
+        assert!(out.contains("skipped"), "the skip is reported, not silent: {out}");
+    }
+
+    #[test]
+    fn search_states_its_domain_when_it_finds_nothing() {
+        let dir = workspace();
+        let out = search(dir.path(), "nothing-matches-this", None, false).unwrap();
+
+        assert!(!out.trim().is_empty(), "an empty text block is a 400");
+        assert!(out.contains("composed"), "{out}");
+        assert!(out.contains("path"), "{out}");
+    }
+
+    #[test]
+    fn an_uncompilable_regex_is_a_readable_refusal() {
+        let dir = workspace();
+        let err = search(dir.path(), "(unclosed", None, false).unwrap_err();
+
+        assert_eq!(err.status, "invalid_pattern");
+        assert!(!err.detail.is_empty());
     }
 }
