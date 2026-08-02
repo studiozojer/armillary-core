@@ -37,7 +37,7 @@ pub struct ToolError {
 }
 
 impl ToolError {
-    fn new(status: &'static str, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(status: &'static str, detail: impl Into<String>) -> Self {
         ToolError {
             status,
             detail: detail.into(),
@@ -470,9 +470,9 @@ pub fn read_whole(root: &Path, path: &str) -> Result<(String, u64, String), Tool
 }
 
 /// One line, read with a byte cap so a single line cannot defeat the page cap.
-struct Line {
-    text: String,
-    truncated: bool,
+pub(crate) struct Line {
+    pub(crate) text: String,
+    pub(crate) truncated: bool,
 }
 
 /// Consume the remainder of an over-long line. Bounded per read so a
@@ -492,7 +492,7 @@ fn discard_to_newline(reader: &mut impl BufRead) -> std::io::Result<()> {
 ///
 /// Reads `MAX_LINE_BYTES + 1` so "at the cap" and "over the cap" are
 /// distinguishable, and never holds more than that regardless of line length.
-fn next_line(reader: &mut impl BufRead, path: &str) -> Result<Option<Line>, ToolError> {
+pub(crate) fn next_line(reader: &mut impl BufRead, path: &str) -> Result<Option<Line>, ToolError> {
     let unreadable = || ToolError::new("read_failed", format!("could not read {path}"));
 
     let mut buf = Vec::new();
