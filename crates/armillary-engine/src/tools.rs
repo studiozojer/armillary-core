@@ -56,7 +56,9 @@ impl ToolError {
             "malformed_path" => StatusCode::BAD_REQUEST,
             "outside_workspace" | "denied_credential" | "denied_noise" => StatusCode::FORBIDDEN,
             "not_found" => StatusCode::NOT_FOUND,
-            "is_a_directory" | "not_a_directory" | "invalid_input" => StatusCode::BAD_REQUEST,
+            "is_a_directory" | "not_a_directory" | "invalid_input" | "invalid_pattern" => {
+                StatusCode::BAD_REQUEST
+            }
             "not_openable" | "not_text" => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "too_large" => StatusCode::PAYLOAD_TOO_LARGE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -145,6 +147,30 @@ pub fn definitions() -> Vec<serde_json::Value> {
                 "required": ["path"],
             },
         }),
+        serde_json::json!({
+            "name": "find_files",
+            "description": "Find files by a glob pattern over their path, e.g. \
+                            \"**/2026-07-30-*\" or \"operators/**/*.md\". Searches \
+                            the modules this workspace declares; content that is \
+                            not composed (reference clones, git worktrees) is not \
+                            searched unless you name it with `path`. Use this when \
+                            you know roughly what a file is called and not where it is.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "A glob matched against the workspace-relative path.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional. Restrict the search to this directory, \
+                                        which may be outside the composed modules.",
+                    },
+                },
+                "required": ["pattern"],
+            },
+        }),
     ]
 }
 
@@ -164,6 +190,11 @@ pub fn dispatch(name: &str, input: &serde_json::Value, root: &Path) -> Result<St
             required_str(input, "path", name)?,
             optional_usize(input, "offset", 1)?,
             optional_usize(input, "limit", DEFAULT_LINES)?,
+        ),
+        "find_files" => crate::search::find_files(
+            root,
+            required_str(input, "pattern", name)?,
+            optional_str(input, "path"),
         ),
         other => Err(ToolError::new(
             "unknown_tool",
@@ -644,6 +675,12 @@ fn optional_usize(
     }
 }
 
+/// An optional string argument. Absent and empty are the same thing here —
+/// see `search::resolve_domain` for why `""` must not mean the workspace root.
+fn optional_str<'a>(input: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    input.get(key).and_then(|v| v.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,7 +818,10 @@ mod tests {
 
         // Order is part of the cached prefix, so it is pinned rather than
         // incidental.
-        assert_eq!(names, ["get_composition", "list_directory", "read_file"]);
+        assert_eq!(
+            names,
+            ["get_composition", "list_directory", "read_file", "find_files"]
+        );
         for d in &defs {
             assert_eq!(d["input_schema"]["type"], "object");
             assert!(

@@ -167,6 +167,81 @@ pub(crate) fn walk(
     stats
 }
 
+/// The most paths one `find_files` result may carry.
+///
+/// Generous next to the match caps because a path is cheap — roughly 60 bytes
+/// against a 200-character match window.
+pub(crate) const MAX_PATHS: usize = 100;
+
+/// The sentence every result ends with, naming what was and was not searched.
+///
+/// **The whole absence-vs-refusal lesson lives here.** SD-2 deliberately
+/// narrows the domain; without this, that narrowing reads exactly like an
+/// empty workspace, and the model has no way to learn otherwise. The 2026-08-01
+/// sync work shipped the opposite of this — `verdict()` returned `current` for
+/// twenty-four repos having contacted nothing.
+fn domain_note(scoped: bool, roots: usize, files: usize) -> String {
+    if scoped {
+        format!("[searched 1 path explicitly, {files} files]\n")
+    } else {
+        format!(
+            "[searched {roots} composed modules, {files} files. \
+             Undeclared content — repos/external/, worktrees — was not searched; \
+             pass `path` to search one directly.]\n"
+        )
+    }
+}
+
+/// Find files whose workspace-relative path matches a glob.
+pub(crate) fn find_files(
+    root: &Path,
+    pattern: &str,
+    path: Option<&str>,
+) -> Result<String, ToolError> {
+    let glob = globset::Glob::new(pattern)
+        .map_err(|e| ToolError::new("invalid_pattern", e.to_string()))?
+        .compile_matcher();
+
+    let (roots, scoped) = resolve_domain(root, path)?;
+    let deadline = Instant::now() + SEARCH_BUDGET;
+
+    let mut found: Vec<String> = Vec::new();
+    let mut capped = false;
+    let stats = walk(root, &roots, deadline, &mut |_abs, rel| {
+        if glob.is_match(rel) {
+            found.push(rel.to_string());
+            if found.len() >= MAX_PATHS {
+                capped = true;
+                return false;
+            }
+        }
+        true
+    });
+
+    found.sort();
+
+    let mut out = String::new();
+    if found.is_empty() {
+        out.push_str(&format!("no files matching `{pattern}`\n"));
+    } else {
+        out.push_str(&format!("{} files matching `{pattern}`\n", found.len()));
+        for f in &found {
+            out.push_str(f);
+            out.push('\n');
+        }
+    }
+    if capped {
+        out.push_str(&format!(
+            "[stopped at {MAX_PATHS} paths; narrow with `path` or a tighter pattern]\n"
+        ));
+    }
+    if stats.timed_out {
+        out.push_str("[the search budget expired; results are partial]\n");
+    }
+    out.push_str(&domain_note(scoped, roots.len(), stats.files));
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +523,60 @@ mod tests {
             !seen.iter().any(|p| p == "repos/engine/link.rs"),
             "a symlink must not be visited, even when its target is inside a declared root: {seen:?}"
         );
+    }
+
+    #[test]
+    fn find_files_matches_the_relative_path_not_just_the_file_name() {
+        // Matching the name alone would make `operators/**/*.md` inexpressible,
+        // which is most of what a path glob is for in this workspace.
+        let dir = workspace();
+        let out = find_files(dir.path(), "operators/**/*.md", None).unwrap();
+
+        assert!(out.contains("operators/tycho/self.md"), "{out}");
+        assert!(!out.contains("repos/engine/lib.rs"), "{out}");
+    }
+
+    #[test]
+    fn find_files_states_its_domain_when_it_finds_nothing() {
+        // MUTATION-CHECKED. The anti-collapse test: SD-2 narrows what is
+        // searched, and without this sentence that narrowing is
+        // indistinguishable from an empty workspace.
+        let dir = workspace();
+        let out = find_files(dir.path(), "**/*.ts", None).unwrap();
+
+        assert!(!out.trim().is_empty(), "an empty text block is a 400");
+        assert!(out.contains("composed"), "the domain must be named: {out}");
+        assert!(out.contains("path"), "the recovery must be named: {out}");
+    }
+
+    #[test]
+    fn find_files_reaches_undeclared_content_through_an_explicit_path() {
+        let dir = workspace();
+        let out = find_files(dir.path(), "**/*.ts", Some("repos/external/opencode")).unwrap();
+
+        assert!(out.contains("x.ts"), "{out}");
+    }
+
+    #[test]
+    fn find_files_caps_its_output_and_names_the_recovery() {
+        let dir = workspace();
+        for n in 0..MAX_PATHS + 10 {
+            fs::write(dir.path().join(format!("repos/engine/note-{n:04}.md")), "x").unwrap();
+        }
+        let out = find_files(dir.path(), "**/*.md", None).unwrap();
+
+        assert!(out.contains("stopped at"), "a bitten cap must announce itself: {out}");
+        assert!(out.contains("path"), "the recovery must be named: {out}");
+    }
+
+    #[test]
+    fn an_uncompilable_glob_is_a_readable_refusal_not_zero_results() {
+        // Zero results and "your pattern is broken" are the same sentence to a
+        // model unless we make them different.
+        let dir = workspace();
+        let err = find_files(dir.path(), "[", None).unwrap_err();
+
+        assert_eq!(err.status, "invalid_pattern");
+        assert!(!err.detail.is_empty(), "the compiler's own message is the repair hint");
     }
 }
