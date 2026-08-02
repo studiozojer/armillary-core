@@ -295,7 +295,12 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 /// - **The noun matches what is counted** — roots, split into modules and
 ///   router files, because `get_composition` counts only the former.
 /// - **The verb matches how the walk ended.** `files` from an interrupted
-///   walk is how far we got, not the size of the domain.
+///   walk is how far we got, not the size of the domain. It says *searched*,
+///   not *walked*, because the two callers pass different numbers into this
+///   one sentence: `find_files` passes every path it walked (it glob-tests
+///   all of them), `search` passes only the files it actually read, which is
+///   short by the not-text and unreadable tallies printed beside it. Both are
+///   honestly "searched"; only one was ever "walked".
 /// - **Both kinds of exclusion are named, and on the scoped path too.** Under
 ///   an explicit `path` the guard still prunes credentials, `node_modules`,
 ///   worktrees and the rest, so a scoped result that named nothing let
@@ -316,7 +321,7 @@ fn domain_note(scope: &Scope, files: usize, complete: bool) -> String {
         format!("searched {where_}, {}", plural(files, "file", "files"))
     } else {
         format!(
-            "stopped early — {} walked so far across {where_}, which is not the size of the domain",
+            "stopped early — {} searched so far across {where_}, which is not the size of the domain",
             plural(files, "file", "files")
         )
     };
