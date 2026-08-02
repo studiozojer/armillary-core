@@ -101,9 +101,19 @@ pub(crate) struct WalkStats {
 /// search rather than filling a 50-match budget and then walking 7,700 more
 /// files to no purpose.
 ///
-/// **Symlinks are not followed.** This workspace routes real content through
-/// them, so following would both risk cycles and return a second copy of a
-/// file already walked at its real path. Content is reached where it lives.
+/// **Symlinks are not followed.** Following one would risk a cycle, and — for
+/// the common case, a symlink whose target already sits inside a declared
+/// root — would return a second copy of a file already walked at its real
+/// path.
+///
+/// That justification does not cover every case, and this is the part worth
+/// being honest about: nothing here checks that a symlink's target is
+/// actually reachable some other way. A symlink inside a declared root whose
+/// target lies **outside every declared root** is simply skipped, and its
+/// content drops out of search silently — no error, no note, nothing to
+/// distinguish it from content that was never there. That is a known
+/// limitation of scoping the domain to the manifest, not a property this
+/// function guarantees.
 pub(crate) fn walk(
     root: &Path,
     roots: &[PathBuf],
@@ -409,5 +419,34 @@ mod tests {
         let stats = walk(dir.path(), &roots, Instant::now(), &mut |_a, _r| true);
 
         assert!(stats.timed_out, "an expired deadline must be reported, not silent");
+    }
+
+    #[test]
+    fn a_symlink_is_not_followed_even_when_its_target_is_inside_a_declared_root() {
+        // MUTATION-CHECKED (see report): this pins the behaviour the doc
+        // comment on `walk` now describes honestly rather than asserting a
+        // guarantee. The target here happens to sit inside the same declared
+        // root, so this test cannot by itself distinguish "cycle/duplicate
+        // avoidance" from "we simply never look at symlinks" — but it does
+        // pin that the link itself is never visited, which is the property
+        // `WalkDir::follow_links(false)` is relied on for.
+        let dir = workspace();
+        fs::write(dir.path().join("repos/engine/real.rs"), "needle-real").unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("repos/engine/real.rs"),
+            dir.path().join("repos/engine/link.rs"),
+        )
+        .unwrap();
+
+        let seen = walked(dir.path());
+
+        assert!(
+            seen.iter().any(|p| p == "repos/engine/real.rs"),
+            "the real file must still be walked: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|p| p == "repos/engine/link.rs"),
+            "a symlink must not be visited, even when its target is inside a declared root: {seen:?}"
+        );
     }
 }
