@@ -350,18 +350,28 @@ mod tests {
     fn the_walk_prunes_what_the_guard_denies() {
         // MUTATION-CHECKED. One gate, not two: search inherits every fix the
         // guard ever receives, and a credential is never opened to be matched.
+        //
+        // `secrets.json` is the discriminating case here, not `.env`: its
+        // extension (`json`) is on `is_openable`'s allowlist, so it is the one
+        // fixture in this test that is excluded *only* by `filter_entry`
+        // consulting `is_hidden_from_listings` — if that prune ever breaks,
+        // this is the assertion that catches it. `.env` has no allowlisted
+        // extension, so `is_openable` refuses it independently of the prune;
+        // it stays here as a pin on that other gate, not as prune coverage.
         let dir = workspace();
         fs::create_dir_all(dir.path().join("repos/engine/node_modules/pkg")).unwrap();
         fs::write(dir.path().join("repos/engine/node_modules/pkg/i.js"), "needle").unwrap();
         fs::create_dir_all(dir.path().join("repos/engine/.worktrees/feat/src")).unwrap();
         fs::write(dir.path().join("repos/engine/.worktrees/feat/src/lib.rs"), "needle").unwrap();
         fs::write(dir.path().join("repos/engine/.env"), "TOKEN=needle").unwrap();
+        fs::write(dir.path().join("repos/engine/secrets.json"), "{\"token\":\"needle\"}").unwrap();
 
         let seen = walked(dir.path());
 
         assert!(!seen.iter().any(|p| p.contains("node_modules")), "{seen:?}");
         assert!(!seen.iter().any(|p| p.contains(".worktrees")), "{seen:?}");
         assert!(!seen.iter().any(|p| p.contains(".env")), "{seen:?}");
+        assert!(!seen.iter().any(|p| p.contains("secrets.json")), "{seen:?}");
     }
 
     #[test]
