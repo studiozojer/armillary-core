@@ -1001,7 +1001,17 @@ mod tests {
         assert!(out.contains("stopped at"), "a bitten cap must announce itself: {out}");
         assert!(out.contains("path"), "the recovery must be named: {out}");
 
-        // A truncated list must not read as a complete one: the footer's
+        // The cap must BIND, not merely announce itself — the same gap that was
+        // closed on `search`'s cap test and left open here, so the two siblings
+        // disagreed about how much they proved. Without this, a cap that fired
+        // at the wrong threshold, or fired and still leaked paths into the body,
+        // passes.
+        assert_eq!(
+            count_path_lines(&out), MAX_PATHS,
+            "the cap announced itself but did not bind: {out}"
+        );
+
+        // And a truncated list must not read as a complete one: the footer's
         // file count is how far the walk got, not the size of the domain.
         assert!(
             out.contains("stopped early"),
@@ -1011,6 +1021,14 @@ mod tests {
             !out.contains("searched 3 declared roots"),
             "the verb must match how the walk ended: {out}"
         );
+    }
+
+    /// Count the path lines of a `find_files` result: everything that is not
+    /// the header and not a bracketed note.
+    fn count_path_lines(out: &str) -> usize {
+        out.lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('[') && !l.contains(" matching `"))
+            .count()
     }
 
     #[test]
