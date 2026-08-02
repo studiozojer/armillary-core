@@ -315,7 +315,13 @@ pub(crate) fn search(
     let mut skipped = 0usize;
 
     let stats = walk(root, &roots, deadline, &mut |abs, rel| {
+        // Failing to open an already-`is_openable`, already-walked file
+        // (permissions, a transient I/O error) is the same event as a bad
+        // byte inside one that did open: a file that was in the domain and
+        // could not be read. Both fold into the one `skipped` tally rather
+        // than one counted and the other silently dropped.
         let Ok(file) = std::fs::File::open(abs) else {
+            skipped += 1;
             return true;
         };
         let mut reader = std::io::BufReader::new(file);
@@ -341,9 +347,13 @@ pub(crate) fn search(
                 Ok(None) => break,
                 // `is_openable` gates extensions, not contents. One bad byte in
                 // one file must not fail a 7,788-file search — it is tallied
-                // and the walk continues.
+                // and the walk continues. The matches already found in this
+                // file are withdrawn along with the lines that reported them:
+                // a file reported as skipped must not still be charged against
+                // the 50-match budget for lines nobody will see.
                 Err(_) => {
                     skipped += 1;
+                    total -= per_file.len();
                     per_file.clear();
                     break;
                 }
@@ -379,7 +389,7 @@ pub(crate) fn search(
         ));
     }
     if skipped > 0 {
-        out.push_str(&format!("[{skipped} files skipped: not valid UTF-8]\n"));
+        out.push_str(&format!("[{skipped} files skipped: unreadable or not valid UTF-8]\n"));
     }
     if stats.timed_out {
         out.push_str("[the search budget expired; results are partial]\n");
@@ -791,6 +801,15 @@ mod tests {
 
         let out = search(dir.path(), "NEEDLE", None, true).unwrap();
 
+        // Pins that `window` actually ran, not merely that its two possible
+        // failure symptoms are absent. Without this, `!out.contains('\u{FFFD}')`
+        // is trivially true and `out.contains("NEEDLE")` is satisfied by the
+        // echoed query inside `no matches for \`NEEDLE\`` whenever the match
+        // never reaches `window` at all — exactly the fixture-vacuity found
+        // above with the 2000-repeat version. `…` cannot come from a "no
+        // matches" line (`domain_note` uses an em dash, not an ellipsis), so
+        // its presence is real evidence the window ran.
+        assert!(out.contains('…'), "the window must have run: {out}");
         assert!(!out.contains('\u{FFFD}'), "a character was split: {out}");
         assert!(out.contains("NEEDLE"), "{out}");
     }
@@ -842,17 +861,9 @@ mod tests {
         // whether the cap binds correctly. A match-report line is
         // unambiguous by its own format instead: `  {lineno}: {text}`, i.e.
         // leading whitespace, then digits, then `": "` — which no path line
-        // or bracketed note in the output can produce.
-        let match_lines = out
-            .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
-                !digits.is_empty() && t[digits.len()..].starts_with(": ")
-            })
-            .count();
+        // or bracketed note in the output can produce. See `count_match_lines`.
         assert_eq!(
-            match_lines, MAX_MATCHES,
+            count_match_lines(&out), MAX_MATCHES,
             "the cap announced itself but did not bind: {out}"
         );
     }
@@ -889,6 +900,84 @@ mod tests {
 
         assert!(out.contains("operators/tycho/self.md"), "the good hits survive: {out}");
         assert!(out.contains("skipped"), "the skip is reported, not silent: {out}");
+    }
+
+    /// Count report lines by their own format — leading whitespace, digits,
+    /// then `": "` — rather than by the text of any particular query, so the
+    /// count is not fooled by a match whose rendered text does not start
+    /// with the query itself (`repos/engine/lib.rs`'s `// needle`, in
+    /// particular).
+    fn count_match_lines(out: &str) -> usize {
+        out.lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+                !digits.is_empty() && t[digits.len()..].starts_with(": ")
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_file_that_matches_before_going_unreadable_does_not_inflate_the_total() {
+        // Established by reverting the fix and re-running: without
+        // `total -= per_file.len();` before `per_file.clear()`, this test
+        // fails — `total` stays at +2 for `partial.md`'s two good lines even
+        // though `partial.md` is dropped from `hits` entirely (a file
+        // reported as skipped renders no lines), so the header's own count
+        // no longer matches what it prints, and those two withdrawn matches
+        // would still have consumed budget against `MAX_MATCHES`.
+        let dir = workspace();
+        let mut body = b"needle\nneedle\n".to_vec();
+        body.extend_from_slice(&[0xff, 0xfe, 0x00]);
+        fs::write(dir.path().join("repos/engine/partial.md"), body).unwrap();
+
+        let out = search(dir.path(), "needle", None, false).unwrap();
+
+        assert!(
+            !out.contains("partial.md"),
+            "a file reported as skipped must not also appear as a hit: {out}"
+        );
+        assert!(out.contains("skipped"), "{out}");
+
+        let header_total: usize = out
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(usize::MAX);
+
+        assert_eq!(
+            header_total,
+            count_match_lines(&out),
+            "the header must not count matches it renders no line for: {out}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_file_that_cannot_be_opened_is_tallied_rather_than_silently_dropped() {
+        // Established by reverting the fix and re-running: without folding
+        // the `File::open` failure into `skipped`, this test fails — `out`
+        // never says "skipped" even though `locked.md` is a real, in-domain,
+        // openable-by-extension file that was never read. That is quieter
+        // than the UTF-8 case, which was at least counted.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = workspace();
+        let path = dir.path().join("repos/engine/locked.md");
+        fs::write(&path, "needle\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let out = search(dir.path(), "needle", None, false).unwrap();
+
+        // Restore permissions so the tempdir can clean itself up.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            out.contains("skipped"),
+            "an unopenable file must be tallied, not silently dropped: {out}"
+        );
+        assert!(out.contains("operators/tycho/self.md"), "the good hits survive: {out}");
     }
 
     #[test]
