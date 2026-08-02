@@ -1215,4 +1215,49 @@ mod tests {
         assert_eq!(via_route.status, via_tool.status);
         assert_eq!(via_route.status, "denied_credential");
     }
+
+    // ---- the two search verbs, through dispatch ----
+
+    #[test]
+    fn the_search_verbs_are_reachable_by_the_names_their_definitions_declare() {
+        // A working body behind a misspelled arm is a green suite and a dead
+        // tool. `unknown_tool` is the failure this pins.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("modules.toml"), "[router]\ncontains = [\"a.md\"]\n").unwrap();
+        fs::write(dir.path().join("a.md"), "needle\n").unwrap();
+
+        let found = dispatch(
+            "search",
+            &serde_json::json!({ "query": "needle" }),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(found.contains("a.md"), "{found}");
+
+        let listed = dispatch(
+            "find_files",
+            &serde_json::json!({ "pattern": "*.md" }),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(listed.contains("a.md"), "{listed}");
+    }
+
+    #[test]
+    fn a_search_verb_missing_its_required_argument_is_an_error_not_a_panic() {
+        let dir = tree_fixture();
+        for (name, key) in [("search", "query"), ("find_files", "pattern")] {
+            let err = dispatch(name, &serde_json::json!({}), dir.path()).unwrap_err();
+            assert_eq!(err.status, "invalid_input", "{name}");
+            assert!(err.detail.contains(key), "{name}: {}", err.detail);
+        }
+    }
+
+    #[test]
+    fn an_invalid_pattern_maps_to_a_bad_request() {
+        assert_eq!(
+            ToolError::new("invalid_pattern", "x").http_status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
 }
