@@ -90,16 +90,36 @@ pub(crate) fn resolve_domain(
 pub(crate) const SEARCH_BUDGET: Duration = Duration::from_secs(10);
 
 pub(crate) struct WalkStats {
+    /// Files handed to `visit`: everything under the roots that survived the
+    /// **safety** gate. Deliberately not narrowed by `is_openable` — see the
+    /// note below — so a caller that opens files must subtract its own
+    /// refusals before printing this next to the word "searched".
     pub files: usize,
     pub timed_out: bool,
 }
 
-/// Walk the search roots, handing each openable text file to `visit`.
+/// Walk the search roots, handing every file the safety gate allows to `visit`.
 ///
 /// `visit` receives the absolute path and the workspace-relative path, and
 /// returns `false` to stop the walk immediately — that is how a cap ends a
 /// search rather than filling a 50-match budget and then walking 7,700 more
 /// files to no purpose.
+///
+/// **Two gates, and only one of them is here.** `is_hidden_from_listings`
+/// (credentials, `node_modules`, `target`, `.build`, `.worktrees`,
+/// `.armillary`) is a safety and noise rule that governs whether a path is
+/// served at all, so it prunes the walk. `is_openable` is a **content** gate —
+/// it decides whether bytes may be handed out — and it lives in the visitor of
+/// whichever caller actually reads a file. `guard::is_openable`'s own doc says
+/// this: it governs opening, and hiding what cannot be opened from a *listing*
+/// reintroduces the projection it was changed to remove. `find_files` is a
+/// listing; applying the content gate here made `find_files("**/*.png")` answer
+/// "there are none" about files sitting in plain view, under a footer claiming
+/// thousands of files had been examined.
+///
+/// **Entries are visited in sorted order** (`sort_by_file_name`), roots in
+/// declaration order. Without it the filesystem decides, so two identical calls
+/// could return different results and — once a cap bites — a different *set*.
 ///
 /// **Symlinks are not followed.** Following one would risk a cycle, and — for
 /// the common case, a symlink whose target already sits inside a declared
@@ -130,6 +150,10 @@ pub(crate) fn walk(
     for start in roots {
         let walker = WalkDir::new(start)
             .follow_links(false)
+            // Determinism, and the reason it is not cosmetic: a cap keeps the
+            // first N *visited*, so an unordered walk makes the surviving set
+            // itself vary between two identical calls.
+            .sort_by_file_name()
             .into_iter()
             // `filter_entry` skips a whole subtree on false, so `node_modules`
             // costs one stat rather than a descent into it. Depth 0 is the
@@ -148,9 +172,6 @@ pub(crate) fn walk(
             // With `follow_links(false)` a symlink is neither file nor dir
             // here, so it is skipped — see the note above.
             if !entry.file_type().is_file() {
-                continue;
-            }
-            if !crate::guard::is_openable(&entry.file_name().to_string_lossy()) {
                 continue;
             }
             let Ok(rel) = entry.path().strip_prefix(&canonical_root) else {
@@ -193,6 +214,12 @@ fn domain_note(scoped: bool, roots: usize, files: usize) -> String {
 }
 
 /// Find files whose workspace-relative path matches a glob.
+///
+/// **A listing, not a read.** It opens nothing, so the content gate
+/// (`is_openable`) does not apply: a `.png` or a `.se1` matching the pattern is
+/// reported. The alternative — inheriting `search`'s gate because the two share
+/// a walker — made this verb answer "no files matching `**/*.png`" about files
+/// sitting in plain view.
 pub(crate) fn find_files(
     root: &Path,
     pattern: &str,
@@ -238,6 +265,8 @@ pub(crate) fn find_files(
     if stats.timed_out {
         out.push_str("[the search budget expired; results are partial]\n");
     }
+    // `stats.files` is exactly what this verb examined: every walked path was
+    // tested against the glob, because nothing here refuses a file for its type.
     out.push_str(&domain_note(scoped, roots.len(), stats.files));
     Ok(out)
 }
@@ -313,8 +342,18 @@ pub(crate) fn search(
     let mut total = 0usize;
     let mut capped = false;
     let mut skipped = 0usize;
+    let mut not_text = 0usize;
 
     let stats = walk(root, &roots, deadline, &mut |abs, rel| {
+        // **The content gate, and this is the only place it belongs.** `walk`
+        // hands over every file the safety gate allows, because `find_files`
+        // must list what it cannot open. This verb opens, so it refuses here —
+        // and counts the refusals, so the footer can say how many files it
+        // declined to read rather than dropping them into silence.
+        if !crate::guard::is_openable(&abs.file_name().unwrap_or_default().to_string_lossy()) {
+            not_text += 1;
+            return true;
+        }
         // Failing to open an already-`is_openable`, already-walked file
         // (permissions, a transient I/O error) is the same event as a bad
         // byte inside one that did open: a file that was in the domain and
@@ -388,13 +427,24 @@ pub(crate) fn search(
             "[stopped at {MAX_MATCHES} matches; narrow with `path` or a tighter query]\n"
         ));
     }
+    if not_text > 0 {
+        out.push_str(&format!(
+            "[{not_text} files not searched: the type is not served as text — \
+             `find_files` lists them]\n"
+        ));
+    }
     if skipped > 0 {
         out.push_str(&format!("[{skipped} files skipped: unreadable or not valid UTF-8]\n"));
     }
     if stats.timed_out {
         out.push_str("[the search budget expired; results are partial]\n");
     }
-    out.push_str(&domain_note(scoped, roots.len(), stats.files));
+    // Not `stats.files`: the walk offers files this verb never opens. The
+    // number printed beside "searched" is the number actually read — the two
+    // exclusions it subtracts are each announced above, so the three tallies
+    // add back up to what was walked.
+    let searched = stats.files.saturating_sub(not_text + skipped);
+    out.push_str(&domain_note(scoped, roots.len(), searched));
     Ok(out)
 }
 
@@ -579,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn the_walk_visits_openable_files_inside_declared_roots() {
+    fn the_walk_visits_files_inside_declared_roots() {
         let dir = workspace();
         assert_eq!(
             walked(dir.path()),
@@ -616,15 +666,86 @@ mod tests {
     }
 
     #[test]
-    fn the_walk_skips_types_that_are_not_served_as_text() {
+    fn the_walk_offers_every_file_the_safety_gate_allows_including_unopenable_types() {
+        // The content gate used to live here, and `find_files` inherited it by
+        // sharing the walker — so a `.png` sitting in plain view produced "no
+        // files matching `**/*.png`" under a footer claiming thousands of files
+        // were examined. `guard::is_openable`'s own doc draws this line: it
+        // governs opening, and hiding what cannot be opened from a listing
+        // reintroduces the projection it was changed to remove.
         let dir = workspace();
         fs::write(dir.path().join("repos/engine/icon.png"), [0x89, 0x50]).unwrap();
         fs::write(dir.path().join("repos/engine/ephe.se1"), [0x00, 0x01]).unwrap();
 
         let seen = walked(dir.path());
 
-        assert!(!seen.iter().any(|p| p.ends_with(".png")), "{seen:?}");
-        assert!(!seen.iter().any(|p| p.ends_with(".se1")), "{seen:?}");
+        assert!(seen.iter().any(|p| p.ends_with(".png")), "{seen:?}");
+        assert!(seen.iter().any(|p| p.ends_with(".se1")), "{seen:?}");
+    }
+
+    #[test]
+    fn a_type_that_is_not_served_as_text_is_listed_but_never_read() {
+        // The other half: moving the gate must not let `search` open a `.png`.
+        // The two verbs now disagree on purpose — one lists, one reads — and the
+        // disagreement is stated in the result rather than left to be inferred.
+        let dir = workspace();
+        fs::write(dir.path().join("repos/engine/icon.png"), b"needle").unwrap();
+        fs::write(dir.path().join("repos/engine/ephe.se1"), b"needle").unwrap();
+
+        let listed = find_files(dir.path(), "**/*.png", None).unwrap();
+        assert!(
+            listed.contains("repos/engine/icon.png"),
+            "a listing must not hide what it cannot open: {listed}"
+        );
+
+        let searched = search(dir.path(), "needle", None, false).unwrap();
+        assert!(!searched.contains("icon.png"), "search must still not read it: {searched}");
+        assert!(!searched.contains("ephe.se1"), "{searched}");
+        assert!(
+            searched.contains("2 files not searched: the type is not served as text"),
+            "the refusal must be counted, not silent: {searched}"
+        );
+    }
+
+    #[test]
+    fn each_footer_counts_what_its_own_verb_actually_did() {
+        // The knock-on, and the reason it is pinned: `stats.files` now counts
+        // everything walked, so printing it beside "searched" would overstate
+        // what `search` read by exactly the files it refused to open.
+        // `find_files` examined all five; `search` read three and says so about
+        // the other two.
+        let dir = workspace();
+        fs::write(dir.path().join("repos/engine/icon.png"), [0x89, 0x50]).unwrap();
+        fs::write(dir.path().join("repos/engine/ephe.se1"), [0x00, 0x01]).unwrap();
+
+        let listed = find_files(dir.path(), "**/*.nothing", None).unwrap();
+        assert!(listed.contains("5 files"), "a listing examined all of them: {listed}");
+
+        let searched = search(dir.path(), "nothing-matches-this", None, false).unwrap();
+        assert!(searched.contains("3 files"), "a search read only the text ones: {searched}");
+        assert!(!searched.contains("5 files"), "{searched}");
+    }
+
+    #[test]
+    fn a_capped_listing_is_deterministic_rather_than_whatever_the_disk_returned() {
+        // The cap keeps the first N *visited*, so an unordered walk lets the
+        // filesystem choose which N survive: two identical calls could return
+        // different sets, and the survivors were then sorted into something that
+        // reads as a lexicographic prefix while `n-0000` was missing from it.
+        // `sort_by_file_name` on the walker is what makes the surviving set a
+        // fact about the workspace rather than about the disk.
+        let dir = workspace();
+        for n in 0..MAX_PATHS + 10 {
+            fs::write(dir.path().join(format!("repos/engine/n-{n:04}.md")), "x").unwrap();
+        }
+
+        let first = find_files(dir.path(), "repos/engine/*.md", None).unwrap();
+        let again = find_files(dir.path(), "repos/engine/*.md", None).unwrap();
+        assert_eq!(first, again, "two identical calls must return the same result");
+
+        assert!(first.contains("n-0000.md"), "the survivors must be a real prefix: {first}");
+        assert!(first.contains("n-0099.md"), "{first}");
+        assert!(!first.contains("n-0100.md"), "{first}");
     }
 
     #[test]
