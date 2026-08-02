@@ -125,6 +125,14 @@ fn is_noise(name_lower: &str) -> bool {
             // `build` and not `.build` is the same failure as a credential
             // denylist assembled by remembering names.
             | ".build"
+            // A git worktree is a second checkout of a repo that is already
+            // composed here — derived duplicate state, the same category as
+            // `target/` and `.build`. Seven of them exist in this workspace
+            // and each holds a full copy of its repo, so a walk that entered
+            // them would return the same file from two branches with nothing
+            // in the result to say which was which. Every byte in a worktree
+            // is readable at its real path.
+            | ".worktrees"
             | "dist"
             | ".next"
             | ".expo"
@@ -510,5 +518,28 @@ mod tests {
         // surprise: `.env.example` is a committed template with no allowlisted
         // extension. Templates are read on the machine, not from a phone.
         assert!(!is_openable(".env.example"));
+    }
+
+    #[test]
+    fn worktrees_are_denied_as_derived_duplicate_state() {
+        // SD-5. A worktree is a second checkout of a repo already composed here:
+        // same category as `target/` and `.build`. Every file in one is readable
+        // at its real path, and a search that walked both would return the same
+        // file twice from two different branches.
+        let (root, _o) = farm();
+        fs::create_dir_all(root.path().join(".worktrees/feat-x/src")).unwrap();
+        fs::write(root.path().join(".worktrees/feat-x/src/lib.rs"), "fn main() {}").unwrap();
+
+        assert_eq!(resolve(root.path(), ".worktrees"), Err(GuardError::DeniedNoise));
+        assert_eq!(
+            resolve(root.path(), ".worktrees/feat-x/src/lib.rs"),
+            Err(GuardError::DeniedNoise)
+        );
+
+        // The accepted cost, asserted rather than assumed: SD-5 knowingly removes
+        // worktrees from /tree and /file, which the Explorer consumes. Pinned here
+        // so it stays a decision rather than arriving later as a surprise report —
+        // the `env_example_no_longer_opens` precedent.
+        assert!(is_hidden_from_listings(".worktrees"));
     }
 }
