@@ -122,11 +122,23 @@ pub enum ProjectionError {
     /// moved under the boot event's feet. The caller (Task 11) re-records a
     /// fresh `boot` event; this function only detects the drift.
     BootDrift { path: String },
-    /// `data.path` could not be read at all — missing, permission-denied,
-    /// not valid UTF-8, or (deliberately folded into this same variant
-    /// rather than a separate `Escaped` case) it canonicalizes outside
-    /// `root`. A boot path has no legitimate reason to leave the workspace
-    /// root, so "escaped" and "unreadable" are one caller-visible outcome.
+    /// A declared boot file could not be read at all.
+    ///
+    /// **Defensive only since B-2, and a candidate for removal.** `read_boot`
+    /// now judges each file by comparing its *current* verdict against the
+    /// recorded one, and every way a file can fail to load — missing,
+    /// permission-denied, not valid UTF-8, canonicalizing outside `root` —
+    /// registers as a changed verdict, which is `BootDrift`. Drift heals
+    /// forward; this kills the turn. So the cases that used to arrive here now
+    /// arrive there, and a stream that would have been permanently dead
+    /// repairs itself instead.
+    ///
+    /// What remains is one branch that should be unreachable: a UTF-8 decode
+    /// failing after the same bytes already passed a UTF-8 check. Kept rather
+    /// than `unwrap`ped. Removing the variant means giving
+    /// `ProjectionError::Transient` its own machine code, since the two share
+    /// an arm in `loop_::project_healing` — a small change, but it renames a
+    /// user-visible string, so it is recorded here rather than slipped in.
     BootUnreadable { path: String },
     /// **DD-1.** The workspace manifests no longer hash to what the last
     /// standing `composition` event recorded — one was edited, created, or
@@ -358,6 +370,101 @@ fn render_tool_result(status: &str, body: &str, is_error: bool) -> String {
     }
 }
 
+/// One entry of a boot event's file list, as recorded.
+struct BootFile {
+    path: String,
+    /// Absent when the file was not on disk at record time (`present: false`).
+    sha256: Option<String>,
+}
+
+/// The recorded boot file list, accepting both shapes.
+///
+/// **Both, deliberately.** Every stream written before B-2 carries a single
+/// `{path, sha256}`, and a log that cannot project its own history is not an
+/// append-only log. The single-file form reads as a one-element list.
+fn boot_files(data: &serde_json::Value) -> Vec<BootFile> {
+    if let Some(files) = data.get("files").and_then(|f| f.as_array()) {
+        return files
+            .iter()
+            .map(|f| BootFile {
+                path: text_field(f, "path"),
+                sha256: match f.get("present").and_then(|p| p.as_bool()) {
+                    Some(false) => None,
+                    _ => Some(text_field(f, "sha256")),
+                },
+            })
+            .collect();
+    }
+    match data.get("path").and_then(|p| p.as_str()) {
+        Some(path) => vec![BootFile {
+            path: path.to_string(),
+            sha256: Some(text_field(data, "sha256")),
+        }],
+        None => Vec::new(),
+    }
+}
+
+/// **B-2.** Read a boot event's declared files and join them into one system
+/// prompt, in the order the manifest declared.
+///
+/// Files are joined with a blank line and **nothing else** — no path banners,
+/// no engine framing. This is identity prose, and interleaving machine markers
+/// through someone's principles changes how they read. The composition already
+/// tells a session where its operator lives if it wants to cite a source.
+///
+/// Returns `None` when nothing loaded, never `Some("")`: an empty system
+/// prompt is a shape the request builder must not emit, and "nothing loaded"
+/// is the same state as "nothing declared".
+fn read_boot(root: &Path, data: &serde_json::Value) -> Result<Option<String>, ProjectionError> {
+    let mut parts: Vec<String> = Vec::new();
+
+    for file in boot_files(data) {
+        let unreadable = || ProjectionError::BootUnreadable {
+            path: file.path.clone(),
+        };
+        let drifted = || ProjectionError::BootDrift {
+            path: file.path.clone(),
+        };
+
+        // What the file is RIGHT NOW, judged by exactly the rule the writer
+        // used: resolvable under root, readable, and valid UTF-8. Anything
+        // else is "not loadable", which is a state, not an error.
+        let current: Option<Vec<u8>> = resolve_boot_path(root, &file.path)
+            .ok()
+            .and_then(|resolved| std::fs::read(&resolved).ok())
+            .filter(|bytes| std::str::from_utf8(bytes).is_ok());
+
+        // **Drift is a changed verdict, not a changed file.** Comparing the
+        // recorded state against the current one handles all four cases with
+        // one rule — and getting this wrong is what an earlier draft did: it
+        // treated "recorded absent" as "must not exist", so a boot file that
+        // existed but was refused for being non-UTF-8 drifted on every
+        // projection, was repaired into a present entry, and then failed the
+        // turn on the decode. A file that BECOMES loadable is real drift; a
+        // file that was never loadable and still isn't has not changed.
+        match (&file.sha256, current) {
+            (Some(expected), Some(bytes)) if sha256_hex(&bytes) == *expected => {
+                parts.push(String::from_utf8(bytes).map_err(|_| unreadable())?);
+            }
+            (Some(_), Some(_)) => return Err(drifted()),
+            // Recorded present, no longer loadable — the file was deleted or
+            // broken under the session. Drift, so the repair re-records it
+            // absent and the stream keeps working.
+            (Some(_), None) => return Err(drifted()),
+            // Recorded absent and now loadable: an identity that GAINS a file
+            // changed as surely as one that edits a file.
+            (None, Some(_)) => return Err(drifted()),
+            (None, None) => continue,
+        }
+    }
+
+    Ok(if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    })
+}
+
 /// True when the manifests on disk no longer match what this `composition`
 /// event recorded — edited, created, or removed.
 ///
@@ -555,20 +662,7 @@ pub fn project_context(
             }
 
             "boot" => {
-                let path = text_field(&ev.data, "path");
-                let expected_sha = text_field(&ev.data, "sha256");
-                let resolved = resolve_boot_path(root, &path)?;
-                let bytes = std::fs::read(&resolved).map_err(|_| ProjectionError::BootUnreadable {
-                    path: path.clone(),
-                })?;
-                let actual_sha = sha256_hex(&bytes);
-                if actual_sha != expected_sha {
-                    return Err(ProjectionError::BootDrift { path });
-                }
-                let content = String::from_utf8(bytes).map_err(|_| ProjectionError::BootUnreadable {
-                    path: path.clone(),
-                })?;
-                system = Some(content);
+                system = read_boot(root, &ev.data)?;
             }
 
             // Superseded by a later composition — see `last_composition_id`.
@@ -859,6 +953,128 @@ mod tests {
         let turn = project_context(&events, dir.path()).expect("the stale b1 must not fail this projection");
 
         assert_eq!(turn.system.as_deref(), Some("# current boot content"));
+    }
+
+    // ---- B-2: an operator's boot is several declared files, in order ----
+
+    /// Write `files` into `dir` and return the `files` array a boot event
+    /// would carry for them, in the same order.
+    fn boot_files(dir: &Path, files: &[(&str, &str)]) -> serde_json::Value {
+        json!(files
+            .iter()
+            .map(|(name, body)| {
+                std::fs::write(dir.join(name), body).unwrap();
+                json!({ "path": name, "sha256": sha256_hex(body.as_bytes()), "present": true })
+            })
+            .collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_boot_event_listing_several_files_concatenates_them_in_declared_order() {
+        // Order is the declaration, and it is load-bearing twice: it is what
+        // the operator meant, and it is the prefix-cache order (stable first,
+        // so an edit late in the list invalidates less).
+        let dir = tempfile::tempdir().unwrap();
+        let files = boot_files(
+            dir.path(),
+            &[("principles.md", "# principles"), ("voice.md", "# voice")],
+        );
+
+        let events = vec![
+            ev(1, "b1", "boot", json!({ "files": files })),
+            ev(2, "u1", "user_message", json!({"text": "hi"})),
+        ];
+
+        let turn = project_context(&events, dir.path()).unwrap();
+        assert_eq!(turn.system.as_deref(), Some("# principles\n\n# voice"));
+    }
+
+    #[test]
+    fn a_single_file_boot_event_still_projects_exactly_as_before() {
+        // Every stream written before this change carries `{path, sha256}`.
+        // Refusing to read them back would make the log's own history
+        // unprojectable, which is the one thing an append-only log may not do.
+        let dir = tempfile::tempdir().unwrap();
+        let bytes: &[u8] = b"# the old shape";
+        std::fs::write(dir.path().join("boot.md"), bytes).unwrap();
+
+        let events = vec![ev(
+            1,
+            "b1",
+            "boot",
+            json!({"path": "boot.md", "sha256": sha256_hex(bytes)}),
+        )];
+
+        let turn = project_context(&events, dir.path()).unwrap();
+        assert_eq!(turn.system.as_deref(), Some("# the old shape"));
+    }
+
+    #[test]
+    fn one_moved_file_in_a_boot_list_is_drift_and_the_error_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = boot_files(
+            dir.path(),
+            &[("principles.md", "# principles"), ("voice.md", "# voice")],
+        );
+        std::fs::write(dir.path().join("voice.md"), "# voice, rewritten").unwrap();
+
+        let events = vec![ev(1, "b1", "boot", json!({ "files": files }))];
+
+        match project_context(&events, dir.path()) {
+            Err(ProjectionError::BootDrift { path }) => assert_eq!(path, "voice.md"),
+            other => panic!("expected drift naming voice.md, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_declared_boot_file_that_was_absent_is_recorded_absent_and_stays_skipped() {
+        // C-4: a declared path with nothing behind it is skipped, not an error
+        // — the same posture `protocol_sources.present` takes in the
+        // composition. Recording the absence is what keeps it visible; a boot
+        // that silently loads two of three files is the failure this avoids.
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = boot_files(dir.path(), &[("principles.md", "# principles")])
+            .as_array()
+            .unwrap()
+            .clone();
+        files.push(json!({ "path": "never-written.md", "present": false }));
+
+        let events = vec![ev(1, "b1", "boot", json!({ "files": files }))];
+
+        let turn = project_context(&events, dir.path()).unwrap();
+        assert_eq!(turn.system.as_deref(), Some("# principles"));
+    }
+
+    #[test]
+    fn a_file_that_appeared_where_one_was_recorded_absent_is_drift() {
+        // The other direction, and it matters: an identity that GAINS a file
+        // has changed as surely as one that edits a file, and a session going
+        // on without it is describing an operator that no longer exists.
+        let dir = tempfile::tempdir().unwrap();
+        let events = vec![ev(
+            1,
+            "b1",
+            "boot",
+            json!({ "files": [{ "path": "voice.md", "present": false }] }),
+        )];
+        std::fs::write(dir.path().join("voice.md"), "# voice, written since").unwrap();
+
+        assert!(matches!(
+            project_context(&events, dir.path()),
+            Err(ProjectionError::BootDrift { .. })
+        ));
+    }
+
+    #[test]
+    fn a_boot_event_with_no_readable_files_sets_no_system_prompt() {
+        // Not an empty string: an empty system prompt is a shape the request
+        // builder must not emit, and "nothing loaded" is the same state as
+        // "nothing declared".
+        let dir = tempfile::tempdir().unwrap();
+        let events = vec![ev(1, "b1", "boot", json!({ "files": [] }))];
+
+        let turn = project_context(&events, dir.path()).unwrap();
+        assert_eq!(turn.system, None);
     }
 
     // ---- DD-1: the composition reaches a session as its own durable event ----
@@ -1436,7 +1652,20 @@ mod tests {
     }
 
     #[test]
-    fn boot_path_escaping_root_is_boot_unreadable() {
+    fn boot_path_escaping_root_never_loads_and_heals_instead_of_killing_the_stream() {
+        // **Changed behaviour, recorded rather than slipped in.** This used to
+        // be `BootUnreadable`, which fails the turn — so a stream carrying an
+        // escaping boot path was permanently dead, every turn, forever. Under
+        // B-2's verdict comparison it is drift instead: the repair re-records
+        // the path absent, the projection skips it, and the session continues
+        // with no system prompt.
+        //
+        // The file is not loaded either way, so nothing is loosened. What
+        // changes is that a misconfiguration stops being fatal, which is the
+        // posture this engine already takes everywhere else — an instance that
+        // works without identity beats one that cannot run. The absence is
+        // recorded in the log rather than only shouted at the turn, so it is
+        // still visible to the client and greppable.
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("secret.md"), b"nope").unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -1453,7 +1682,10 @@ mod tests {
 
         let err = project_context(&events, root.path()).unwrap_err();
 
-        assert!(matches!(err, ProjectionError::BootUnreadable { .. }));
+        assert!(
+            matches!(err, ProjectionError::BootDrift { .. }),
+            "escaping paths heal forward now: {err:?}"
+        );
     }
 
     #[test]

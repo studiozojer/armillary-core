@@ -111,101 +111,140 @@ fn attach_info(store: &LogStore, id: &str) -> Result<AttachInfo, SessionError> {
     })
 }
 
-/// Appends the router's `boot` event, or logs and skips.
+/// Hash one declared boot file, report it absent, or refuse the declaration.
 ///
-/// **Skip, never fail.** An instance that works without identity beats an
-/// instance that cannot be created — the same posture as `KeylessProvider`
-/// (the engine serves regardless; you discover the gap at first use). The
-/// accepted cost, recorded in the design: a misconfigured boot path is
-/// invisible from the phone, indistinguishable from having declared none.
-/// Phase 2 makes it a durable event.
+/// **Skip-never-fail, one file at a time.** A workspace where one identity file
+/// was renamed still gets a session, and the absence is *recorded* so the
+/// projection can see it and a human can grep it. Silently loading two of three
+/// files is the failure this shape exists to avoid.
 ///
-/// Reuses `projection::resolve_boot_path` rather than re-deriving root
-/// containment — that function is `pub(crate)` for exactly this reason, so what
-/// this call site accepts is exactly what the projection will later accept.
+/// Three outcomes, and the split between the last two is load-bearing:
 ///
-/// `resolve_boot_path` is NOT a full path guard, and this function must not be
-/// read as inheriting one. All it does is `root.join(rel)`, `canonicalize`, and
-/// `starts_with(root)`. Because `Path::join` with an absolute argument *replaces*
-/// the base, an absolute path that happens to sit inside root canonicalizes to
-/// something under root and passes. That is precisely why the caller-side
-/// absolute-path refusal below exists — it is the only thing rejecting an
-/// absolute `[router] boot`, and any future caller of `resolve_boot_path` needs
-/// its own. (`guard::resolve` is the resolver that does reject absolute paths and
-/// `..` components before canonicalizing; unifying the three resolvers on it is
-/// parked for Phase 2.)
-///
-/// Mirrors `loop_::rerecord_boot`'s shape (resolve off-thread, then
-/// `tokio::fs::read`) since both call sites read the same kind of file for
-/// the same reason.
-async fn append_boot_event(state: &SharedState, stream: &str, rel: &str) {
-    // `constitution/composition.md` (Task 1) documents `[router] boot` as a
-    // path RELATIVE to root. An absolute path that happens to sit inside
-    // root would still pass `resolve_boot_path`'s containment check below —
-    // and then get written verbatim into a durable, portable log, where it
-    // would break on any machine whose root sits somewhere else. Refused
-    // rather than silently relativized (e.g. via `strip_prefix`): rewriting
-    // it would hide a misconfiguration instead of surfacing it.
+/// - **Loadable** → `{path, sha256, present: true}`.
+/// - **Declared fine but not loadable right now** (missing, unreadable, not
+///   UTF-8) → `{path, present: false}`. Recorded, and re-checked every
+///   projection, because a file that becomes loadable is real drift.
+/// - **A malformed declaration** (absolute, or escaping the root) → `None`,
+///   recorded nowhere. Nothing on disk can make it valid, so there is nothing
+///   to re-check; recording it absent would make the projection drift on it
+///   forever. This is a manifest bug, and the warning is the whole remedy.
+async fn weigh_boot_file(root: &std::path::Path, rel: &str) -> Option<serde_json::Value> {
+    let malformed = |why: &str| -> Option<serde_json::Value> {
+        eprintln!("warning: boot file {rel:?} {why} — not recorded (fix the manifest)");
+        None
+    };
+    let absent = |why: &str| {
+        eprintln!("warning: boot file {rel:?} {why} — recorded absent, not loaded");
+        Some(serde_json::json!({ "path": rel, "present": false }))
+    };
+
+    // Documented as RELATIVE to root. An absolute path that happens to sit
+    // inside root would pass the containment check below and then be written
+    // verbatim into a durable, portable log, breaking on any machine whose
+    // root sits elsewhere. Refused rather than silently relativized —
+    // rewriting it would hide the misconfiguration instead of surfacing it.
     if std::path::Path::new(rel).is_absolute() {
-        eprintln!(
-            "warning: [router] boot = {rel:?} is an absolute path, but this key is documented \
-             as relative to the workspace root — creating instance {stream} with no boot event \
-             (it will have no system prompt)"
-        );
-        return;
+        return malformed("is absolute, and this key is documented as relative to the root");
     }
 
-    let root = state.root.clone();
-    let rel_owned = rel.to_string();
+    let (root_owned, rel_owned) = (root.to_path_buf(), rel.to_string());
     let resolved = match tokio::task::spawn_blocking(move || {
-        crate::projection::resolve_boot_path(&root, &rel_owned)
+        crate::projection::resolve_boot_path(&root_owned, &rel_owned)
     })
     .await
     {
         Ok(Ok(path)) => path,
-        _ => {
-            eprintln!(
-                "warning: [router] boot = {rel:?} cannot be resolved (missing, or outside the \
-                 workspace root) — creating instance {stream} with no boot event (it will have \
-                 no system prompt)"
-            );
-            return;
-        }
+        // Conflated on purpose, and the conflation costs nothing: a path that
+        // escaped the root is malformed, a path that is merely missing is
+        // absent, and `resolve_boot_path` cannot tell them apart. Recording it
+        // absent is the safe reading of the ambiguity — an escaping path
+        // cannot become loadable through the resolver, so it never drifts.
+        _ => return absent("cannot be resolved (missing, or outside the workspace root)"),
     };
 
-    let bytes = match tokio::fs::read(&resolved).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            eprintln!(
-                "warning: [router] boot = {rel:?} is unreadable ({e}) — creating instance \
-                 {stream} with no boot event (it will have no system prompt)"
-            );
-            return;
-        }
+    let Ok(bytes) = tokio::fs::read(&resolved).await else {
+        return absent("is unreadable");
     };
 
-    // A non-UTF-8 boot file must never be appended: `projection.rs`'s "boot"
-    // arm decodes the bytes with `String::from_utf8`, and a decode failure
-    // there surfaces as `ProjectionError::BootUnreadable`, which
-    // `loop_::run_turn` routes to `fail_turn(..., "boot_unreadable", ...)` —
-    // NOT to the drift-recovery branch (only a SHA mismatch on an
-    // already-recorded event re-records). Appending an event that can never
-    // be read back would turn a benign misconfiguration into every future
-    // turn on this stream failing forever — the exact inversion of
-    // skip-never-fail this function exists to avoid.
+    // A non-UTF-8 boot file must never be recorded present: the projection
+    // decodes with `String::from_utf8`, and a failure there surfaces as
+    // `BootUnreadable`, which `run_turn` routes to `fail_turn` — NOT to
+    // drift recovery, which only fires on a SHA mismatch. Recording bytes
+    // that can never be read back would turn a benign misconfiguration into
+    // every future turn on this stream failing forever.
     if std::str::from_utf8(&bytes).is_err() {
-        eprintln!(
-            "warning: [router] boot = {rel:?} is not valid UTF-8 — creating instance {stream} \
-             with no boot event (appending it would make every turn on this stream fail)"
-        );
+        return absent("is not valid UTF-8");
+    }
+
+    Some(serde_json::json!({
+        "path": rel,
+        "sha256": crate::hash::sha256_hex(&bytes),
+        "present": true,
+    }))
+}
+
+/// **B-2 — boot the summoned operator's own declared files.**
+///
+/// The ordered list is the router's own `boot` (if declared) followed by the
+/// summoned operator's, and order is load-bearing: it is what the manifest
+/// meant, and it is prefix-cache order, where an edit late in the list
+/// invalidates less than one early.
+///
+/// **The declaration is read once, at instance creation, and then fixed.**
+/// Editing an operator's `boot` list mid-session does not re-boot a running
+/// instance — it takes effect on the next one. A session keeps the identity it
+/// booted with. (Editing a boot *file* is different and IS picked up: that is
+/// `BootDrift`, and the repair re-hashes the same declared paths.)
+///
+/// Reuses `projection::resolve_boot_path` rather than re-deriving root
+/// containment, so what this accepts is exactly what the projection will later
+/// accept. That function is NOT a full path guard — see its own docs and
+/// `guard.rs`'s TRIPWIRE — which is why `weigh_boot_file` refuses absolute
+/// paths itself. These paths come from a manifest, never from a client.
+async fn append_boot_event(state: &SharedState, stream: &str, operator: Option<&str>) {
+    let mut declared: Vec<String> = Vec::new();
+    if let Some(rel) = state.boot.as_deref() {
+        declared.push(rel.to_string());
+    }
+
+    if let Some(name) = operator {
+        let root = state.root.clone();
+        // A second parse of the manifests, alongside the composition event's.
+        // Two small reads; sharing one parse would mean threading a
+        // `Composition` through both writers for a race the composition's own
+        // per-turn drift check already catches.
+        if let Ok(composition) =
+            tokio::task::spawn_blocking(move || armillary_composition::parse_workspace(&root)).await
+        {
+            if let Ok(op) = composition
+                .map(|c| c.operators.into_iter().find(|o| o.name == name))
+            {
+                declared.extend(op.and_then(|o| o.boot).unwrap_or_default());
+            }
+        }
+    }
+
+    // C-4: nothing declared means no boot event and no system prompt. Not an
+    // error — a bare clone is a working host.
+    if declared.is_empty() {
         return;
     }
 
-    let sha256 = crate::hash::sha256_hex(&bytes);
+    let mut files = Vec::with_capacity(declared.len());
+    for rel in &declared {
+        if let Some(entry) = weigh_boot_file(&state.root, rel).await {
+            files.push(entry);
+        }
+    }
+
+    // Every declared path was malformed, so there is nothing to record and
+    // nothing a later projection could re-check.
+    if files.is_empty() {
+        return;
+    }
 
     let sessions = state.sessions.clone();
     let stream_owned = stream.to_string();
-    let path_for_event = rel.to_string();
     let appended = tokio::task::spawn_blocking(move || {
         sessions.append(
             &stream_owned,
@@ -215,7 +254,7 @@ async fn append_boot_event(state: &SharedState, stream: &str, rel: &str) {
                     instance: None,
                 },
                 event_type: "boot".to_string(),
-                data: serde_json::json!({ "path": path_for_event, "sha256": sha256 }),
+                data: serde_json::json!({ "files": files }),
             },
         )
     })
@@ -286,6 +325,9 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<Instance>), (StatusCode, String)> {
     let sessions = state.sessions.clone();
     let operator = body.operator;
+    // `operator` is moved into the `instance_created` payload below; B-2 needs
+    // the name again afterwards to resolve that operator's declared boot.
+    let operator_name = operator.clone();
     let id = uuid::Uuid::new_v4().to_string();
     let started_at = humantime::format_rfc3339_millis(SystemTime::now()).to_string();
 
@@ -311,9 +353,11 @@ pub async fn create(
     // a stream's first event to be instance_created, and list_instances skips
     // any stream where it is not. Boot-first would make every instance
     // invisible to the list screen.
-    if let Some(rel) = state.boot.as_deref() {
-        append_boot_event(&state, &id, rel).await;
-    }
+    // B-2: which files boot depends on WHO was summoned, so this is no longer
+    // gated on `state.boot` alone — an operator can declare a boot where the
+    // router declares none. The function itself is presence-gated and returns
+    // without writing when nothing is declared either way.
+    append_boot_event(&state, &id, operator_name.as_deref()).await;
 
     // DD-1, and after boot for the same reason boot comes after
     // instance_created: the earlier events' seq numbers are documented and

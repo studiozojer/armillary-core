@@ -290,4 +290,105 @@ boot = "getting-started.md"
         assert_eq!(merged.router.boot.as_deref(), Some("getting-started.md"));
         assert_eq!(merged.router.contains, vec!["CLAUDE.md"]);
     }
+
+    // ---- B-2: an operator declares its own boot surface ----
+
+    #[test]
+    fn an_operator_declares_the_files_that_constitute_its_identity() {
+        // Declared, not conventional. A rule like "always load
+        // `<path>/CLAUDE.md`" is already wrong in this workspace: ariadne's
+        // manifest entry says outright that she has no CLAUDE.md and her boot
+        // surface is `self.md`.
+        let c = parse_manifest_str(
+            "[[operators]]\nname = \"tycho\"\npath = \"operators/tycho\"\n\
+             boot = [\"operators/tycho/principles.md\", \"operators/tycho/CLAUDE.md\"]\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            c.operators[0].boot,
+            Some(vec![
+                "operators/tycho/principles.md".to_string(),
+                "operators/tycho/CLAUDE.md".to_string(),
+            ]),
+            "order is the declaration — stable-first is the caller's to honour"
+        );
+    }
+
+    #[test]
+    fn an_operator_without_a_declared_boot_is_not_an_error() {
+        // C-4 throughout. Most operators will not declare one, and an engine
+        // that cannot inject a system prompt ignores the field entirely.
+        let c = parse_manifest_str(
+            "[[operators]]\nname = \"leavitt\"\npath = \"operators/leavitt\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.operators[0].boot, None);
+    }
+
+    #[test]
+    fn an_unknown_field_on_a_module_survives_instead_of_vanishing() {
+        // C-5, and the gap that made this necessary: `Module` had no `extra`
+        // and no `deny_unknown_fields`, so serde's default silently DROPPED
+        // anything it did not recognise. Writing `boot = [...]` on an operator
+        // before the engine understood it would have parsed clean, done
+        // nothing, and said nothing — the exact silent-drop class this
+        // codebase keeps closing. `Protocol` and `Router` already carry
+        // `extra` for this reason; `Module` did not.
+        let c = parse_manifest_str(
+            "[[repos]]\nname = \"r\"\npath = \"p\"\nsomething_new = \"kept\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            c.repos[0].extra.get("something_new").and_then(|v| v.as_str()),
+            Some("kept")
+        );
+    }
+
+    #[test]
+    fn boot_rides_on_the_operators_single_declaration_because_a_second_one_is_an_error() {
+        // C-6: a `name` collision within a section is an ERROR, across the
+        // manifest pair as much as within one file. So there is no "declare the
+        // operator publicly, add its boot in the overlay" shape — an engine
+        // MUST refuse rather than silently override. Boot goes wherever the
+        // operator itself is declared, which in a real deployment is the
+        // private overlay, where the paths belong anyway.
+        let base = parse_manifest_str(
+            "[[operators]]\nname = \"tycho\"\npath = \"operators/tycho\"\n",
+        )
+        .unwrap();
+        let overlay = parse_manifest_str(
+            "[[operators]]\nname = \"tycho\"\npath = \"operators/tycho\"\n\
+             boot = [\"operators/tycho/self.md\"]\n",
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                crate::merge(base, overlay),
+                Err(CompositionError::NameCollision { .. })
+            ),
+            "silently overriding an operator's boot is exactly what C-6 forbids"
+        );
+    }
+
+    #[test]
+    fn an_operator_declared_only_in_the_overlay_carries_its_boot_through() {
+        // The real deployment shape: `modules.toml` ships commented-out
+        // examples and `modules.local.toml` carries every real entry.
+        let base = parse_manifest_str("[router]\ncontains = [\"CLAUDE.md\"]\n").unwrap();
+        let overlay = parse_manifest_str(
+            "[[operators]]\nname = \"tycho\"\npath = \"operators/tycho\"\n\
+             boot = [\"operators/tycho/self.md\"]\n",
+        )
+        .unwrap();
+
+        let merged = crate::merge(base, overlay).unwrap();
+        assert_eq!(
+            merged.operators[0].boot,
+            Some(vec!["operators/tycho/self.md".to_string()])
+        );
+        assert_eq!(merged.router.contains, vec!["CLAUDE.md"]);
+    }
 }

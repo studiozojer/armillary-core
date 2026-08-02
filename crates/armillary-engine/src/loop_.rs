@@ -181,38 +181,61 @@ async fn fail_turn(
     }
 }
 
-/// Re-records a fresh `boot` event on `BootDrift`: re-reads the SAME `path`
-/// the drifted event pointed to (reusing `projection::resolve_boot_path` so
-/// the root-containment check is not re-derived at a second call site),
-/// hashes the current bytes, and appends `{ path, sha256 }` with `actor:
-/// system` — the disk content is re-affirmed as current truth. Returns the
-/// brief's `boot_unreadable` machine code on any failure along the way (an
-/// unreadable file, or the append itself failing — both leave the turn with
-/// no system prompt it can trust, so both fold into the same named code).
+/// Re-records a fresh `boot` event on `BootDrift`: re-reads the **same declared
+/// paths** the drifted event listed, re-hashes their current bytes, and appends
+/// a new `{ files: [...] }` event with `actor: system` — the disk content is
+/// re-affirmed as current truth. I-1: the correction is a new event, never an
+/// edit. Returns `boot_unreadable` on any failure (an unreadable file, or the
+/// append itself failing — both leave the turn with no system prompt it can
+/// trust, so both fold into the same named code).
+///
+/// **The declared paths come from the drifted event, not from the manifest.**
+/// A boot *file* changing is drift and is repaired here; a boot *declaration*
+/// changing is a composition change, and a running instance keeps the identity
+/// it booted with. Reading the manifest here would silently re-scope a live
+/// session's identity mid-turn.
+///
+/// A path recorded absent is re-checked and may now be present — an identity
+/// that gained a file changed as surely as one that edited a file, and the
+/// projection treats both as drift, so both must be repairable here.
 ///
 /// **Deliberately lacks two guards that `routes::instances::append_boot_event`
 /// has** — the absolute-path refusal and the UTF-8 check — and the asymmetry is
 /// reasoned, not forgotten. This function never introduces a path: it can only
-/// re-affirm a path some earlier event already recorded, so an absolute path here
+/// re-affirm one some earlier event already recorded, so an absolute path here
 /// was already durable and refusing it now would strand the stream rather than
 /// clean it. And a non-UTF-8 boot file fails this turn either way — the
-/// re-projection immediately below returns `BootUnreadable` on the decode — so
-/// the guard would buy nothing except sparing the log one junk event. Adding the
-/// guards is a Phase 2 semantics decision (see the design doc's parked items,
-/// which also covers whether re-recording should follow the *current* `[router]
-/// boot` declaration rather than the recorded path), not a fix to slip in here.
-async fn rerecord_boot(state: &SharedState, stream: &str, path: &str) -> Result<(), &'static str> {
-    let root = state.root.clone();
-    let path_owned = path.to_string();
-    let resolved = tokio::task::spawn_blocking(move || {
-        crate::projection::resolve_boot_path(&root, &path_owned)
-    })
-    .await
-    .map_err(|_| "boot_unreadable")?
-    .map_err(|_| "boot_unreadable")?;
+/// re-projection immediately below returns `BootUnreadable` on the decode.
+async fn rerecord_boot(
+    state: &SharedState,
+    stream: &str,
+    paths: &[String],
+) -> Result<(), &'static str> {
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let root = state.root.clone();
+        let path_owned = path.clone();
+        let resolved = tokio::task::spawn_blocking(move || {
+            crate::projection::resolve_boot_path(&root, &path_owned)
+        })
+        .await
+        .map_err(|_| "boot_unreadable")?;
 
-    let bytes = tokio::fs::read(&resolved).await.map_err(|_| "boot_unreadable")?;
-    let sha256 = crate::hash::sha256_hex(&bytes);
+        files.push(match resolved {
+            Ok(resolved) => match tokio::fs::read(&resolved).await {
+                Ok(bytes) => serde_json::json!({
+                    "path": path,
+                    "sha256": crate::hash::sha256_hex(&bytes),
+                    "present": true,
+                }),
+                // Recorded absent rather than failing the turn: a renamed
+                // identity file must not brick a running session, and the
+                // absence is now visible in the log.
+                Err(_) => serde_json::json!({ "path": path, "present": false }),
+            },
+            Err(_) => serde_json::json!({ "path": path, "present": false }),
+        });
+    }
 
     let ev = NewEvent {
         actor: Actor {
@@ -220,12 +243,35 @@ async fn rerecord_boot(state: &SharedState, stream: &str, path: &str) -> Result<
             instance: None,
         },
         event_type: "boot".to_string(),
-        data: serde_json::json!({ "path": path, "sha256": sha256 }),
+        data: serde_json::json!({ "files": files }),
     };
     append_blocking(&state.sessions, stream, ev)
         .await
         .map_err(|_| "boot_unreadable")?;
     Ok(())
+}
+
+/// The paths the last standing `boot` event declared, in order.
+///
+/// Accepts both shapes for the same reason the projection does: a stream
+/// written before B-2 carries a single `{path, sha256}`, and the repair must
+/// work on history it did not write.
+fn declared_boot_paths(events: &[crate::log::envelope::EventEnvelope]) -> Vec<String> {
+    let Some(ev) = events.iter().rfind(|e| e.event_type == "boot") else {
+        return Vec::new();
+    };
+    if let Some(files) = ev.data.get("files").and_then(|f| f.as_array()) {
+        return files
+            .iter()
+            .filter_map(|f| f.get("path").and_then(|p| p.as_str()))
+            .map(str::to_string)
+            .collect();
+    }
+    ev.data
+        .get("path")
+        .and_then(|p| p.as_str())
+        .map(|p| vec![p.to_string()])
+        .unwrap_or_default()
 }
 
 /// Runs one turn to completion (or interruption, or failure), then clears
@@ -612,8 +658,19 @@ async fn project_healing(
         match project_context(&events, &state.root) {
             Ok(turn) => return Some(turn),
 
+            // `path` names the file that moved, which is the diagnostic. The
+            // repair re-derives the WHOLE declared list — a boot event is one
+            // event covering N files, so re-recording half of it would leave
+            // the stream projecting a system prompt assembled from two
+            // different moments.
             Err(ProjectionError::BootDrift { path }) => {
-                if let Err(code) = rerecord_boot(state, stream, &path).await {
+                let paths = declared_boot_paths(&events);
+                if paths.is_empty() {
+                    eprintln!("drift on {path:?} but no boot event declares it on {stream:?}");
+                    fail_turn(&state.sessions, stream, operator, generation, "boot_unreadable", &state.model.model).await;
+                    return None;
+                }
+                if let Err(code) = rerecord_boot(state, stream, &paths).await {
                     fail_turn(&state.sessions, stream, operator, generation, code, &state.model.model).await;
                     return None;
                 }
