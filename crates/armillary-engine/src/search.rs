@@ -178,6 +178,35 @@ mod tests {
     }
 
     #[test]
+    fn two_declarations_of_the_same_path_collapse_to_one_root() {
+        // MUTATION-CHECKED. The manifest parser rejects a *name* collision
+        // within a section (C-6) but a *path* collision across sections is a
+        // legal manifest — an operator entry and a repo entry can both point
+        // at `repos/engine` under different names. Without `push_root`'s
+        // `contains` check, that one directory would surface as two roots,
+        // and every caller that walks `search_roots` (a search tool grepping
+        // each root, in particular) would report every match in it twice.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("modules.toml"), "").unwrap();
+        fs::write(
+            dir.path().join("modules.local.toml"),
+            "[[operators]]\nname = \"engine-operator\"\npath = \"repos/engine\"\n\n\
+             [[repos]]\nname = \"engine\"\npath = \"repos/engine\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("repos/engine")).unwrap();
+        fs::write(dir.path().join("repos/engine/lib.rs"), "// needle\n").unwrap();
+
+        let roots = search_roots(dir.path()).unwrap();
+        let hits = roots.iter().filter(|p| p.ends_with("repos/engine")).count();
+
+        assert_eq!(
+            hits, 1,
+            "one path declared under two names must be one root, not two: {roots:?}"
+        );
+    }
+
+    #[test]
     fn an_empty_path_argument_means_the_default_domain_not_the_whole_disk() {
         // `list_directory` uses "" for the workspace root, so a model has
         // learned that idiom and will send it here meaning "no scope". If ""
