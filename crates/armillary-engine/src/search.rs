@@ -12,6 +12,22 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
+/// The roots a default-domain search walks, with the two kinds counted apart.
+///
+/// **The counts are separate because the footer names them separately.** A
+/// root is either a declared module (operator, commons, repo) or a file named
+/// by `[router] contains`, and `get_composition` reports only the first kind.
+/// Rendering one total under the word "modules" gave a model two
+/// engine-authored answers to the same question — 23 from `get_composition`,
+/// 30 from `search` — with nothing to reconcile them.
+pub(crate) struct Roots {
+    pub paths: Vec<PathBuf>,
+    /// How many of `paths` came from a declared operator, commons, or repo.
+    pub modules: usize,
+    /// How many came from `[router] contains`.
+    pub router_files: usize,
+}
+
 /// The directories and files a default-domain search walks.
 ///
 /// **C-1 as running code:** declared, not discovered. Nothing here enumerates
@@ -23,11 +39,11 @@ use walkdir::WalkDir;
 /// judges the canonical result. A path that escapes, is denied, or is simply
 /// not on this machine is **skipped rather than fatal** (C-4): a manifest
 /// naming a repo that was never cloned here is the ordinary case.
-pub(crate) fn search_roots(root: &Path) -> Result<Vec<PathBuf>, ToolError> {
+pub(crate) fn search_roots(root: &Path) -> Result<Roots, ToolError> {
     let composition = armillary_composition::parse_workspace(root)
         .map_err(|e| ToolError::new("composition_unreadable", e.to_string()))?;
 
-    let mut out: Vec<PathBuf> = Vec::new();
+    let mut out = Roots { paths: Vec::new(), modules: 0, router_files: 0 };
 
     for m in composition
         .operators
@@ -35,29 +51,52 @@ pub(crate) fn search_roots(root: &Path) -> Result<Vec<PathBuf>, ToolError> {
         .chain(&composition.commons)
         .chain(&composition.repos)
     {
-        push_root(root, &m.path, &mut out);
+        if push_root(root, &m.path, &mut out.paths) {
+            out.modules += 1;
+        }
     }
     for f in &composition.router.contains {
-        push_root(root, f, &mut out);
+        if push_root(root, f, &mut out.paths) {
+            out.router_files += 1;
+        }
     }
 
     Ok(out)
 }
 
-/// Resolve one declared path and add it if it survives the guard.
+/// Resolve one declared path and add it if it survives the guard. Returns
+/// whether it was actually added, so the caller's tally counts roots that
+/// exist rather than declarations that were made.
 ///
 /// A free function rather than a closure over `out` on purpose: a closure
 /// holding `&mut out` across both loops and then returning `out` is a
 /// borrow-checker argument nobody needs to have.
-fn push_root(root: &Path, rel: &str, out: &mut Vec<PathBuf>) {
+fn push_root(root: &Path, rel: &str, out: &mut Vec<PathBuf>) -> bool {
     if let Ok(p) = crate::guard::resolve(root, rel) {
         // Canonical, so two declarations reaching the same directory through
         // different spellings collapse to one root rather than producing
         // every match twice.
         if !out.contains(&p) {
             out.push(p);
+            return true;
         }
     }
+    false
+}
+
+/// How a call's domain was arrived at — which is what its footer must say.
+#[derive(Debug)]
+pub(crate) enum Scope {
+    /// The caller named a path; the domain is exactly that one.
+    Explicit,
+    /// The default domain: what the manifest declares.
+    Composed { modules: usize, router_files: usize },
+}
+
+#[derive(Debug)]
+pub(crate) struct Domain {
+    pub paths: Vec<PathBuf>,
+    pub scope: Scope,
 }
 
 /// The domain for one call: the composed roots, or the one path the caller named.
@@ -70,13 +109,22 @@ fn push_root(root: &Path, rel: &str, out: &mut Vec<PathBuf>) {
 /// uses `""` for the workspace root, so a model has learned that spelling and
 /// will send it here meaning "no scope"; resolving it to the root would
 /// silently search every external clone — the opposite of the request.
-pub(crate) fn resolve_domain(
-    root: &Path,
-    path: Option<&str>,
-) -> Result<(Vec<PathBuf>, bool), ToolError> {
+pub(crate) fn resolve_domain(root: &Path, path: Option<&str>) -> Result<Domain, ToolError> {
     match path {
-        Some(p) if !p.is_empty() => Ok((vec![crate::guard::resolve(root, p)?], true)),
-        _ => Ok((search_roots(root)?, false)),
+        Some(p) if !p.is_empty() => Ok(Domain {
+            paths: vec![crate::guard::resolve(root, p)?],
+            scope: Scope::Explicit,
+        }),
+        _ => {
+            let roots = search_roots(root)?;
+            Ok(Domain {
+                paths: roots.paths,
+                scope: Scope::Composed {
+                    modules: roots.modules,
+                    router_files: roots.router_files,
+                },
+            })
+        }
     }
 }
 
@@ -92,10 +140,23 @@ pub(crate) const SEARCH_BUDGET: Duration = Duration::from_secs(10);
 pub(crate) struct WalkStats {
     /// Files handed to `visit`: everything under the roots that survived the
     /// **safety** gate. Deliberately not narrowed by `is_openable` — see the
-    /// note below — so a caller that opens files must subtract its own
+    /// note on `walk` — so a caller that opens files must subtract its own
     /// refusals before printing this next to the word "searched".
     pub files: usize,
     pub timed_out: bool,
+    /// The visitor ended the walk before the roots were exhausted.
+    pub stopped_short: bool,
+}
+
+impl WalkStats {
+    /// Whether `files` is the whole domain or merely how far we got.
+    ///
+    /// A count taken from an interrupted walk is not a denominator, and a
+    /// footer that prints it under the word "searched" invites it to be read
+    /// as one.
+    pub fn complete(&self) -> bool {
+        !self.timed_out && !self.stopped_short
+    }
 }
 
 /// Walk the search roots, handing every file the safety gate allows to `visit`.
@@ -112,14 +173,14 @@ pub(crate) struct WalkStats {
 /// it decides whether bytes may be handed out — and it lives in the visitor of
 /// whichever caller actually reads a file. `guard::is_openable`'s own doc says
 /// this: it governs opening, and hiding what cannot be opened from a *listing*
-/// reintroduces the projection it was changed to remove. `find_files` is a
-/// listing; applying the content gate here made `find_files("**/*.png")` answer
-/// "there are none" about files sitting in plain view, under a footer claiming
-/// thousands of files had been examined.
+/// reintroduces the projection that gate was changed to remove. `find_files`
+/// is a listing; applying the content gate here made `find_files("**/*.png")`
+/// answer "there are none" about files sitting in plain view.
 ///
 /// **Entries are visited in sorted order** (`sort_by_file_name`), roots in
-/// declaration order. Without it the filesystem decides, so two identical calls
-/// could return different results and — once a cap bites — a different *set*.
+/// declaration order. Without it the filesystem decides, so two identical
+/// calls could return different results and — once a cap bites — a different
+/// *set*.
 ///
 /// **Symlinks are not followed.** Following one would risk a cycle, and — for
 /// the common case, a symlink whose target already sits inside a declared
@@ -140,7 +201,7 @@ pub(crate) fn walk(
     deadline: Instant,
     visit: &mut dyn FnMut(&Path, &str) -> bool,
 ) -> WalkStats {
-    let mut stats = WalkStats { files: 0, timed_out: false };
+    let mut stats = WalkStats { files: 0, timed_out: false, stopped_short: false };
 
     // Entries arrive from canonical roots, so the prefix stripped from them
     // must be canonical too — otherwise every relative path silently keeps a
@@ -180,6 +241,7 @@ pub(crate) fn walk(
             let rel = rel.to_string_lossy().to_string();
             stats.files += 1;
             if !visit(entry.path(), &rel) {
+                stats.stopped_short = true;
                 return stats;
             }
         }
@@ -194,6 +256,32 @@ pub(crate) fn walk(
 /// against a 200-character match window.
 pub(crate) const MAX_PATHS: usize = 100;
 
+/// Exclusions no `path` argument can lift.
+///
+/// **The distinction this draws is the only one that matters to the reader.**
+/// Undeclared content is *reachable if you name it*; these are *refused
+/// however you name them* — `guard::resolve` denies them at any depth, so
+/// `search("x", path="repos/engine/.worktrees/feat")` comes back
+/// `denied_noise`. The sentence this replaced lumped worktrees in with
+/// undeclared content and offered `path` as the recovery for both, which
+/// promised a repair the guard refuses. Worktrees are not undeclared at all:
+/// they sit *inside* declared roots and are excluded by a different mechanism.
+///
+/// Every name here is pinned to that behaviour by
+/// `the_note_promises_a_recovery_only_where_one_exists`.
+const NEVER_SEARCHED: &str = "Credentials, build and dependency trees \
+     (node_modules, target, .build), git worktrees (.worktrees), and the \
+     engine's own .armillary are never searched at any path — naming one is \
+     refused, not widened.";
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("{n} {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
 /// The sentence every result ends with, naming what was and was not searched.
 ///
 /// **The whole absence-vs-refusal lesson lives here.** SD-2 deliberately
@@ -201,15 +289,44 @@ pub(crate) const MAX_PATHS: usize = 100;
 /// empty workspace, and the model has no way to learn otherwise. The 2026-08-01
 /// sync work shipped the opposite of this — `verdict()` returned `current` for
 /// twenty-four repos having contacted nothing.
-fn domain_note(scoped: bool, roots: usize, files: usize) -> String {
-    if scoped {
-        format!("[searched 1 path explicitly, {files} files]\n")
+///
+/// Three things it must get right, each of which it once got wrong:
+///
+/// - **The noun matches what is counted** — roots, split into modules and
+///   router files, because `get_composition` counts only the former.
+/// - **The verb matches how the walk ended.** `files` from an interrupted
+///   walk is how far we got, not the size of the domain.
+/// - **Both kinds of exclusion are named, and on the scoped path too.** Under
+///   an explicit `path` the guard still prunes credentials, `node_modules`,
+///   worktrees and the rest, so a scoped result that named nothing let
+///   `search("apiKey", path="repos/app")` render "not there" about an answer
+///   sitting in `node_modules`.
+fn domain_note(scope: &Scope, files: usize, complete: bool) -> String {
+    let where_ = match scope {
+        Scope::Explicit => "1 path named explicitly".to_string(),
+        Scope::Composed { modules, router_files } => format!(
+            "{} ({}, {})",
+            plural(modules + router_files, "declared root", "declared roots"),
+            plural(*modules, "module", "modules"),
+            plural(*router_files, "router file", "router files"),
+        ),
+    };
+
+    let head = if complete {
+        format!("searched {where_}, {}", plural(files, "file", "files"))
     } else {
         format!(
-            "[searched {roots} composed modules, {files} files. \
-             Undeclared content — repos/external/, worktrees — was not searched; \
-             pass `path` to search one directly.]\n"
+            "stopped early — {} walked so far across {where_}, which is not the size of the domain",
+            plural(files, "file", "files")
         )
+    };
+
+    match scope {
+        Scope::Explicit => format!("[{head}. {NEVER_SEARCHED}]\n"),
+        Scope::Composed { .. } => format!(
+            "[{head}. Content the manifest does not declare — repos/external/, for one — \
+             was not searched; pass `path` to search it directly. {NEVER_SEARCHED}]\n"
+        ),
     }
 }
 
@@ -218,8 +335,8 @@ fn domain_note(scoped: bool, roots: usize, files: usize) -> String {
 /// **A listing, not a read.** It opens nothing, so the content gate
 /// (`is_openable`) does not apply: a `.png` or a `.se1` matching the pattern is
 /// reported. The alternative — inheriting `search`'s gate because the two share
-/// a walker — made this verb answer "no files matching `**/*.png`" about files
-/// sitting in plain view.
+/// a walker — made this verb answer "no files matching `**/*.png`" under a
+/// footer claiming thousands of files were examined.
 pub(crate) fn find_files(
     root: &Path,
     pattern: &str,
@@ -229,12 +346,12 @@ pub(crate) fn find_files(
         .map_err(|e| ToolError::new("invalid_pattern", e.to_string()))?
         .compile_matcher();
 
-    let (roots, scoped) = resolve_domain(root, path)?;
+    let domain = resolve_domain(root, path)?;
     let deadline = Instant::now() + SEARCH_BUDGET;
 
     let mut found: Vec<String> = Vec::new();
     let mut capped = false;
-    let stats = walk(root, &roots, deadline, &mut |_abs, rel| {
+    let stats = walk(root, &domain.paths, deadline, &mut |_abs, rel| {
         if glob.is_match(rel) {
             found.push(rel.to_string());
             if found.len() >= MAX_PATHS {
@@ -258,8 +375,14 @@ pub(crate) fn find_files(
         }
     }
     if capped {
+        // Naming *which* paths survived, not just how many. They are the first
+        // hundred the walk reached — declared roots in manifest order, entries
+        // sorted within each — and the list is then sorted for display. A
+        // sorted list running `a…` to `z…` otherwise reads as complete.
         out.push_str(&format!(
-            "[stopped at {MAX_PATHS} paths; narrow with `path` or a tighter pattern]\n"
+            "[stopped at {MAX_PATHS} paths: the first {MAX_PATHS} the walk reached, \
+             sorted for display — not the alphabetically first {MAX_PATHS}, and not all \
+             that match. Narrow with `path` or a tighter pattern.]\n"
         ));
     }
     if stats.timed_out {
@@ -267,7 +390,7 @@ pub(crate) fn find_files(
     }
     // `stats.files` is exactly what this verb examined: every walked path was
     // tested against the glob, because nothing here refuses a file for its type.
-    out.push_str(&domain_note(scoped, roots.len(), stats.files));
+    out.push_str(&domain_note(&domain.scope, stats.files, stats.complete()));
     Ok(out)
 }
 
@@ -335,7 +458,7 @@ pub(crate) fn search(
         .build()
         .map_err(|e| ToolError::new("invalid_pattern", e.to_string()))?;
 
-    let (roots, scoped) = resolve_domain(root, path)?;
+    let domain = resolve_domain(root, path)?;
     let deadline = Instant::now() + SEARCH_BUDGET;
 
     let mut hits: Vec<(String, Vec<(usize, String)>)> = Vec::new();
@@ -343,8 +466,9 @@ pub(crate) fn search(
     let mut capped = false;
     let mut skipped = 0usize;
     let mut not_text = 0usize;
+    let mut per_file_capped = 0usize;
 
-    let stats = walk(root, &roots, deadline, &mut |abs, rel| {
+    let stats = walk(root, &domain.paths, deadline, &mut |abs, rel| {
         // **The content gate, and this is the only place it belongs.** `walk`
         // hands over every file the safety gate allows, because `find_files`
         // must list what it cannot open. This verb opens, so it refuses here —
@@ -372,13 +496,24 @@ pub(crate) fn search(
                 Ok(Some(line)) => {
                     lineno += 1;
                     if let Some(m) = re.find(&line.text) {
+                        // **The per-file cap is detected one match late, on
+                        // purpose.** It was the one cap that set nothing: a
+                        // file with thirty matches rendered five lines and was
+                        // byte-identical to a file containing exactly five. But
+                        // a notice raised at the fifth match would fire for a
+                        // file that has exactly five, making a complete result
+                        // read as a truncated one — the same collapse pointing
+                        // the other way. So the file is read until a *sixth*
+                        // match proves something is being withheld; that match
+                        // is neither rendered nor charged to the total.
+                        if per_file.len() == MAX_MATCHES_PER_FILE {
+                            per_file_capped += 1;
+                            break;
+                        }
                         per_file.push((lineno, window(&line.text, m.start(), m.end())));
                         total += 1;
                         if total >= MAX_MATCHES {
                             capped = true;
-                            break;
-                        }
-                        if per_file.len() >= MAX_MATCHES_PER_FILE {
                             break;
                         }
                     }
@@ -427,10 +562,18 @@ pub(crate) fn search(
             "[stopped at {MAX_MATCHES} matches; narrow with `path` or a tighter query]\n"
         ));
     }
+    if per_file_capped > 0 {
+        out.push_str(&format!(
+            "[{} had more than {MAX_MATCHES_PER_FILE} matches; only the first \
+             {MAX_MATCHES_PER_FILE} of each are shown — `read_file` the path, or narrow \
+             the query, to see the rest]\n",
+            plural(per_file_capped, "file", "files"),
+        ));
+    }
     if not_text > 0 {
         out.push_str(&format!(
-            "[{not_text} files not searched: the type is not served as text — \
-             `find_files` lists them]\n"
+            "[{} not searched: the type is not served as text — `find_files` lists them]\n",
+            plural(not_text, "file", "files"),
         ));
     }
     if skipped > 0 {
@@ -444,7 +587,7 @@ pub(crate) fn search(
     // exclusions it subtracts are each announced above, so the three tallies
     // add back up to what was walked.
     let searched = stats.files.saturating_sub(not_text + skipped);
-    out.push_str(&domain_note(scoped, roots.len(), searched));
+    out.push_str(&domain_note(&domain.scope, searched, stats.complete()));
     Ok(out)
 }
 
@@ -500,8 +643,29 @@ mod tests {
         let roots = search_roots(dir.path()).unwrap();
 
         assert_eq!(
-            rels(dir.path(), &roots),
+            rels(dir.path(), &roots.paths),
             vec!["CLAUDE.md", "operators/tycho", "repos/engine"]
+        );
+    }
+
+    #[test]
+    fn modules_and_router_files_are_counted_apart() {
+        // The footer used to print this total under the word "modules", which
+        // on the real workspace rendered "30 composed modules" while
+        // `get_composition` said 23 — two engine-authored answers to one
+        // question, with nothing to reconcile them. The counts are separate so
+        // the sentence can be true.
+        let dir = workspace();
+        let roots = search_roots(dir.path()).unwrap();
+
+        assert_eq!(roots.modules, 2, "tycho and engine; never-cloned is absent");
+        assert_eq!(roots.router_files, 1, "CLAUDE.md");
+        assert_eq!(roots.modules + roots.router_files, roots.paths.len());
+
+        let out = find_files(dir.path(), "**/*.nothing", None).unwrap();
+        assert!(
+            out.contains("3 declared roots (2 modules, 1 router file)"),
+            "the noun must match what is counted: {out}"
         );
     }
 
@@ -513,7 +677,7 @@ mod tests {
         let dir = workspace();
         let roots = search_roots(dir.path()).expect("an absent module must not fail enumeration");
 
-        assert!(!rels(dir.path(), &roots).iter().any(|r| r.contains("never-cloned")));
+        assert!(!rels(dir.path(), &roots.paths).iter().any(|r| r.contains("never-cloned")));
     }
 
     #[test]
@@ -525,7 +689,7 @@ mod tests {
         // proves the exclusion is a consequence of the manifest.
         let dir = workspace();
         assert!(
-            !rels(dir.path(), &search_roots(dir.path()).unwrap())
+            !rels(dir.path(), &search_roots(dir.path()).unwrap().paths)
                 .iter()
                 .any(|r| r.contains("external")),
             "undeclared content must not be a search root"
@@ -540,7 +704,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            rels(dir.path(), &search_roots(dir.path()).unwrap())
+            rels(dir.path(), &search_roots(dir.path()).unwrap().paths)
                 .iter()
                 .any(|r| r == "repos/external/opencode"),
             "a declared module must become a search root"
@@ -568,11 +732,16 @@ mod tests {
         fs::write(dir.path().join("repos/engine/lib.rs"), "// needle\n").unwrap();
 
         let roots = search_roots(dir.path()).unwrap();
-        let hits = roots.iter().filter(|p| p.ends_with("repos/engine")).count();
+        let hits = roots.paths.iter().filter(|p| p.ends_with("repos/engine")).count();
 
         assert_eq!(
             hits, 1,
-            "one path declared under two names must be one root, not two: {roots:?}"
+            "one path declared under two names must be one root, not two: {:?}",
+            roots.paths
+        );
+        assert_eq!(
+            roots.modules, 1,
+            "a collapsed duplicate must not be counted twice in the footer either"
         );
     }
 
@@ -583,11 +752,14 @@ mod tests {
         // resolved to the root, it would silently defeat SD-2 and search
         // every external clone — the opposite of what the model asked for.
         let dir = workspace();
-        let (roots, scoped) = resolve_domain(dir.path(), Some("")).unwrap();
+        let domain = resolve_domain(dir.path(), Some("")).unwrap();
 
-        assert!(!scoped, "\"\" must not count as an explicit scope");
+        assert!(
+            matches!(domain.scope, Scope::Composed { .. }),
+            "\"\" must not count as an explicit scope"
+        );
         assert_eq!(
-            rels(dir.path(), &roots),
+            rels(dir.path(), &domain.paths),
             vec!["CLAUDE.md", "operators/tycho", "repos/engine"]
         );
     }
@@ -597,10 +769,10 @@ mod tests {
         // SD-3, David's constraint: reachable when you are specifically
         // looking at it.
         let dir = workspace();
-        let (roots, scoped) = resolve_domain(dir.path(), Some("repos/external/opencode")).unwrap();
+        let domain = resolve_domain(dir.path(), Some("repos/external/opencode")).unwrap();
 
-        assert!(scoped);
-        assert_eq!(rels(dir.path(), &roots), vec!["repos/external/opencode"]);
+        assert!(matches!(domain.scope, Scope::Explicit));
+        assert_eq!(rels(dir.path(), &domain.paths), vec!["repos/external/opencode"]);
     }
 
     #[test]
@@ -617,7 +789,7 @@ mod tests {
         let mut seen = Vec::new();
         walk(
             dir,
-            &roots,
+            &roots.paths,
             Instant::now() + SEARCH_BUDGET,
             &mut |_abs, rel| {
                 seen.push(rel.to_string());
@@ -667,11 +839,11 @@ mod tests {
 
     #[test]
     fn the_walk_offers_every_file_the_safety_gate_allows_including_unopenable_types() {
-        // The content gate used to live here, and `find_files` inherited it by
-        // sharing the walker — so a `.png` sitting in plain view produced "no
-        // files matching `**/*.png`" under a footer claiming thousands of files
-        // were examined. `guard::is_openable`'s own doc draws this line: it
-        // governs opening, and hiding what cannot be opened from a listing
+        // C1. The content gate used to live here, and `find_files` inherited it
+        // by sharing the walker — so a `.png` sitting in plain view produced
+        // "no files matching `**/*.png`" under a footer claiming thousands of
+        // files were examined. `guard::is_openable`'s own doc draws this line:
+        // it governs opening, and hiding what cannot be opened from a listing
         // reintroduces the projection it was changed to remove.
         let dir = workspace();
         fs::write(dir.path().join("repos/engine/icon.png"), [0x89, 0x50]).unwrap();
@@ -685,9 +857,10 @@ mod tests {
 
     #[test]
     fn a_type_that_is_not_served_as_text_is_listed_but_never_read() {
-        // The other half: moving the gate must not let `search` open a `.png`.
-        // The two verbs now disagree on purpose — one lists, one reads — and the
-        // disagreement is stated in the result rather than left to be inferred.
+        // The other half of C1: moving the gate must not let `search` open a
+        // `.png`. The two verbs now disagree on purpose — one lists, one reads
+        // — and the disagreement is stated in the result rather than left for
+        // the model to infer.
         let dir = workspace();
         fs::write(dir.path().join("repos/engine/icon.png"), b"needle").unwrap();
         fs::write(dir.path().join("repos/engine/ephe.se1"), b"needle").unwrap();
@@ -709,9 +882,9 @@ mod tests {
 
     #[test]
     fn each_footer_counts_what_its_own_verb_actually_did() {
-        // The knock-on, and the reason it is pinned: `stats.files` now counts
-        // everything walked, so printing it beside "searched" would overstate
-        // what `search` read by exactly the files it refused to open.
+        // The knock-on from C1, and the reason it is pinned: `stats.files` now
+        // counts everything walked, so printing it beside "searched" would
+        // overstate what `search` read by exactly the files it refused to open.
         // `find_files` examined all five; `search` read three and says so about
         // the other two.
         let dir = workspace();
@@ -727,50 +900,33 @@ mod tests {
     }
 
     #[test]
-    fn a_capped_listing_is_deterministic_rather_than_whatever_the_disk_returned() {
-        // The cap keeps the first N *visited*, so an unordered walk lets the
-        // filesystem choose which N survive: two identical calls could return
-        // different sets, and the survivors were then sorted into something that
-        // reads as a lexicographic prefix while `n-0000` was missing from it.
-        // `sort_by_file_name` on the walker is what makes the surviving set a
-        // fact about the workspace rather than about the disk.
-        let dir = workspace();
-        for n in 0..MAX_PATHS + 10 {
-            fs::write(dir.path().join(format!("repos/engine/n-{n:04}.md")), "x").unwrap();
-        }
-
-        let first = find_files(dir.path(), "repos/engine/*.md", None).unwrap();
-        let again = find_files(dir.path(), "repos/engine/*.md", None).unwrap();
-        assert_eq!(first, again, "two identical calls must return the same result");
-
-        assert!(first.contains("n-0000.md"), "the survivors must be a real prefix: {first}");
-        assert!(first.contains("n-0099.md"), "{first}");
-        assert!(!first.contains("n-0100.md"), "{first}");
-    }
-
-    #[test]
     fn a_visitor_that_returns_false_stops_the_walk() {
         // This is how a cap ends a search: 50 matches must not cost a walk of
         // all 7,788 files.
         let dir = workspace();
         let roots = search_roots(dir.path()).unwrap();
         let mut count = 0usize;
-        let stats = walk(dir.path(), &roots, Instant::now() + SEARCH_BUDGET, &mut |_a, _r| {
+        let stats = walk(dir.path(), &roots.paths, Instant::now() + SEARCH_BUDGET, &mut |_a, _r| {
             count += 1;
             false
         });
 
         assert_eq!(count, 1);
         assert_eq!(stats.files, 1);
+        assert!(
+            stats.stopped_short && !stats.complete(),
+            "a walk cut short must say so, or its file count is read as a domain size"
+        );
     }
 
     #[test]
     fn an_expired_budget_ends_the_walk_and_says_so() {
         let dir = workspace();
         let roots = search_roots(dir.path()).unwrap();
-        let stats = walk(dir.path(), &roots, Instant::now(), &mut |_a, _r| true);
+        let stats = walk(dir.path(), &roots.paths, Instant::now(), &mut |_a, _r| true);
 
         assert!(stats.timed_out, "an expired deadline must be reported, not silent");
+        assert!(!stats.complete(), "and a timed-out walk is not a complete one");
     }
 
     #[test]
@@ -822,8 +978,8 @@ mod tests {
         let out = find_files(dir.path(), "**/*.ts", None).unwrap();
 
         assert!(!out.trim().is_empty(), "an empty text block is a 400");
-        assert!(out.contains("composed"), "the domain must be named: {out}");
-        assert!(out.contains("path"), "the recovery must be named: {out}");
+        assert!(out.contains("declared roots"), "the domain must be named: {out}");
+        assert!(out.contains("pass `path`"), "the recovery must be named: {out}");
     }
 
     #[test]
@@ -844,6 +1000,39 @@ mod tests {
 
         assert!(out.contains("stopped at"), "a bitten cap must announce itself: {out}");
         assert!(out.contains("path"), "the recovery must be named: {out}");
+
+        // A truncated list must not read as a complete one: the footer's
+        // file count is how far the walk got, not the size of the domain.
+        assert!(
+            out.contains("stopped early"),
+            "a walk ended by a cap must not report its count as a domain size: {out}"
+        );
+        assert!(
+            !out.contains("searched 3 declared roots"),
+            "the verb must match how the walk ended: {out}"
+        );
+    }
+
+    #[test]
+    fn a_capped_listing_is_deterministic_rather_than_whatever_the_disk_returned() {
+        // M1/I4. The cap keeps the first N *visited*, so an unordered walk lets
+        // the filesystem choose which N survive: two identical calls could
+        // return different sets, and the survivors were then sorted into
+        // something that reads as a lexicographic prefix while `n-0000` was
+        // missing from it. `sort_by_file_name` on the walker is what makes the
+        // surviving set a fact about the workspace rather than about the disk.
+        let dir = workspace();
+        for n in 0..MAX_PATHS + 10 {
+            fs::write(dir.path().join(format!("repos/engine/n-{n:04}.md")), "x").unwrap();
+        }
+
+        let first = find_files(dir.path(), "repos/engine/*.md", None).unwrap();
+        let again = find_files(dir.path(), "repos/engine/*.md", None).unwrap();
+        assert_eq!(first, again, "two identical calls must return the same result");
+
+        assert!(first.contains("n-0000.md"), "the survivors must be a real prefix: {first}");
+        assert!(first.contains("n-0099.md"), "{first}");
+        assert!(!first.contains("n-0100.md"), "{first}");
     }
 
     #[test]
@@ -944,9 +1133,46 @@ mod tests {
         let out = search(dir.path(), "needle", None, false).unwrap();
         let from_chatty = out.matches("needle ").count();
 
+        assert_eq!(
+            from_chatty, MAX_MATCHES_PER_FILE,
+            "the per-file cap must bind exactly, not merely bound: {out}"
+        );
+
+        // C2, and the whole point of the finding: this was the one cap that
+        // set nothing. Five lines from a file of a hundred matches were
+        // byte-indistinguishable from a file containing exactly five, so
+        // "that is all there is" and "that is all you were shown" rendered
+        // identically — the failure this branch exists to refuse.
         assert!(
-            from_chatty <= MAX_MATCHES_PER_FILE,
-            "one file produced {from_chatty} matches: {out}"
+            out.contains(&format!("more than {MAX_MATCHES_PER_FILE} matches")),
+            "a bitten per-file cap must announce itself: {out}"
+        );
+        assert!(
+            out.contains("1 file had"),
+            "and say how many files it bit: {out}"
+        );
+        assert!(
+            out.contains("read_file"),
+            "and name the recovery: {out}"
+        );
+    }
+
+    #[test]
+    fn a_file_at_exactly_the_per_file_cap_does_not_claim_to_be_truncated() {
+        // The other side of C2. A notice that fires whether or not anything was
+        // withheld is as uninformative as no notice at all: it would make a
+        // complete result read as a truncated one, which is the same collapse
+        // pointing the other way.
+        let dir = workspace();
+        let body: String = (0..MAX_MATCHES_PER_FILE).map(|i| format!("needle {i}\n")).collect();
+        fs::write(dir.path().join("repos/engine/exact.md"), body).unwrap();
+
+        let out = search(dir.path(), "needle", None, false).unwrap();
+
+        assert!(out.contains("exact.md"), "{out}");
+        assert!(
+            !out.contains("more than"),
+            "nothing was withheld, so nothing may claim it was: {out}"
         );
     }
 
@@ -966,7 +1192,14 @@ mod tests {
         let out = search(dir.path(), "needle", None, false).unwrap();
 
         assert!(out.contains("stopped at"), "{out}");
-        assert!(!out.contains(" of "), "no invented denominator: {out}");
+        // A shaped check rather than a bare `" of "`: the domain note now
+        // (correctly) contains the phrase "the size of the domain", and the
+        // defect this guards is specifically an `N of M` denominator nothing
+        // measured.
+        assert!(
+            !regex::Regex::new(r"\d+ of \d+").unwrap().is_match(&out),
+            "no invented denominator: {out}"
+        );
 
         // The cap must BIND, not merely announce itself. Without this the test
         // passes for a cap that fires at the wrong threshold, or that fires and
@@ -987,6 +1220,15 @@ mod tests {
             count_match_lines(&out), MAX_MATCHES,
             "the cap announced itself but did not bind: {out}"
         );
+
+        // I3: the walk stopped at the cap, so its file count is how far it got
+        // and not the size of the domain. The verb has to carry that, because
+        // the number alone reads as a denominator.
+        assert!(
+            out.contains("stopped early"),
+            "a count from an interrupted walk must not be reported as a search: {out}"
+        );
+        assert!(!out.contains("searched 3 declared roots"), "{out}");
     }
 
     #[test]
@@ -1107,8 +1349,77 @@ mod tests {
         let out = search(dir.path(), "nothing-matches-this", None, false).unwrap();
 
         assert!(!out.trim().is_empty(), "an empty text block is a 400");
-        assert!(out.contains("composed"), "{out}");
-        assert!(out.contains("path"), "{out}");
+        assert!(out.contains("declared roots"), "{out}");
+        assert!(out.contains("pass `path`"), "{out}");
+    }
+
+    #[test]
+    fn the_note_promises_a_recovery_only_where_one_exists() {
+        // I1, and the point of running it rather than reading it: the sentence
+        // this replaced said "Undeclared content — repos/external/, worktrees —
+        // was not searched; pass `path` to search one directly", which promised
+        // a repair the guard refuses. `.worktrees` is in `is_noise`, so
+        // `guard::resolve` denies it at any depth. Two categories, and only one
+        // of them has a recovery:
+        //
+        //   reachable if you name it — anything the manifest does not declare
+        //   refused however you name it — the noise and credential set
+        //
+        // Worktrees were never in the first category at all: they sit *inside*
+        // declared roots and are excluded by a different mechanism.
+        let dir = workspace();
+        fs::create_dir_all(dir.path().join("repos/engine/.worktrees/feat")).unwrap();
+        fs::write(dir.path().join("repos/engine/.worktrees/feat/w.rs"), "needle\n").unwrap();
+        fs::create_dir_all(dir.path().join("repos/engine/node_modules/pkg")).unwrap();
+        fs::write(dir.path().join("repos/engine/node_modules/pkg/i.js"), "needle\n").unwrap();
+
+        let note = search(dir.path(), "nothing-matches-this", None, false).unwrap();
+
+        // Category one: named as not-searched, and the offered recovery works.
+        assert!(note.contains("does not declare"), "{note}");
+        assert!(note.contains("pass `path` to search it directly"), "{note}");
+        let reached = search(dir.path(), "needle", Some("repos/external/opencode"), false).unwrap();
+        assert!(reached.contains("x.ts"), "the promised recovery must work: {reached}");
+
+        // Category two: named as never-searched, and every name in that
+        // sentence is refused when a caller tries the recovery anyway. This is
+        // the assertion that would have caught the original defect — it
+        // executes the claim instead of reading it.
+        assert!(note.contains("never searched at any path"), "{note}");
+        for named in [".worktrees", "node_modules", "target", ".build", ".armillary"] {
+            assert!(note.contains(named), "the note must name {named}: {note}");
+        }
+        for refused in ["repos/engine/.worktrees/feat", "repos/engine/node_modules/pkg"] {
+            let err = search(dir.path(), "needle", Some(refused), false).unwrap_err();
+            assert_eq!(
+                err.status, "denied_noise",
+                "{refused} is refused, so the note must not offer `path` for it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scoped_result_states_its_exclusions_too() {
+        // M2. Under an explicit `path` the guard still prunes credentials,
+        // `node_modules`, worktrees and the rest — so a scoped note that named
+        // nothing let `search("apiKey", path="repos/app")` render "not there"
+        // about an answer sitting in `node_modules`. The commitment held on the
+        // unscoped path only.
+        let dir = workspace();
+        fs::create_dir_all(dir.path().join("repos/engine/node_modules/pkg")).unwrap();
+        fs::write(dir.path().join("repos/engine/node_modules/pkg/i.js"), "apiKey\n").unwrap();
+
+        let out = search(dir.path(), "apiKey", Some("repos/engine"), false).unwrap();
+
+        assert!(out.contains("no matches"), "{out}");
+        assert!(out.contains("1 path named explicitly"), "{out}");
+        assert!(
+            out.contains("node_modules") && out.contains("never searched at any path"),
+            "a scoped zero-match result must still name what it did not look at: {out}"
+        );
+
+        let listed = find_files(dir.path(), "**/*.js", Some("repos/engine")).unwrap();
+        assert!(listed.contains("never searched at any path"), "{listed}");
     }
 
     #[test]

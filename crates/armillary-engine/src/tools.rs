@@ -150,11 +150,16 @@ pub fn definitions() -> Vec<serde_json::Value> {
         serde_json::json!({
             "name": "find_files",
             "description": "Find files by a glob pattern over their path, e.g. \
-                            \"**/2026-07-30-*\" or \"operators/**/*.md\". Searches \
-                            the modules this workspace declares; content that is \
-                            not composed (reference clones, git worktrees) is not \
-                            searched unless you name it with `path`. Use this when \
-                            you know roughly what a file is called and not where it is.",
+                            \"**/2026-07-30-*\" or \"operators/**/*.md\". Lists files \
+                            of any type, including ones `search` cannot read. Covers \
+                            the modules this workspace declares: content the manifest \
+                            does not declare (reference clones under repos/external/, \
+                            for one) is not covered unless you name it with `path`. \
+                            Credentials, build and dependency trees (node_modules, \
+                            target, .build), git worktrees and the engine's own \
+                            .armillary are never listed, at any path — naming one is \
+                            refused rather than widening the search. Use this when you \
+                            know roughly what a file is called and not where it is.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -176,12 +181,17 @@ pub fn definitions() -> Vec<serde_json::Value> {
             "description": "Search the contents of this workspace's files for a \
                             regular expression, returning each matching line with \
                             its path and line number. A plain string is a valid \
-                            regex. Searches the modules this workspace declares; \
-                            content that is not composed (reference clones, git \
-                            worktrees) is not searched unless you name it with \
-                            `path`. Long lines are windowed around the match. Use \
-                            this to find out where something is said before reading \
-                            the file that says it.",
+                            regex. Searches the modules this workspace declares: \
+                            content the manifest does not declare (reference clones \
+                            under repos/external/, for one) is not searched unless you \
+                            name it with `path`. Credentials, build and dependency \
+                            trees (node_modules, target, .build), git worktrees and the \
+                            engine's own .armillary are never searched, at any path — \
+                            naming one is refused rather than widening the search. Only \
+                            text file types are read; `find_files` will still list the \
+                            rest. Long lines are windowed around the match. Use this to \
+                            find out where something is said before reading the file \
+                            that says it.",
             "input_schema": {
                 "type": "object",
                 "properties": {
