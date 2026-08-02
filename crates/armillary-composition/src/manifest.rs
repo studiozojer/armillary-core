@@ -9,6 +9,29 @@ pub struct Module {
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// **Optional, and interpreted only by engines that inject a system
+    /// prompt.** The ordered files that constitute this module's identity —
+    /// paths relative to the workspace root, most stable first.
+    ///
+    /// This is a composition field (every implementation reads manifests) with
+    /// an engine-specific *use*. B-2 is explicitly conditional — *"where the
+    /// engine can enforce (hooks, system-prompt injection, pre-tool gates)"* —
+    /// so an implementation with no system slot ignores this and is still
+    /// conformant. It is declared here rather than left to convention because
+    /// convention is already wrong: this workspace has an operator with no
+    /// `CLAUDE.md` whose boot surface is `self.md`.
+    ///
+    /// Order is the declaration and the caller must honour it: boot content is
+    /// the prefix-cache candidate, and changing an early file invalidates
+    /// everything after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot: Option<Vec<String>>,
+    /// C-5, and the same reason `Protocol` and `Router` carry one: without it
+    /// serde's default silently DROPS an unrecognized key. A manifest written
+    /// against a newer engine would parse clean here, do nothing, and say
+    /// nothing. Never add `deny_unknown_fields`.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, toml::Value>,
 }
 
 /// C-5: the protocol interface is deliberately provisional — the manifest models

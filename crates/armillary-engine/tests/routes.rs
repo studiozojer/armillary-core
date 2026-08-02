@@ -152,22 +152,26 @@ async fn create_and_attach(router: axum::Router) -> serde_json::Value {
     attach
 }
 
-/// Assert a stream holds exactly the two events creation writes, and no boot.
+/// Assert a misconfigured boot loaded nothing — the session exists and has no
+/// system prompt.
 ///
-/// The four boot-skip tests below used to say "boot was skipped" as
-/// `headSeq == 1`. Once creation also appends DD-1's composition event, a bare
-/// count stops distinguishing "boot was skipped" from "boot landed and
-/// something else didn't" — so they assert the thing they were always about.
-fn assert_no_boot_event(data_dir: &std::path::Path, attach: &serde_json::Value) {
+/// This used to assert "no boot event was appended", which was the right claim
+/// when a boot event could only say `{path, sha256}`: appending one meant
+/// CLAIMING a hash for a file that could not be read, and the projection would
+/// then fail every turn on the stream forever. B-2's `{files: [{path,
+/// present}]}` can say *absent*, so the premise changed — the engine now
+/// records the failed path instead of dropping it, and a misconfigured boot
+/// stops being invisible from the phone.
+///
+/// What the four tests below were always about survives intact: a broken boot
+/// declaration must not break the session, and must not smuggle content in.
+fn assert_boot_loaded_nothing(root: &std::path::Path, data_dir: &std::path::Path, attach: &serde_json::Value) {
     let id = attach["instance"]["id"].as_str().unwrap();
     let store = LogStore::open(data_dir).unwrap();
-    let types: Vec<String> = store
-        .read_from(id, 0)
-        .unwrap()
-        .iter()
-        .map(|e| e.event_type.clone())
-        .collect();
-    assert_eq!(types, vec!["instance_created", "composition"], "{types:?}");
+    let events = store.read_from(id, 0).unwrap();
+    let turn = armillary_engine::projection::project_context(&events, root)
+        .expect("a broken boot declaration must not make the stream unprojectable");
+    assert_eq!(turn.system, None, "{events:?}");
 }
 
 /// Error responses are `(StatusCode, String)` — plain text, not JSON — so
@@ -540,9 +544,9 @@ async fn create_appends_a_boot_event_after_instance_created() {
     let events = store.read_from(&id, 0).unwrap();
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
     assert_eq!(types, vec!["instance_created", "boot", "composition"]);
-    assert_eq!(events[1].data["path"], "getting-started.md");
+    assert_eq!(events[1].data["files"][0]["path"], "getting-started.md");
     assert_eq!(
-        events[1].data["sha256"],
+        events[1].data["files"][0]["sha256"],
         armillary_engine::hash::sha256_hex(contents.as_bytes())
     );
 }
@@ -606,6 +610,98 @@ async fn create_records_the_composition_so_a_session_knows_what_it_was_booted_in
     assert!(!text.contains("ghost"), "a commented-out repo reached the model: {text}");
 }
 
+/// A workspace declaring one operator with a two-file boot surface.
+///
+/// The paths deliberately are NOT `<path>/CLAUDE.md`: a convention would already
+/// be wrong in the real workspace, where one operator has no CLAUDE.md at all
+/// and boots from `self.md`. Declared, not inferred.
+fn app_with_operator_boot() -> (axum::Router, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.keep();
+    std::fs::create_dir_all(root.join("operators/tycho")).unwrap();
+    std::fs::write(root.join("operators/tycho/principles.md"), "# principles").unwrap();
+    std::fs::write(root.join("operators/tycho/voice.md"), "# voice").unwrap();
+    std::fs::write(
+        root.join("modules.toml"),
+        "[[operators]]\nname = \"tycho\"\npath = \"operators/tycho\"\n\
+         boot = [\"operators/tycho/principles.md\", \"operators/tycho/voice.md\"]\n\n\
+         [[operators]]\nname = \"leavitt\"\npath = \"operators/leavitt\"\n",
+    )
+    .unwrap();
+    let root = root.canonicalize().unwrap();
+
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let store = LogStore::open(&data_dir).unwrap();
+    let router = app(AppState {
+        root: root.clone(),
+        sessions: Arc::new(Sessions::new(store)),
+        model: model_config(),
+        provider: Arc::new(KeylessProvider),
+        boot: None,
+    });
+    (router, root, data_dir)
+}
+
+async fn create_for(router: axum::Router, operator: serde_json::Value) -> String {
+    let (status, created) =
+        post_json(router, "/instances", serde_json::json!({ "operator": operator })).await;
+    assert_eq!(status, StatusCode::CREATED);
+    created["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn summoning_an_operator_boots_the_files_it_declared_in_declared_order() {
+    // **B-2.** Before this, every instance got the router's own file whatever
+    // was summoned — the rule was in the constitution and nowhere in the
+    // engine. The point is speed as much as correctness: pulling these would
+    // cost a listing and two reads, each a full round trip with the whole
+    // window re-sent, before the operator said a word.
+    let (router, root, data_dir) = app_with_operator_boot();
+    let id = create_for(router, serde_json::json!("tycho")).await;
+
+    let store = LogStore::open(&data_dir).unwrap();
+    let events = store.read_from(&id, 0).unwrap();
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(types, vec!["instance_created", "boot", "composition"]);
+
+    let turn = armillary_engine::projection::project_context(&events, &root).unwrap();
+    assert_eq!(turn.system.as_deref(), Some("# principles\n\n# voice"));
+}
+
+#[tokio::test]
+async fn an_operator_that_declares_no_boot_gets_no_boot_event() {
+    // C-4: presence-gated. Most operators will never declare one.
+    let (router, _root, data_dir) = app_with_operator_boot();
+    let id = create_for(router, serde_json::json!("leavitt")).await;
+
+    let store = LogStore::open(&data_dir).unwrap();
+    let types: Vec<String> = store
+        .read_from(&id, 0)
+        .unwrap()
+        .iter()
+        .map(|e| e.event_type.clone())
+        .collect();
+    assert_eq!(types, vec!["instance_created", "composition"]);
+}
+
+#[tokio::test]
+async fn a_dispatcher_instance_does_not_inherit_any_operators_boot() {
+    // No operator summoned means no operator identity. An instance that
+    // silently booted as tycho because tycho is declared first would be the
+    // worst possible failure here.
+    let (router, _root, data_dir) = app_with_operator_boot();
+    let id = create_for(router, serde_json::Value::Null).await;
+
+    let store = LogStore::open(&data_dir).unwrap();
+    let types: Vec<String> = store
+        .read_from(&id, 0)
+        .unwrap()
+        .iter()
+        .map(|e| e.event_type.clone())
+        .collect();
+    assert_eq!(types, vec!["instance_created", "composition"]);
+}
+
 #[tokio::test]
 async fn a_bare_clone_is_told_that_nothing_is_composed_rather_than_told_nothing() {
     // C-4: presence-gated, and this is what presence-gating means HERE — not
@@ -633,7 +729,7 @@ async fn an_unreadable_boot_source_still_creates_the_instance() {
         boot: Some("does-not-exist.md".to_string()),
     });
     let attach = create_and_attach(router).await;
-    assert_no_boot_event(&data_dir, &attach);
+    assert_boot_loaded_nothing(&root.canonicalize().unwrap(), &data_dir, &attach);
 }
 
 #[tokio::test]
@@ -656,7 +752,7 @@ async fn a_non_utf8_boot_source_is_skipped_not_appended() {
         boot: Some("boot.md".to_string()),
     });
     let attach = create_and_attach(router).await;
-    assert_no_boot_event(&data_dir, &attach);
+    assert_boot_loaded_nothing(&root.canonicalize().unwrap(), &data_dir, &attach);
 }
 
 #[tokio::test]
@@ -679,7 +775,7 @@ async fn a_boot_path_declared_absolute_is_refused_not_relativized() {
         boot: Some(root.join("boot.md").to_string_lossy().to_string()),
     });
     let attach = create_and_attach(router).await;
-    assert_no_boot_event(&data_dir, &attach);
+    assert_boot_loaded_nothing(&root.canonicalize().unwrap(), &data_dir, &attach);
 }
 
 #[tokio::test]
@@ -709,5 +805,5 @@ async fn a_boot_path_escaping_root_is_skipped_not_honored() {
         boot: Some(escape_path),
     });
     let attach = create_and_attach(router).await;
-    assert_no_boot_event(&data_dir, &attach);
+    assert_boot_loaded_nothing(&root.canonicalize().unwrap(), &data_dir, &attach);
 }

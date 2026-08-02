@@ -539,6 +539,16 @@ async fn crash_resume_the_log_survives_dropping_and_rebuilding_the_whole_process
 // --- bonus: BootDrift re-record path (not in the brief's lettered list, but
 // cited by the turn's step 3 and cheap to pin directly) ---
 
+/// The first declared file of a boot event, whichever shape it was written in.
+///
+/// B-2 turned the payload from `{path, sha256}` into `{files: [{path, sha256,
+/// present}]}`. These tests are about the two WRITERS agreeing on a stream, not
+/// about the payload's shape, so they read through this rather than restating
+/// the shape six times.
+fn boot_file(e: &EventEnvelope, key: &str) -> serde_json::Value {
+    e.data["files"][0][key].clone()
+}
+
 #[tokio::test]
 async fn a_drifted_boot_event_is_rerecorded_fresh_before_the_turn_runs() {
     let data_dir = tempfile::tempdir().unwrap().keep();
@@ -581,7 +591,7 @@ async fn a_drifted_boot_event_is_rerecorded_fresh_before_the_turn_runs() {
     let boot_events: Vec<&EventEnvelope> = events.iter().filter(|e| e.event_type == "boot").collect();
     assert_eq!(boot_events.len(), 2, "the drifted boot must be followed by a fresh re-record");
     let correct_sha = armillary_engine::hash::sha256_hex(b"# current boot content");
-    assert_eq!(boot_events[1].data["sha256"], correct_sha);
+    assert_eq!(boot_file(boot_events[1], "sha256"), correct_sha);
     assert_eq!(boot_events[1].actor.role, armillary_engine::log::envelope::Role::System);
 
     let assistant = events.iter().find(|e| e.event_type == "assistant_message").unwrap();
@@ -696,9 +706,9 @@ async fn both_boot_writers_land_on_one_stream_and_the_turn_reads_the_current_fil
     let at_create = sessions.store().read_from(&id, 0).unwrap();
     let boots: Vec<&EventEnvelope> = at_create.iter().filter(|e| e.event_type == "boot").collect();
     assert_eq!(boots.len(), 1, "create appends exactly one boot event: {at_create:?}");
-    assert_eq!(boots[0].data["path"], "boot.md");
+    assert_eq!(boot_file(boots[0], "path"), "boot.md");
     assert_eq!(
-        boots[0].data["sha256"],
+        boot_file(boots[0], "sha256"),
         armillary_engine::hash::sha256_hex(b"# first boot content")
     );
 
@@ -720,15 +730,15 @@ async fn both_boot_writers_land_on_one_stream_and_the_turn_reads_the_current_fil
     let boots: Vec<&EventEnvelope> = events.iter().filter(|e| e.event_type == "boot").collect();
     assert_eq!(boots.len(), 2, "both writers must be on the stream: {events:?}");
     assert_eq!(
-        boots[0].data["path"], boots[1].data["path"],
+        boot_file(boots[0], "path"), boot_file(boots[1], "path"),
         "both writers record the same declared path spelling"
     );
     assert_ne!(
-        boots[0].data["sha256"], boots[1].data["sha256"],
+        boot_file(boots[0], "sha256"), boot_file(boots[1], "sha256"),
         "the re-record must carry a DIFFERENT sha — otherwise it is not re-reading disk"
     );
     assert_eq!(
-        boots[1].data["sha256"],
+        boot_file(boots[1], "sha256"),
         armillary_engine::hash::sha256_hex(b"# second boot content")
     );
 
