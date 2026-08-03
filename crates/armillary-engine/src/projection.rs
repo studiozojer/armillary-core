@@ -346,6 +346,12 @@ fn recovery_hint(status: &str) -> &'static str {
         "invalid_input" => "the arguments did not match the tool's schema; check the names and types and call it again",
         "read_failed" => "the file could not be read from disk; try again or read something else",
         "composition_unreadable" => "the workspace manifests could not be parsed; read them as files instead",
+        // The write verbs. A status with no arm here renders "the call did not
+        // succeed", which tells the model nothing to do next.
+        "composition_locked" => "this file defines the workspace's composition and this session was not granted permission to write it; change something else, or ask for a session that may compose",
+        "no_match" => "old_string does not appear in that file; re-read the file and copy the exact text, without read_file's line-number prefixes",
+        "ambiguous_match" => "old_string appears more than once; include more surrounding lines until exactly one match remains, or call edit_file once per occurrence",
+        "write_failed" => "the file could not be written to disk; check the path and try again, or write somewhere else",
         // The three ways a call ends without its tool ever running. Each says
         // whether repeating it is worth anything — `interrupted` and
         // `no_result_recorded` are retryable, `bound_reached` is not.
@@ -1466,6 +1472,8 @@ mod tests {
             "too_large", "read_failed",
             // loop
             "interrupted", "no_result_recorded", "bound_reached", "tool_panicked",
+            // write
+            "composition_locked", "no_match", "ambiguous_match", "write_failed",
         ];
         let fallback = recovery_hint("__a_status_no_one_emits__");
 

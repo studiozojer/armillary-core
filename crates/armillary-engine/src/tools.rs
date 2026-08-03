@@ -56,11 +56,19 @@ impl ToolError {
             "malformed_path" => StatusCode::BAD_REQUEST,
             "outside_workspace" | "denied_credential" | "denied_noise" => StatusCode::FORBIDDEN,
             "not_found" => StatusCode::NOT_FOUND,
-            "is_a_directory" | "not_a_directory" | "invalid_input" | "invalid_pattern" => {
-                StatusCode::BAD_REQUEST
-            }
+            "is_a_directory" | "not_a_directory" | "invalid_input" | "invalid_pattern"
+            | "composition_locked" | "no_match" | "ambiguous_match" => StatusCode::BAD_REQUEST,
+            // NOT joined to the arm above: `not_openable` is already mapped
+            // here, an earlier arm would silently win, and `-D warnings` would
+            // stay quiet because the later arm is still reachable via
+            // `"not_text"`. None of these codes is ours to change on the way
+            // past.
             "not_openable" | "not_text" => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+            // Explicit rather than falling through: a failed disk write is
+            // genuinely the server's problem, and saying so deliberately keeps
+            // it distinguishable from an unrecognised code.
+            "write_failed" | "read_failed" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -212,6 +220,39 @@ pub fn definitions() -> Vec<serde_json::Value> {
                 "required": ["query"],
             },
         }),
+        // E-4: new definitions APPEND. The five above keep their positions or
+        // the cached prompt prefix through them is invalidated — and a parallel
+        // window is adding git verbs to this same list, so whichever merges
+        // second appends after, never interleaves.
+        serde_json::json!({
+            "name": "write_file",
+            "description": format!(
+                "Create a file, or replace an existing file's contents entirely. The \
+                 path is relative to the workspace root, and missing parent \
+                 directories are created and named in the result. Writes land on real \
+                 files in the real checkout, immediately. ALWAYS prefer editing an \
+                 existing file with `edit_file` over rewriting it with this — a full \
+                 rewrite of a file you only meant to change part of is the most \
+                 expensive mistake this tool can make. `read_file` cuts any line over \
+                 {MAX_LINE_BYTES} bytes and marks it `{TRUNCATION_MARKER}`: NEVER \
+                 write back content carrying that marker, it is display text and the \
+                 cut bytes are gone."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative path.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The file's complete new contents.",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+        }),
     ]
 }
 
@@ -237,6 +278,7 @@ pub struct ToolCtx {
 /// `spawn_blocking`, so a body could not await an append even if it held the
 /// handle — and event-appending belongs in the one place that already owns
 /// `state` and `stream`.
+#[derive(Debug)]
 pub struct ToolOutcome {
     pub text: String,
     pub effects: Vec<Effect>,
@@ -258,6 +300,7 @@ impl ToolOutcome {
 /// git verbs can add their own without touching this seam again, and the loop's
 /// `match` over it means a new variant is a compile error rather than a
 /// silently dropped event.
+#[derive(Debug)]
 pub enum Effect {
     FileChanged {
         /// **WD-13.** The RESOLVED workspace-relative path, never the request
@@ -317,6 +360,13 @@ pub fn dispatch(
             input.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false),
         )
         .map(ToolOutcome::text),
+        // Returns a `ToolOutcome` directly — no `.map(ToolOutcome::text)`,
+        // because a write is the one verb with effects to describe.
+        "write_file" => crate::write::write_file(
+            ctx,
+            required_str(input, "path", name)?,
+            required_str(input, "content", name)?,
+        ),
         other => Err(ToolError::new(
             "unknown_tool",
             format!("no tool named {other}"),
@@ -549,7 +599,7 @@ fn list_directory(root: &Path, path: &str) -> Result<String, ToolError> {
 /// over the ceiling it still refuses. The tool pages instead and never meets
 /// this constant — which is the point of D15. No file is too large for a model
 /// to read; it is only too large to read at once.
-const MAX_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_BYTES: u64 = 1024 * 1024;
 
 /// The most bytes one line may contribute before it is cut.
 ///
@@ -587,7 +637,28 @@ fn open_readable(root: &Path, path: &str) -> Result<(PathBuf, u64), ToolError> {
     let meta = resolved
         .metadata()
         .map_err(|_| ToolError::new("not_found", format!("nothing at {path}")))?;
-    if meta.is_dir() {
+    gate_openable(&resolved, path, meta.is_dir())?;
+
+    Ok((resolved, meta.len()))
+}
+
+/// The half of the gate that is about the FILE rather than about reading it.
+///
+/// **Ordering is load-bearing and inherited from `file.rs`:** refuse a
+/// directory first, then refuse a type that is not served as text — so a 300 MB
+/// `.zip` reads as "can't open this type" rather than "too large", and
+/// `write_file("notes", …)` on a directory reads as `is_a_directory` rather
+/// than `not_openable`. The misleading-reason failure this ordering fixed once
+/// for reads is the same one it now prevents for writes.
+///
+/// **Shared with `write.rs` (WD-5).** `write_file` takes a string, so writing a
+/// `.png` is meaningless; reusing the read allowlist means the set of files you
+/// can write is exactly the set you can read, with no second rule to keep in
+/// sync. The resolution differs between reading and writing — a create resolves
+/// a path that does not exist — so the gate takes an already-resolved path and
+/// whether it is a directory, rather than resolving for itself.
+pub(crate) fn gate_openable(resolved: &Path, path: &str, is_dir: bool) -> Result<(), ToolError> {
+    if is_dir {
         return Err(ToolError::new(
             "is_a_directory",
             format!("{path} is a directory"),
@@ -605,7 +676,7 @@ fn open_readable(root: &Path, path: &str) -> Result<(PathBuf, u64), ToolError> {
         ));
     }
 
-    Ok((resolved, meta.len()))
+    Ok(())
 }
 
 /// One whole file, for the `/file` route. Unchanged behaviour, shared gate.
@@ -1006,7 +1077,7 @@ mod tests {
         // incidental.
         assert_eq!(
             names,
-            ["get_composition", "list_directory", "read_file", "find_files", "search"]
+            ["get_composition", "list_directory", "read_file", "find_files", "search", "write_file"]
         );
         for d in &defs {
             assert_eq!(d["input_schema"]["type"], "object");

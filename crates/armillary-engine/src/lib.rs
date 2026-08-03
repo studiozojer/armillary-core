@@ -25,6 +25,7 @@ pub mod sync;
 #[cfg(test)]
 pub mod testgit;
 pub mod tools;
+mod write;
 
 use axum::{
     routing::{get, post},
