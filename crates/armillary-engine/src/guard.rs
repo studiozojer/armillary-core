@@ -283,18 +283,25 @@ pub fn resolve(root: &Path, user_path: &str) -> Result<PathBuf, GuardError> {
 // and is consulted first, so a credential-shaped name reads as "never served"
 // rather than "unknown type" even when its extension would otherwise open.
 
-// TRIPWIRE for whoever adds a client-writable boot path: `projection::
+// TRIPWIRE, CLOSED 2026-08-02 by the write-tools branch. `projection::
 // resolve_boot_path` and `loop_::rerecord_boot` read a `boot` event's
-// `data.path` via plain `std::fs`, entirely bypassing this module's
+// `data.path` via plain `std::fs`, and that read used to carry a bare
+// root-containment check, entirely bypassing this module's
 // `judge`/`is_credential`/`is_noise` denial — a `boot` event could name
-// `.env` or `.git/config` and this module would never be consulted. That is
-// currently safe ONLY because nothing here lets a client choose or write a
-// boot path: `data.path` is set at instance creation (server-side), not by
-// any of `send`/`interrupt`/`evict`'s request bodies. The moment a future
-// task makes a boot path client-writable (or client-selectable from a set
-// wider than the server already trusts), THIS is where the credential
-// bypass needs closing — most likely by routing that read through `resolve`
-// above instead of `resolve_boot_path`'s bare root-containment check.
+// `.env` or `.git/config` and this module would never be consulted. That was
+// safe ONLY because nothing let a client choose or write a boot path.
+//
+// D-4 makes `modules.local.toml` operator-writable and `write_file`/`edit_file`
+// can reach it, so an operator declaring `boot = ["repos/x/Secrets.xcconfig"]`
+// became a real disclosure path — not self-exfiltration inside a turn, since it
+// needs a new instance to be created, but real. `resolve_boot_path` now calls
+// `resolve` above, exactly as this tripwire prescribed; `rerecord_boot` reads
+// through the same function and is covered by the same change.
+//
+// The tripwire that REMAINS: this module is still a pure function of
+// `(root, path)`. Any authorization that depends on SESSION state — the
+// composition lock (WD-9) is the first — belongs in the caller, not here, or
+// every read route silently acquires a write rule.
 
 #[cfg(test)]
 mod tests {

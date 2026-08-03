@@ -206,32 +206,37 @@ const HANDLED_TYPES: &[&str] = &[
     "tool_result",
 ];
 
-/// Join `rel` under `root` and require the canonical result to stay under
-/// `root` — a `data.path` that escapes root is not a different kind of error, it
-/// is the same `BootUnreadable` a missing file produces, since neither is ever a
+/// Resolve a boot event's `data.path` under `root`, through the same guard
+/// every other path in this engine passes.
+///
+/// A `data.path` that escapes root is not a different kind of error, it is the
+/// same `BootUnreadable` a missing file produces, since neither is ever a
 /// legitimate boot source.
 ///
-/// Containment is ALL this checks. `Path::join` with an absolute argument
-/// replaces the base, so an absolute `data.path` pointing inside root passes here
-/// — refusing absolute paths is the caller's job (see
-/// `routes::instances::append_boot_event`, which does it before ever appending
-/// one). `guard::resolve` is the resolver that rejects absolute paths and `..`
-/// components outright; unifying on it is parked for Phase 2.
+/// **This was containment WITHOUT judgement** — a bare canonicalize plus
+/// `starts_with`, which `guard.rs`'s TRIPWIRE named as safe only while nothing
+/// let a client choose or write a boot path. D-4 makes `modules.local.toml`
+/// operator-writable, so a `boot` array could name a credential and the next
+/// instance created would boot with it in its system prompt. `guard::resolve`
+/// performs the same containment check and then judges every component of the
+/// canonical path, so that declaration is now refused.
+///
+/// `is_openable` is deliberately NOT added on top: `weigh_boot_file` already
+/// refuses non-UTF-8, which covers the binary case without a second rule to
+/// keep in sync. And `guard::resolve` additionally rejects absolute paths and
+/// `..` components, which this function used to accept — `weigh_boot_file`
+/// refuses absolutes itself before ever appending one, and `rerecord_boot`
+/// records an unresolvable path absent, so neither caller changes behaviour
+/// beyond refusing more.
 ///
 /// `pub(crate)` (not private): the loop (`loop_.rs`) re-records a fresh
 /// `boot` event on `BootDrift` by re-reading the SAME path this function
 /// resolved the first time — it reuses this resolution rather than
 /// re-deriving root-containment logic at a second call site.
 pub(crate) fn resolve_boot_path(root: &Path, rel: &str) -> Result<PathBuf, ProjectionError> {
-    let unreadable = || ProjectionError::BootUnreadable {
+    crate::guard::resolve(root, rel).map_err(|_| ProjectionError::BootUnreadable {
         path: rel.to_string(),
-    };
-    let root_canonical = root.canonicalize().map_err(|_| unreadable())?;
-    let candidate_canonical = root_canonical.join(rel).canonicalize().map_err(|_| unreadable())?;
-    if !candidate_canonical.starts_with(&root_canonical) {
-        return Err(unreadable());
-    }
-    Ok(candidate_canonical)
+    })
 }
 
 /// Merge consecutive same-role messages with a blank line. Anthropic
@@ -1649,6 +1654,39 @@ mod tests {
         let err = project_context(&events, dir.path()).unwrap_err();
 
         assert!(matches!(err, ProjectionError::BootDrift { ref path } if path == "boot.md"));
+    }
+
+    #[test]
+    fn a_boot_path_naming_a_credential_is_refused() {
+        // MUTATION-CHECKED. guard.rs's TRIPWIRE, closed. `resolve_boot_path`
+        // read `data.path` with a bare root-containment check, bypassing
+        // judge / is_credential / is_noise entirely. That was safe only while
+        // nothing let a client choose a boot path — and D-4 makes the manifest
+        // operator-writable, so an operator could declare
+        // `boot = ["repos/x/Secrets.xcconfig"]` and the next instance created
+        // would boot with a credential in its system prompt, past the one gate
+        // built to prevent exactly that.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "TOKEN=hunter2\n").unwrap();
+        std::fs::write(dir.path().join("Secrets.xcconfig"), "KEY=live\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(dir.path().join("node_modules/pkg/boot.md"), "# no\n").unwrap();
+        std::fs::write(dir.path().join("real-boot.md"), "# yes\n").unwrap();
+
+        for denied in [".env", "Secrets.xcconfig", "node_modules/pkg/boot.md"] {
+            assert!(
+                resolve_boot_path(dir.path(), denied).is_err(),
+                "{denied} must never be readable as a boot file"
+            );
+        }
+
+        // The other half, and it is what makes this test non-vacuous:
+        // asserting only that things are refused would pass identically if the
+        // function returned Err for everything.
+        assert!(
+            resolve_boot_path(dir.path(), "real-boot.md").is_ok(),
+            "an ordinary boot file must still resolve"
+        );
     }
 
     #[test]
