@@ -56,11 +56,19 @@ impl ToolError {
             "malformed_path" => StatusCode::BAD_REQUEST,
             "outside_workspace" | "denied_credential" | "denied_noise" => StatusCode::FORBIDDEN,
             "not_found" => StatusCode::NOT_FOUND,
-            "is_a_directory" | "not_a_directory" | "invalid_input" | "invalid_pattern" => {
-                StatusCode::BAD_REQUEST
-            }
+            "is_a_directory" | "not_a_directory" | "invalid_input" | "invalid_pattern"
+            | "composition_locked" | "no_match" | "ambiguous_match" => StatusCode::BAD_REQUEST,
+            // NOT joined to the arm above: `not_openable` is already mapped
+            // here, an earlier arm would silently win, and `-D warnings` would
+            // stay quiet because the later arm is still reachable via
+            // `"not_text"`. None of these codes is ours to change on the way
+            // past.
             "not_openable" | "not_text" => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+            // Explicit rather than falling through: a failed disk write is
+            // genuinely the server's problem, and saying so deliberately keeps
+            // it distinguishable from an unrecognised code.
+            "write_failed" | "read_failed" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -212,7 +220,136 @@ pub fn definitions() -> Vec<serde_json::Value> {
                 "required": ["query"],
             },
         }),
+        // E-4: new definitions APPEND. The five above keep their positions or
+        // the cached prompt prefix through them is invalidated — and a parallel
+        // window is adding git verbs to this same list, so whichever merges
+        // second appends after, never interleaves.
+        serde_json::json!({
+            "name": "write_file",
+            "description": format!(
+                "Create a file, or replace an existing file's contents entirely. The \
+                 path is relative to the workspace root, and missing parent \
+                 directories are created and named in the result. Writes land on real \
+                 files in the real checkout, immediately. ALWAYS prefer editing an \
+                 existing file with `edit_file` over rewriting it with this — a full \
+                 rewrite of a file you only meant to change part of is the most \
+                 expensive mistake this tool can make. `read_file` cuts any line over \
+                 {MAX_LINE_BYTES} bytes and marks it `{TRUNCATION_MARKER}`: NEVER \
+                 write back content carrying that marker, it is display text and the \
+                 cut bytes are gone."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative path.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The file's complete new contents.",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+        }),
+        serde_json::json!({
+            "name": "edit_file",
+            "description": "Replace an exact string in an existing file. `old_string` \
+                            must appear EXACTLY ONCE — include surrounding lines until \
+                            it is unique. Whitespace and indentation are significant. \
+                            Read the file first, and send the file's own text WITHOUT \
+                            read_file's line-number prefixes: the \"   12\\t\" at the \
+                            start of each line is display formatting, not file content, \
+                            and it is the most common reason an edit finds nothing. \
+                            This never creates a file — use `write_file` for that. \
+                            ALWAYS prefer this over rewriting a whole file.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative path to an existing file.",
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact text to replace. Must appear exactly once in the file.",
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Text to put in its place.",
+                    },
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        }),
     ]
+}
+
+/// What a tool body is allowed to know about the session it runs in.
+///
+/// Replaces the bare `&Path`. Tool bodies stay pure functions of their inputs
+/// — no log handle, no session, no runtime — so they remain testable with a
+/// `tempdir` alone. Anything a body needs to KNOW about the instance arrives
+/// here; anything it wants to CHANGE leaves via `ToolOutcome::effects`.
+pub struct ToolCtx {
+    pub root: PathBuf,
+    /// WD-9. Read from `instance_created.data.mayWriteComposition`, default
+    /// **off**. D-4 makes the manifest operator-writable in principle; this is
+    /// the per-session grant that decides whether *this* session is the one
+    /// doing it.
+    pub may_write_composition: bool,
+}
+
+/// A tool's rendered text, plus the durable facts its execution produced.
+///
+/// **Tool bodies describe effects; the loop records them.** Appending is
+/// `async` (`append_child(…).await`) and `dispatch` runs inside
+/// `spawn_blocking`, so a body could not await an append even if it held the
+/// handle — and event-appending belongs in the one place that already owns
+/// `state` and `stream`.
+#[derive(Debug)]
+pub struct ToolOutcome {
+    pub text: String,
+    pub effects: Vec<Effect>,
+}
+
+impl ToolOutcome {
+    /// The overwhelmingly common case: a tool that changed nothing.
+    pub(crate) fn text(text: String) -> Self {
+        ToolOutcome {
+            text,
+            effects: Vec::new(),
+        }
+    }
+}
+
+/// A durable fact produced by executing a tool, for the loop to append.
+///
+/// An enum with one variant today, and deliberately so: the parallel window's
+/// git verbs can add their own without touching this seam again, and the loop's
+/// `match` over it means a new variant is a compile error rather than a
+/// silently dropped event.
+#[derive(Debug)]
+pub enum Effect {
+    FileChanged {
+        /// **WD-13.** The RESOLVED workspace-relative path, never the request
+        /// spelling. WD-11 canonicalizes precisely because one file has
+        /// several spellings; recording the model's own string would give two
+        /// writes to one inode two events a consumer cannot join, and break
+        /// the before/after hash chain across them. D-1's whole claim is a
+        /// machine fact the model cannot narrate over, and a path the model
+        /// chose is exactly a narratable one.
+        path: String,
+        /// `"created"` or `"modified"`. **WD-7: two ops, because two verbs.**
+        /// `moved`/`deleted` were written into the decisions doc before their
+        /// verbs existed; an op no verb emits is an unreachable branch a
+        /// reducer must nonetheless handle.
+        op: &'static str,
+        /// `None` on create — there was no prior content to hash.
+        before: Option<String>,
+        after: String,
+    },
 }
 
 /// Execute one tool call.
@@ -222,26 +359,49 @@ pub fn definitions() -> Vec<serde_json::Value> {
 /// dangle, and they are right for a reason measured here: a `tool_use` with no
 /// `tool_result` is a 400 that kills every later turn. A stale or misspelled
 /// name must come back as a refusal the model can read.
-pub fn dispatch(name: &str, input: &serde_json::Value, root: &Path) -> Result<String, ToolError> {
+pub fn dispatch(
+    name: &str,
+    input: &serde_json::Value,
+    ctx: &ToolCtx,
+) -> Result<ToolOutcome, ToolError> {
+    let root = ctx.root.as_path();
     match name {
-        "get_composition" => get_composition(root),
-        "list_directory" => list_directory(root, required_str(input, "path", name)?),
+        "get_composition" => get_composition(root).map(ToolOutcome::text),
+        "list_directory" => {
+            list_directory(root, required_str(input, "path", name)?).map(ToolOutcome::text)
+        }
         "read_file" => read_page(
             root,
             required_str(input, "path", name)?,
             optional_usize(input, "offset", 1)?,
             optional_usize(input, "limit", DEFAULT_LINES)?,
-        ),
+        )
+        .map(ToolOutcome::text),
         "find_files" => crate::search::find_files(
             root,
             required_str(input, "pattern", name)?,
             optional_str(input, "path"),
-        ),
+        )
+        .map(ToolOutcome::text),
         "search" => crate::search::search(
             root,
             required_str(input, "query", name)?,
             optional_str(input, "path"),
             input.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false),
+        )
+        .map(ToolOutcome::text),
+        // Returns a `ToolOutcome` directly — no `.map(ToolOutcome::text)`,
+        // because a write is the one verb with effects to describe.
+        "write_file" => crate::write::write_file(
+            ctx,
+            required_str(input, "path", name)?,
+            required_str(input, "content", name)?,
+        ),
+        "edit_file" => crate::write::edit_file(
+            ctx,
+            required_str(input, "path", name)?,
+            required_str(input, "old_string", name)?,
+            required_str(input, "new_string", name)?,
         ),
         other => Err(ToolError::new(
             "unknown_tool",
@@ -475,13 +635,22 @@ fn list_directory(root: &Path, path: &str) -> Result<String, ToolError> {
 /// over the ceiling it still refuses. The tool pages instead and never meets
 /// this constant — which is the point of D15. No file is too large for a model
 /// to read; it is only too large to read at once.
-const MAX_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_BYTES: u64 = 1024 * 1024;
 
 /// The most bytes one line may contribute before it is cut.
 ///
 /// A minified bundle or a base64 blob is one line of several megabytes. Without
 /// this, a single line defeats every other cap on this page.
 const MAX_LINE_BYTES: usize = 4000;
+
+/// The marker `read_page` appends to a line it cut at `MAX_LINE_BYTES`.
+///
+/// **One constant, three readers:** the line renderer that writes it, the
+/// footer that counts it, and `write::write_file`, which refuses content
+/// carrying it (WD-14). Three copies of this string would eventually disagree,
+/// and the one that drifted would be the refusal — silently letting display
+/// text be saved as a file.
+pub(crate) const TRUNCATION_MARKER: &str = "…[line truncated]";
 
 /// The most bytes one page may carry, whatever the line budget allows.
 ///
@@ -504,7 +673,28 @@ fn open_readable(root: &Path, path: &str) -> Result<(PathBuf, u64), ToolError> {
     let meta = resolved
         .metadata()
         .map_err(|_| ToolError::new("not_found", format!("nothing at {path}")))?;
-    if meta.is_dir() {
+    gate_openable(&resolved, path, meta.is_dir())?;
+
+    Ok((resolved, meta.len()))
+}
+
+/// The half of the gate that is about the FILE rather than about reading it.
+///
+/// **Ordering is load-bearing and inherited from `file.rs`:** refuse a
+/// directory first, then refuse a type that is not served as text — so a 300 MB
+/// `.zip` reads as "can't open this type" rather than "too large", and
+/// `write_file("notes", …)` on a directory reads as `is_a_directory` rather
+/// than `not_openable`. The misleading-reason failure this ordering fixed once
+/// for reads is the same one it now prevents for writes.
+///
+/// **Shared with `write.rs` (WD-5).** `write_file` takes a string, so writing a
+/// `.png` is meaningless; reusing the read allowlist means the set of files you
+/// can write is exactly the set you can read, with no second rule to keep in
+/// sync. The resolution differs between reading and writing — a create resolves
+/// a path that does not exist — so the gate takes an already-resolved path and
+/// whether it is a directory, rather than resolving for itself.
+pub(crate) fn gate_openable(resolved: &Path, path: &str, is_dir: bool) -> Result<(), ToolError> {
+    if is_dir {
         return Err(ToolError::new(
             "is_a_directory",
             format!("{path} is a directory"),
@@ -522,7 +712,7 @@ fn open_readable(root: &Path, path: &str) -> Result<(PathBuf, u64), ToolError> {
         ));
     }
 
-    Ok((resolved, meta.len()))
+    Ok(())
 }
 
 /// One whole file, for the `/file` route. Unchanged behaviour, shared gate.
@@ -637,6 +827,7 @@ fn read_page(root: &Path, path: &str, offset: usize, limit: usize) -> Result<Str
 
     let mut seen = 0usize;
     let mut emitted = 0usize;
+    let mut truncated_lines = 0usize;
     let mut body = String::new();
     let mut more = false;
 
@@ -651,7 +842,8 @@ fn read_page(root: &Path, path: &str, offset: usize, limit: usize) -> Result<Str
         }
         let mut rendered = format!("{seen:>6}\t{}", line.text);
         if line.truncated {
-            rendered.push_str(" …[line truncated]");
+            rendered.push(' ');
+            rendered.push_str(TRUNCATION_MARKER);
         }
         rendered.push('\n');
 
@@ -663,6 +855,12 @@ fn read_page(root: &Path, path: &str, offset: usize, limit: usize) -> Result<Str
         }
         body.push_str(&rendered);
         emitted += 1;
+        // Counted only for lines that actually reached the page — a line cut
+        // by the byte cap above never made it, and claiming it did would
+        // overstate the loss.
+        if line.truncated {
+            truncated_lines += 1;
+        }
     }
 
     // Every branch below returns non-empty content: an empty text block is a
@@ -677,11 +875,24 @@ fn read_page(root: &Path, path: &str, offset: usize, limit: usize) -> Result<Str
     }
 
     let last = start + emitted - 1;
-    let footer = if more {
+    let mut footer = if more {
         format!("[more lines follow; call read_file with offset={}]\n", last + 1)
     } else {
         "[end of file]\n".to_string()
     };
+    if truncated_lines > 0 {
+        // WD-14. The paging signal already lives in the footer and already
+        // works; this joins it rather than inventing a second channel. Today
+        // the only marker is one inline cut in a 500-line page, easy to lose —
+        // and the write verbs are what turn losing it from a display
+        // limitation into a data-loss path, since a read→write round trip
+        // makes the cut permanent and records it as a clean `modified`.
+        let noun = if truncated_lines == 1 { "line" } else { "lines" };
+        footer.push_str(&format!(
+            "[{truncated_lines} {noun} truncated at {MAX_LINE_BYTES} bytes — \
+             this is not the file's full contents; do not write it back to a file]\n"
+        ));
+    }
     Ok(format!("{path} lines {start}-{last}\n{body}{footer}"))
 }
 
@@ -733,6 +944,41 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// A context over a root, with no composition grant — what every read verb
+    /// runs under.
+    fn ctx(root: &Path) -> ToolCtx {
+        ToolCtx {
+            root: root.to_path_buf(),
+            may_write_composition: false,
+        }
+    }
+
+    /// The switch, called the way it was before WD-10.
+    ///
+    /// `ToolCtx`/`ToolOutcome` exist so a WRITE can describe its effects; a
+    /// read has none, so this keeps the twenty-odd existing tests reading
+    /// exactly as they did rather than growing a `.text` at every assertion.
+    fn call(name: &str, input: serde_json::Value, root: &Path) -> Result<String, ToolError> {
+        dispatch(name, &input, &ctx(root)).map(|o| o.text)
+    }
+
+    #[test]
+    fn an_ordinary_tool_produces_text_and_no_effects() {
+        // The seam's contract: reading changes nothing, so a read verb's
+        // outcome carries an empty effect list. Pins that `effects` is not
+        // accidentally populated by the plumbing itself.
+        let dir = tree_fixture();
+        let out = dispatch(
+            "list_directory",
+            &serde_json::json!({ "path": "" }),
+            &ctx(dir.path()),
+        )
+        .unwrap();
+
+        assert!(!out.text.is_empty());
+        assert!(out.effects.is_empty(), "a read must record no effect");
+    }
+
     /// A workspace shaped like the real one: a public manifest, a private
     /// overlay, one protocol whose source exists and one whose source does not.
     fn workspace() -> tempfile::TempDir {
@@ -762,7 +1008,7 @@ mod tests {
     #[test]
     fn get_composition_reports_what_the_manifests_declare() {
         let dir = workspace();
-        let out = dispatch("get_composition", &serde_json::json!({}), dir.path()).unwrap();
+        let out = call("get_composition", serde_json::json!({}), dir.path()).unwrap();
 
         assert!(out.contains("tycho"), "{out}");
         assert!(out.contains("kairos-engine"), "{out}");
@@ -774,7 +1020,7 @@ mod tests {
         // C-3, and the reason it exists: a local model once read commented-out
         // examples as a live composition. A TOML parser makes it impossible.
         let dir = workspace();
-        let out = dispatch("get_composition", &serde_json::json!({}), dir.path()).unwrap();
+        let out = call("get_composition", serde_json::json!({}), dir.path()).unwrap();
 
         assert!(
             !out.contains("ghost"),
@@ -785,7 +1031,7 @@ mod tests {
     #[test]
     fn protocol_presence_is_reported_because_a_missing_source_is_skipped_not_an_error() {
         let dir = workspace();
-        let out = dispatch("get_composition", &serde_json::json!({}), dir.path()).unwrap();
+        let out = call("get_composition", serde_json::json!({}), dir.path()).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
 
         let by_name = |n: &str| -> bool {
@@ -808,7 +1054,7 @@ mod tests {
         // A quarter of `/composition`'s bytes are hex a model cannot verify and
         // cannot act on. Drift detection is an engine concern.
         let dir = workspace();
-        let out = dispatch("get_composition", &serde_json::json!({}), dir.path()).unwrap();
+        let out = call("get_composition", serde_json::json!({}), dir.path()).unwrap();
 
         assert!(!out.contains("sha256"), "{out}");
     }
@@ -840,7 +1086,7 @@ mod tests {
     fn a_bare_clone_composes_nothing_and_that_is_not_an_error() {
         // C-4: presence-gated throughout. A bare clone is a working host.
         let dir = tempfile::tempdir().unwrap();
-        let out = dispatch("get_composition", &serde_json::json!({}), dir.path())
+        let out = call("get_composition", serde_json::json!({}), dir.path())
             .expect("a bare clone is a working host, not a failure");
 
         assert!(!out.contains("tycho"), "{out}");
@@ -852,7 +1098,7 @@ mod tests {
         // so a stale or misspelled name must come back as something the model
         // can read.
         let dir = workspace();
-        let err = dispatch("read_the_future", &serde_json::json!({}), dir.path()).unwrap_err();
+        let err = call("read_the_future", serde_json::json!({}), dir.path()).unwrap_err();
 
         assert_eq!(err.status, "unknown_tool");
         assert!(err.detail.contains("read_the_future"));
@@ -867,7 +1113,10 @@ mod tests {
         // incidental.
         assert_eq!(
             names,
-            ["get_composition", "list_directory", "read_file", "find_files", "search"]
+            [
+                "get_composition", "list_directory", "read_file", "find_files",
+                "search", "write_file", "edit_file"
+            ]
         );
         for d in &defs {
             assert_eq!(d["input_schema"]["type"], "object");
@@ -894,9 +1143,9 @@ mod tests {
     #[test]
     fn list_directory_names_entries_and_marks_which_are_directories() {
         let dir = tree_fixture();
-        let out = dispatch(
+        let out = call(
             "list_directory",
-            &serde_json::json!({ "path": "" }),
+            serde_json::json!({ "path": "" }),
             dir.path(),
         )
         .unwrap();
@@ -917,7 +1166,7 @@ mod tests {
         for n in 0..MAX_ENTRIES + 11 {
             fs::write(dir.path().join(format!("note-{n:04}.md")), "x").unwrap();
         }
-        let out = dispatch("list_directory", &serde_json::json!({ "path": "" }), dir.path())
+        let out = call("list_directory", serde_json::json!({ "path": "" }), dir.path())
             .unwrap();
 
         assert!(
@@ -936,7 +1185,7 @@ mod tests {
         // path, the truncation footer's own "of 511" satisfied it and the
         // header's count was tested by nothing.
         let dir = tree_fixture();
-        let out = dispatch("list_directory", &serde_json::json!({ "path": "" }), dir.path())
+        let out = call("list_directory", serde_json::json!({ "path": "" }), dir.path())
             .unwrap();
 
         assert!(out.contains("2 entries"), "commons/ and README.md: {out}");
@@ -946,7 +1195,7 @@ mod tests {
     #[test]
     fn credentials_and_build_output_never_reach_a_listing() {
         let dir = tree_fixture();
-        let out = dispatch("list_directory", &serde_json::json!({ "path": "" }), dir.path())
+        let out = call("list_directory", serde_json::json!({ "path": "" }), dir.path())
             .unwrap();
 
         assert!(!out.contains(".env"), "{out}");
@@ -959,9 +1208,9 @@ mod tests {
         // something.
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("empty")).unwrap();
-        let out = dispatch(
+        let out = call(
             "list_directory",
-            &serde_json::json!({ "path": "empty" }),
+            serde_json::json!({ "path": "empty" }),
             dir.path(),
         )
         .unwrap();
@@ -972,9 +1221,9 @@ mod tests {
     #[test]
     fn list_directory_refuses_a_file_and_names_the_recovery() {
         let dir = tree_fixture();
-        let err = dispatch(
+        let err = call(
             "list_directory",
-            &serde_json::json!({ "path": "README.md" }),
+            serde_json::json!({ "path": "README.md" }),
             dir.path(),
         )
         .unwrap_err();
@@ -985,9 +1234,9 @@ mod tests {
     #[test]
     fn list_directory_carries_the_guards_own_code_for_a_denied_path() {
         let dir = tree_fixture();
-        let err = dispatch(
+        let err = call(
             "list_directory",
-            &serde_json::json!({ "path": "node_modules" }),
+            serde_json::json!({ "path": "node_modules" }),
             dir.path(),
         )
         .unwrap_err();
@@ -999,7 +1248,7 @@ mod tests {
     fn a_tool_call_missing_its_required_path_is_an_error_result_not_a_panic() {
         let dir = tree_fixture();
         for name in ["list_directory", "read_file"] {
-            let err = dispatch(name, &serde_json::json!({}), dir.path()).unwrap_err();
+            let err = call(name, serde_json::json!({}), dir.path()).unwrap_err();
             assert_eq!(err.status, "invalid_input", "{name}");
             assert!(err.detail.contains("path"), "{name}: {}", err.detail);
         }
@@ -1008,7 +1257,7 @@ mod tests {
     // ---- read_file (D15) ----
 
     fn read(dir: &Path, input: serde_json::Value) -> String {
-        dispatch("read_file", &input, dir).unwrap()
+        call("read_file", input, dir).unwrap()
     }
 
     /// A file of `n` lines, each `line-0001`-shaped so a window is identifiable.
@@ -1117,6 +1366,41 @@ mod tests {
     }
 
     #[test]
+    fn a_page_carrying_a_truncated_line_says_so_in_the_footer() {
+        // WD-14. Today the only marker is one inline `…[line truncated]` in a
+        // 500-line page — easy to lose, and this branch is what makes losing
+        // it expensive: a read→write round trip makes the cut permanent and
+        // records it as a clean `modified`.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("wide.md"),
+            format!("{}\nshort\n", "z".repeat(MAX_LINE_BYTES * 2)),
+        )
+        .unwrap();
+
+        let out = read(dir.path(), serde_json::json!({ "path": "wide.md" }));
+
+        assert!(out.contains("1 line truncated"), "the count must be named: {out}");
+        assert!(
+            out.contains("not the file's full contents"),
+            "the footer must say what the truncation COST: {out}"
+        );
+    }
+
+    #[test]
+    fn a_page_with_nothing_truncated_carries_no_truncation_footer() {
+        // The other half. A footer asserted only on the truncated path would
+        // pass identically if it were printed unconditionally — and a page
+        // that always claims to be incomplete is worth nothing.
+        let dir = tempfile::tempdir().unwrap();
+        lined_file(dir.path(), "notes.md", 3);
+
+        let out = read(dir.path(), serde_json::json!({ "path": "notes.md" }));
+
+        assert!(!out.contains("truncated"), "{out}");
+    }
+
+    #[test]
     fn truncating_an_over_long_line_never_splits_a_character() {
         // The cap is measured in bytes and this workspace writes `.爻` files:
         // three bytes per character, so the cap lands mid-character by default.
@@ -1206,7 +1490,7 @@ mod tests {
             ("nope.md", "not_found"),
             ("../escape.md", "outside_workspace"),
         ] {
-            let err = dispatch("read_file", &serde_json::json!({ "path": path }), dir.path())
+            let err = call("read_file", serde_json::json!({ "path": path }), dir.path())
                 .unwrap_err();
             assert_eq!(err.status, status, "{path}");
         }
@@ -1219,7 +1503,7 @@ mod tests {
         // serves a credential.
         let dir = tree_fixture();
         let via_route = read_whole(dir.path(), ".env").unwrap_err();
-        let via_tool = dispatch("read_file", &serde_json::json!({ "path": ".env" }), dir.path())
+        let via_tool = call("read_file", serde_json::json!({ "path": ".env" }), dir.path())
             .unwrap_err();
 
         assert_eq!(via_route.status, via_tool.status);
@@ -1236,17 +1520,17 @@ mod tests {
         fs::write(dir.path().join("modules.toml"), "[router]\ncontains = [\"a.md\"]\n").unwrap();
         fs::write(dir.path().join("a.md"), "needle\n").unwrap();
 
-        let found = dispatch(
+        let found = call(
             "search",
-            &serde_json::json!({ "query": "needle" }),
+            serde_json::json!({ "query": "needle" }),
             dir.path(),
         )
         .unwrap();
         assert!(found.contains("a.md"), "{found}");
 
-        let listed = dispatch(
+        let listed = call(
             "find_files",
-            &serde_json::json!({ "pattern": "*.md" }),
+            serde_json::json!({ "pattern": "*.md" }),
             dir.path(),
         )
         .unwrap();
@@ -1257,9 +1541,66 @@ mod tests {
     fn a_search_verb_missing_its_required_argument_is_an_error_not_a_panic() {
         let dir = tree_fixture();
         for (name, key) in [("search", "query"), ("find_files", "pattern")] {
-            let err = dispatch(name, &serde_json::json!({}), dir.path()).unwrap_err();
+            let err = call(name, serde_json::json!({}), dir.path()).unwrap_err();
             assert_eq!(err.status, "invalid_input", "{name}");
             assert!(err.detail.contains(key), "{name}: {}", err.detail);
+        }
+    }
+
+    // ---- the two write verbs, through dispatch ----
+
+    #[test]
+    fn the_write_verbs_are_reachable_by_the_names_their_definitions_declare() {
+        // `unknown_tool` is the failure this pins: a working body behind a
+        // misspelled arm is a green suite and a dead tool.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("modules.toml"), "[router]\ncontains = [\"a.md\"]\n").unwrap();
+        let ctx = ctx(dir.path());
+
+        let made = dispatch(
+            "write_file",
+            &serde_json::json!({ "path": "a.md", "content": "one\n" }),
+            &ctx,
+        )
+        .unwrap();
+        assert!(made.text.contains("created"), "{}", made.text);
+        assert_eq!(made.effects.len(), 1, "a write must record exactly one effect");
+
+        let edited = dispatch(
+            "edit_file",
+            &serde_json::json!({ "path": "a.md", "old_string": "one", "new_string": "two" }),
+            &ctx,
+        )
+        .unwrap();
+        assert!(edited.text.contains("modified"), "{}", edited.text);
+        assert_eq!(edited.effects.len(), 1);
+        assert_eq!(fs::read_to_string(dir.path().join("a.md")).unwrap(), "two\n");
+    }
+
+    #[test]
+    fn a_write_verb_missing_a_required_argument_is_an_error_not_a_panic() {
+        let dir = tree_fixture();
+        for (name, key) in [("write_file", "content"), ("edit_file", "old_string")] {
+            let err = call(name, serde_json::json!({ "path": "README.md" }), dir.path())
+                .unwrap_err();
+            assert_eq!(err.status, "invalid_input", "{name}");
+            assert!(err.detail.contains(key), "{name}: {}", err.detail);
+        }
+    }
+
+    #[test]
+    fn the_new_statuses_map_to_the_codes_the_explorer_already_consumes() {
+        for (status, expected) in [
+            ("composition_locked", StatusCode::BAD_REQUEST),
+            ("no_match", StatusCode::BAD_REQUEST),
+            ("ambiguous_match", StatusCode::BAD_REQUEST),
+            ("write_failed", StatusCode::INTERNAL_SERVER_ERROR),
+            // Pinned because it is the one that must NOT move: `not_openable`
+            // is already mapped, and adding it to an earlier BAD_REQUEST arm
+            // would silently win while `-D warnings` stayed quiet.
+            ("not_openable", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ] {
+            assert_eq!(ToolError::new(status, "x").http_status(), expected, "{status}");
         }
     }
 

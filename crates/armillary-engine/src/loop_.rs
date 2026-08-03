@@ -95,6 +95,26 @@ fn operator_label(events: &[EventEnvelope]) -> String {
         .to_string()
 }
 
+/// **WD-9.** Whether this instance may write the workspace manifests.
+///
+/// Read from `instance_created.data`, exactly as `operator_label` reads the
+/// operator: per-instance facts already live there, and deriving it from the
+/// log rather than from a side table keeps I-1's "the log is the truth" honest.
+///
+/// `pub` rather than private so `tests/routes.rs` can prove the WRITER
+/// (`routes::instances::create`) and this READER agree on the key. A private
+/// reader tested against a hand-built event proves only that the reader is
+/// self-consistent — which is the seam-defect shape this repo has shipped once
+/// already.
+pub fn may_write_composition(events: &[EventEnvelope]) -> bool {
+    events
+        .iter()
+        .find(|e| e.event_type == "instance_created")
+        .and_then(|e| e.data.get("mayWriteComposition"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 fn assistant_actor(operator: &str) -> Actor {
     Actor {
         role: Role::Operator,
@@ -295,6 +315,8 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
         }
     };
     let operator = operator_label(&events);
+    // Read once per turn, from the same event slice `operator_label` was given.
+    let write_grant = may_write_composition(&events);
 
     // Text produced by rounds already finished. The provider restarts its own
     // accumulator on every call, so without this the phone's bubble would jump
@@ -491,16 +513,50 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
                 return;
             }
 
-            let root = state.root.clone();
+            let ctx = crate::tools::ToolCtx {
+                root: state.root.clone(),
+                may_write_composition: write_grant,
+            };
             let (n, i) = (name.clone(), input.clone());
-            let executed = tokio::task::spawn_blocking(move || crate::tools::dispatch(&n, &i, &root))
+            let executed = tokio::task::spawn_blocking(move || crate::tools::dispatch(&n, &i, &ctx))
                 .await
                 .unwrap_or_else(|_| Err(crate::tools::ToolError { status: "tool_panicked", detail: String::new() }));
 
             let (status, content, is_error) = match executed {
                 Ok(out) => {
-                    produced_content |= !out.is_empty();
-                    ("ok".to_string(), out, false)
+                    for effect in &out.effects {
+                        // A `match`, not a `let`-destructure: when the git
+                        // verbs add a second variant, a missing case must be a
+                        // compile error rather than a silently dropped event.
+                        let ev = match effect {
+                            crate::tools::Effect::FileChanged { path, op, before, after } => NewEvent {
+                                // `Role::Tool`, matching `tool_result` — the
+                                // model asked, the tool answered.
+                                actor: Actor { role: Role::Tool, instance: None },
+                                event_type: "file_changed".to_string(),
+                                data: serde_json::json!({
+                                    "path": path, "op": op, "before": before, "after": after,
+                                }),
+                            },
+                        };
+                        // Appended BEFORE the tool_result below: the effect
+                        // preceded the report of it, and a replay should read
+                        // that way.
+                        if let Err(e) = append_child(&state, &stream, &assistant_id, ev).await {
+                            // I-5: a failed log write surfaces to its writer.
+                            // Deliberately NOT a `return` like the tool_use
+                            // failure above — the file is already on disk, so
+                            // this is a record we failed to keep, not a
+                            // mutation we failed to make, and abandoning the
+                            // turn would leave the model with no tool_result
+                            // for a write that actually happened.
+                            eprintln!(
+                                "log_write_failed appending file_changed for stream {stream:?}: {e:?}"
+                            );
+                        }
+                    }
+                    produced_content |= !out.text.is_empty();
+                    ("ok".to_string(), out.text, false)
                 }
                 Err(err) => {
                     // Escalate rather than repeat: a tool that just failed is
@@ -737,6 +793,49 @@ mod tests {
     use crate::sessions::Sessions;
     use crate::state::{AppState, ModelConfig};
 
+    fn bare_event(seq: u64, id: &str, event_type: &str, data: serde_json::Value) -> EventEnvelope {
+        EventEnvelope {
+            stream: "s1".to_string(),
+            id: id.to_string(),
+            seq,
+            ts: "2026-08-02T00:00:00Z".to_string(),
+            actor: Actor {
+                role: Role::System,
+                instance: None,
+            },
+            event_type: event_type.to_string(),
+            thread: None,
+            parent: None,
+            version: 1,
+            cost: None,
+            data,
+        }
+    }
+
+    #[test]
+    fn the_composition_grant_is_read_from_instance_created_and_defaults_off() {
+        // WD-9. Per-instance facts live in `instance_created.data` — this reads
+        // the grant exactly as `operator_label` reads the operator, so the flag
+        // is log-derived rather than held in a side table that could disagree
+        // with the log. The default is asserted rather than assumed: a grant
+        // that defaults on is the whole protection gone.
+        let granted = vec![bare_event(
+            1,
+            "i1",
+            "instance_created",
+            serde_json::json!({ "operator": "tycho", "startedAt": "t", "mayWriteComposition": true }),
+        )];
+        let plain = vec![bare_event(
+            1,
+            "i1",
+            "instance_created",
+            serde_json::json!({ "operator": "tycho", "startedAt": "t" }),
+        )];
+
+        assert!(may_write_composition(&granted));
+        assert!(!may_write_composition(&plain));
+    }
+
     fn model_config() -> ModelConfig {
         ModelConfig {
             model: "claude-sonnet-5".to_string(),
@@ -863,6 +962,118 @@ mod tests {
             provider,
             boot: None,
         })
+    }
+
+    #[tokio::test]
+    async fn a_write_through_a_real_turn_appends_file_changed_before_its_tool_result() {
+        // MUTATION-CHECKED. The unit tests stop at `dispatch` and prove the
+        // verb produces an Effect; nothing else proves the LOOP turns that
+        // Effect into a durable event. That is the whole of WD-10's seam, and
+        // a body that describes an effect no one records is worth nothing.
+        //
+        // Order is asserted, not incidental: `file_changed` precedes
+        // `tool_result` because the effect preceded the report of it, and a
+        // replay should read that way.
+        let data_dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("modules.toml"), "[[repos]]\nname='r'\npath='p'\n")
+            .unwrap();
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance(&sessions, Some("tycho")).await;
+
+        let provider = std::sync::Arc::new(RoundScript::new(vec![
+            calls_with(
+                "toolu_w1",
+                "write_file",
+                serde_json::json!({ "path": "notes.md", "content": "written by a turn\n" }),
+            ),
+            says("done"),
+        ]));
+        let state = state_with(provider, sessions.clone(), root.path()).await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+
+        // The write is real, on the real disk.
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("notes.md")).unwrap(),
+            "written by a turn\n"
+        );
+
+        let events = sessions.store().read_from(&id, 0).unwrap();
+        let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "instance_created",
+                "user_message",
+                "assistant_message",
+                "tool_use",
+                "file_changed",
+                "tool_result",
+                "assistant_message"
+            ],
+            "{types:?}"
+        );
+
+        let changed = events
+            .iter()
+            .find(|e| e.event_type == "file_changed")
+            .unwrap();
+        assert_eq!(changed.data["path"], "notes.md");
+        assert_eq!(changed.data["op"], "created");
+        assert!(changed.data["before"].is_null(), "a create has no prior content");
+        assert_eq!(
+            changed.data["after"],
+            crate::hash::sha256_hex(b"written by a turn\n")
+        );
+        // `Role::Tool`, matching `tool_result` — the model asked, the tool
+        // answered.
+        assert_eq!(changed.actor.role, Role::Tool);
+        // Durable, so it must carry a real seq (I-4: 0 is transient).
+        assert!(changed.seq > 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_write_emits_no_file_changed_at_all() {
+        // D-1's central discipline: this records EFFECT, not intent. The moment
+        // it logs a refusal it is a second copy of `tool_use` and worth
+        // nothing. A guard denial is a `tool_result` error and nothing else.
+        let data_dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("modules.toml"), "[[repos]]\nname='r'\npath='p'\n")
+            .unwrap();
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance(&sessions, Some("tycho")).await;
+
+        let provider = std::sync::Arc::new(RoundScript::new(vec![
+            calls_with(
+                "toolu_w1",
+                "write_file",
+                serde_json::json!({ "path": "secrets.json", "content": "{}" }),
+            ),
+            says("refused"),
+        ]));
+        let state = state_with(provider, sessions.clone(), root.path()).await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+
+        assert!(!root.path().join("secrets.json").exists());
+
+        let events = sessions.store().read_from(&id, 0).unwrap();
+        assert!(
+            !events.iter().any(|e| e.event_type == "file_changed"),
+            "a refusal logged an effect it never had"
+        );
+        let result = events
+            .iter()
+            .find(|e| e.event_type == "tool_result")
+            .unwrap();
+        assert_eq!(result.data["status"], "denied_credential");
+        assert_eq!(result.data["isError"], true);
     }
 
     #[tokio::test]

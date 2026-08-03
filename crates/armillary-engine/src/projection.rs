@@ -204,34 +204,40 @@ const HANDLED_TYPES: &[&str] = &[
     "return",
     "tool_use",
     "tool_result",
+    "file_changed",
 ];
 
-/// Join `rel` under `root` and require the canonical result to stay under
-/// `root` — a `data.path` that escapes root is not a different kind of error, it
-/// is the same `BootUnreadable` a missing file produces, since neither is ever a
+/// Resolve a boot event's `data.path` under `root`, through the same guard
+/// every other path in this engine passes.
+///
+/// A `data.path` that escapes root is not a different kind of error, it is the
+/// same `BootUnreadable` a missing file produces, since neither is ever a
 /// legitimate boot source.
 ///
-/// Containment is ALL this checks. `Path::join` with an absolute argument
-/// replaces the base, so an absolute `data.path` pointing inside root passes here
-/// — refusing absolute paths is the caller's job (see
-/// `routes::instances::append_boot_event`, which does it before ever appending
-/// one). `guard::resolve` is the resolver that rejects absolute paths and `..`
-/// components outright; unifying on it is parked for Phase 2.
+/// **This was containment WITHOUT judgement** — a bare canonicalize plus
+/// `starts_with`, which `guard.rs`'s TRIPWIRE named as safe only while nothing
+/// let a client choose or write a boot path. D-4 makes `modules.local.toml`
+/// operator-writable, so a `boot` array could name a credential and the next
+/// instance created would boot with it in its system prompt. `guard::resolve`
+/// performs the same containment check and then judges every component of the
+/// canonical path, so that declaration is now refused.
+///
+/// `is_openable` is deliberately NOT added on top: `weigh_boot_file` already
+/// refuses non-UTF-8, which covers the binary case without a second rule to
+/// keep in sync. And `guard::resolve` additionally rejects absolute paths and
+/// `..` components, which this function used to accept — `weigh_boot_file`
+/// refuses absolutes itself before ever appending one, and `rerecord_boot`
+/// records an unresolvable path absent, so neither caller changes behaviour
+/// beyond refusing more.
 ///
 /// `pub(crate)` (not private): the loop (`loop_.rs`) re-records a fresh
 /// `boot` event on `BootDrift` by re-reading the SAME path this function
 /// resolved the first time — it reuses this resolution rather than
 /// re-deriving root-containment logic at a second call site.
 pub(crate) fn resolve_boot_path(root: &Path, rel: &str) -> Result<PathBuf, ProjectionError> {
-    let unreadable = || ProjectionError::BootUnreadable {
+    crate::guard::resolve(root, rel).map_err(|_| ProjectionError::BootUnreadable {
         path: rel.to_string(),
-    };
-    let root_canonical = root.canonicalize().map_err(|_| unreadable())?;
-    let candidate_canonical = root_canonical.join(rel).canonicalize().map_err(|_| unreadable())?;
-    if !candidate_canonical.starts_with(&root_canonical) {
-        return Err(unreadable());
-    }
-    Ok(candidate_canonical)
+    })
 }
 
 /// Merge consecutive same-role messages with a blank line. Anthropic
@@ -340,6 +346,12 @@ fn recovery_hint(status: &str) -> &'static str {
         "invalid_input" => "the arguments did not match the tool's schema; check the names and types and call it again",
         "read_failed" => "the file could not be read from disk; try again or read something else",
         "composition_unreadable" => "the workspace manifests could not be parsed; read them as files instead",
+        // The write verbs. A status with no arm here renders "the call did not
+        // succeed", which tells the model nothing to do next.
+        "composition_locked" => "this file defines the workspace's composition and this session was not granted permission to write it; change something else, or ask for a session that may compose",
+        "no_match" => "old_string does not appear in that file; re-read the file and copy the exact text, without read_file's line-number prefixes",
+        "ambiguous_match" => "old_string appears more than once; include more surrounding lines until exactly one match remains, or call edit_file once per occurrence",
+        "write_failed" => "the file could not be written to disk; check the path and try again, or write somewhere else",
         // The three ways a call ends without its tool ever running. Each says
         // whether repeating it is worth anything — `interrupted` and
         // `no_result_recorded` are retryable, `bound_reached` is not.
@@ -801,6 +813,15 @@ pub fn project_context(
                     }],
                 });
             }
+
+            // WD-8: durable, deliberately NOT projected. The model already has
+            // this from `tool_result`; rendering it again duplicates
+            // information and spends tokens. Handled-by-skipping is still
+            // handled — P-3 wants a case for every durable type, not a message
+            // for every durable type. Without this arm the catch-all below
+            // renders `[unhandled event type: file_changed]` into the model's
+            // context, which is the opposite of the decision.
+            "file_changed" => {}
 
             // Never silent (P-3): visible in the transcript rather than
             // dropped, so a gap in coverage shows up where a human or the
@@ -1451,6 +1472,8 @@ mod tests {
             "too_large", "read_failed",
             // loop
             "interrupted", "no_result_recorded", "bound_reached", "tool_panicked",
+            // write
+            "composition_locked", "no_match", "ambiguous_match", "write_failed",
         ];
         let fallback = recovery_hint("__a_status_no_one_emits__");
 
@@ -1610,6 +1633,17 @@ mod tests {
                     "content": "fixture result",
                     "isError": false,
                 }),
+                // WD-8: this one is durable and deliberately projects NOTHING.
+                // It still belongs in the fixture — the assertion below is that
+                // no durable type reaches the catch-all, and "contributes no
+                // message" and "contributes an [unhandled] marker" are exactly
+                // what this test tells apart.
+                "file_changed" => json!({
+                    "path": "notes/example.md",
+                    "op": "modified",
+                    "before": "aa",
+                    "after": "bb",
+                }),
                 other => panic!("test fixture missing a data payload for durable type {other}"),
             };
             events.push(ev(seq, &id, t, data));
@@ -1649,6 +1683,79 @@ mod tests {
         let err = project_context(&events, dir.path()).unwrap_err();
 
         assert!(matches!(err, ProjectionError::BootDrift { ref path } if path == "boot.md"));
+    }
+
+    #[test]
+    fn file_changed_is_durable_and_has_an_explicit_reducer_arm() {
+        // MUTATION-CHECKED. P-3: the reducer obligation is enforced rather
+        // than remembered — adding a durable type fails the suite until a case
+        // exists for it.
+        assert!(DURABLE_TYPES.contains(&"file_changed"));
+        assert!(HANDLED_TYPES.contains(&"file_changed"));
+    }
+
+    #[test]
+    fn a_file_changed_event_contributes_nothing_to_the_projection() {
+        // MUTATION-CHECKED, and it asserts what the totality count CANNOT see.
+        // `project_context`'s match ends in a catch-all that renders
+        // `[unhandled event type: …]`, so "no arm" is not "not projected" — it
+        // is projected as noise. WD-8: the model already learned what happened
+        // from `tool_result`; rendering the event again duplicates information
+        // and spends tokens. P-1 makes the window a projection, so a durable
+        // event is not obliged to enter it.
+        let events = vec![
+            ev(1, "u1", "user_message", json!({"text": "write it"})),
+            ev(
+                2,
+                "fc1",
+                "file_changed",
+                json!({
+                    "path": "operators/tycho/todo.md",
+                    "op": "modified",
+                    "before": "aa", "after": "bb"
+                }),
+            ),
+        ];
+
+        let turn = project_context(&events, Path::new(".")).unwrap();
+        let rendered = format!("{:?}", turn.messages);
+
+        assert!(!rendered.contains("file_changed"), "{rendered}");
+        assert!(!rendered.contains("unhandled event type"), "{rendered}");
+        assert!(!rendered.contains("todo.md"), "{rendered}");
+    }
+
+    #[test]
+    fn a_boot_path_naming_a_credential_is_refused() {
+        // MUTATION-CHECKED. guard.rs's TRIPWIRE, closed. `resolve_boot_path`
+        // read `data.path` with a bare root-containment check, bypassing
+        // judge / is_credential / is_noise entirely. That was safe only while
+        // nothing let a client choose a boot path — and D-4 makes the manifest
+        // operator-writable, so an operator could declare
+        // `boot = ["repos/x/Secrets.xcconfig"]` and the next instance created
+        // would boot with a credential in its system prompt, past the one gate
+        // built to prevent exactly that.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "TOKEN=hunter2\n").unwrap();
+        std::fs::write(dir.path().join("Secrets.xcconfig"), "KEY=live\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(dir.path().join("node_modules/pkg/boot.md"), "# no\n").unwrap();
+        std::fs::write(dir.path().join("real-boot.md"), "# yes\n").unwrap();
+
+        for denied in [".env", "Secrets.xcconfig", "node_modules/pkg/boot.md"] {
+            assert!(
+                resolve_boot_path(dir.path(), denied).is_err(),
+                "{denied} must never be readable as a boot file"
+            );
+        }
+
+        // The other half, and it is what makes this test non-vacuous:
+        // asserting only that things are refused would pass identically if the
+        // function returned Err for everything.
+        assert!(
+            resolve_boot_path(dir.path(), "real-boot.md").is_ok(),
+            "an ordinary boot file must still resolve"
+        );
     }
 
     #[test]

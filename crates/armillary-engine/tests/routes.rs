@@ -839,3 +839,51 @@ async fn a_boot_path_escaping_root_is_skipped_not_honored() {
     let attach = create_and_attach(router).await;
     assert_boot_loaded_nothing(&root.canonicalize().unwrap(), &data_dir, &attach);
 }
+
+#[tokio::test]
+async fn an_instance_records_whether_it_may_write_the_composition() {
+    // WD-9, and this test exists to close a SEAM rather than to check a field.
+    // The route WRITES `mayWriteComposition` into `instance_created.data` and
+    // `loop_::may_write_composition` READS it back; each is correct alone and
+    // the pair fails silently if they disagree about the key — which is the
+    // shape of defect this repo has already shipped once. So the reader is run
+    // against events the writer actually produced.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.keep().canonicalize().unwrap();
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let store = LogStore::open(&data_dir).unwrap();
+    let router = armillary_engine::app(AppState {
+        root,
+        sessions: Arc::new(Sessions::new(store)),
+        model: model_config(),
+        provider: Arc::new(KeylessProvider),
+        boot: None,
+    });
+
+    let (status, created) = post_json(
+        router.clone(),
+        "/instances",
+        serde_json::json!({ "mayWriteComposition": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["mayWriteComposition"], true);
+
+    let id = created["id"].as_str().unwrap().to_string();
+    let store = LogStore::open(&data_dir).unwrap();
+    let events = store.read_from(&id, 0).unwrap();
+    assert!(
+        armillary_engine::loop_::may_write_composition(&events),
+        "the loop's reader did not see the grant the route wrote"
+    );
+
+    // Default OFF, asserted rather than assumed — a grant that defaults on is
+    // the whole protection gone.
+    let (_, plain) = post_json(router.clone(), "/instances", serde_json::json!({})).await;
+    assert_eq!(plain["mayWriteComposition"], false);
+
+    let plain_id = plain["id"].as_str().unwrap().to_string();
+    let store = LogStore::open(&data_dir).unwrap();
+    let plain_events = store.read_from(&plain_id, 0).unwrap();
+    assert!(!armillary_engine::loop_::may_write_composition(&plain_events));
+}
