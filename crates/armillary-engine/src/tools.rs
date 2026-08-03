@@ -1547,6 +1547,63 @@ mod tests {
         }
     }
 
+    // ---- the two write verbs, through dispatch ----
+
+    #[test]
+    fn the_write_verbs_are_reachable_by_the_names_their_definitions_declare() {
+        // `unknown_tool` is the failure this pins: a working body behind a
+        // misspelled arm is a green suite and a dead tool.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("modules.toml"), "[router]\ncontains = [\"a.md\"]\n").unwrap();
+        let ctx = ctx(dir.path());
+
+        let made = dispatch(
+            "write_file",
+            &serde_json::json!({ "path": "a.md", "content": "one\n" }),
+            &ctx,
+        )
+        .unwrap();
+        assert!(made.text.contains("created"), "{}", made.text);
+        assert_eq!(made.effects.len(), 1, "a write must record exactly one effect");
+
+        let edited = dispatch(
+            "edit_file",
+            &serde_json::json!({ "path": "a.md", "old_string": "one", "new_string": "two" }),
+            &ctx,
+        )
+        .unwrap();
+        assert!(edited.text.contains("modified"), "{}", edited.text);
+        assert_eq!(edited.effects.len(), 1);
+        assert_eq!(fs::read_to_string(dir.path().join("a.md")).unwrap(), "two\n");
+    }
+
+    #[test]
+    fn a_write_verb_missing_a_required_argument_is_an_error_not_a_panic() {
+        let dir = tree_fixture();
+        for (name, key) in [("write_file", "content"), ("edit_file", "old_string")] {
+            let err = call(name, serde_json::json!({ "path": "README.md" }), dir.path())
+                .unwrap_err();
+            assert_eq!(err.status, "invalid_input", "{name}");
+            assert!(err.detail.contains(key), "{name}: {}", err.detail);
+        }
+    }
+
+    #[test]
+    fn the_new_statuses_map_to_the_codes_the_explorer_already_consumes() {
+        for (status, expected) in [
+            ("composition_locked", StatusCode::BAD_REQUEST),
+            ("no_match", StatusCode::BAD_REQUEST),
+            ("ambiguous_match", StatusCode::BAD_REQUEST),
+            ("write_failed", StatusCode::INTERNAL_SERVER_ERROR),
+            // Pinned because it is the one that must NOT move: `not_openable`
+            // is already mapped, and adding it to an earlier BAD_REQUEST arm
+            // would silently win while `-D warnings` stayed quiet.
+            ("not_openable", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ] {
+            assert_eq!(ToolError::new(status, "x").http_status(), expected, "{status}");
+        }
+    }
+
     #[test]
     fn an_invalid_pattern_maps_to_a_bad_request() {
         assert_eq!(
