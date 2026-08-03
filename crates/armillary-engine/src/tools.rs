@@ -483,6 +483,15 @@ const MAX_BYTES: u64 = 1024 * 1024;
 /// this, a single line defeats every other cap on this page.
 const MAX_LINE_BYTES: usize = 4000;
 
+/// The marker `read_page` appends to a line it cut at `MAX_LINE_BYTES`.
+///
+/// **One constant, three readers:** the line renderer that writes it, the
+/// footer that counts it, and `write::write_file`, which refuses content
+/// carrying it (WD-14). Three copies of this string would eventually disagree,
+/// and the one that drifted would be the refusal — silently letting display
+/// text be saved as a file.
+pub(crate) const TRUNCATION_MARKER: &str = "…[line truncated]";
+
 /// The most bytes one page may carry, whatever the line budget allows.
 ///
 /// ~16k tokens. This is the cap that usually binds, and it binds for a reason
@@ -637,6 +646,7 @@ fn read_page(root: &Path, path: &str, offset: usize, limit: usize) -> Result<Str
 
     let mut seen = 0usize;
     let mut emitted = 0usize;
+    let mut truncated_lines = 0usize;
     let mut body = String::new();
     let mut more = false;
 
@@ -651,7 +661,8 @@ fn read_page(root: &Path, path: &str, offset: usize, limit: usize) -> Result<Str
         }
         let mut rendered = format!("{seen:>6}\t{}", line.text);
         if line.truncated {
-            rendered.push_str(" …[line truncated]");
+            rendered.push(' ');
+            rendered.push_str(TRUNCATION_MARKER);
         }
         rendered.push('\n');
 
@@ -663,6 +674,12 @@ fn read_page(root: &Path, path: &str, offset: usize, limit: usize) -> Result<Str
         }
         body.push_str(&rendered);
         emitted += 1;
+        // Counted only for lines that actually reached the page — a line cut
+        // by the byte cap above never made it, and claiming it did would
+        // overstate the loss.
+        if line.truncated {
+            truncated_lines += 1;
+        }
     }
 
     // Every branch below returns non-empty content: an empty text block is a
@@ -677,11 +694,24 @@ fn read_page(root: &Path, path: &str, offset: usize, limit: usize) -> Result<Str
     }
 
     let last = start + emitted - 1;
-    let footer = if more {
+    let mut footer = if more {
         format!("[more lines follow; call read_file with offset={}]\n", last + 1)
     } else {
         "[end of file]\n".to_string()
     };
+    if truncated_lines > 0 {
+        // WD-14. The paging signal already lives in the footer and already
+        // works; this joins it rather than inventing a second channel. Today
+        // the only marker is one inline cut in a 500-line page, easy to lose —
+        // and the write verbs are what turn losing it from a display
+        // limitation into a data-loss path, since a read→write round trip
+        // makes the cut permanent and records it as a clean `modified`.
+        let noun = if truncated_lines == 1 { "line" } else { "lines" };
+        footer.push_str(&format!(
+            "[{truncated_lines} {noun} truncated at {MAX_LINE_BYTES} bytes — \
+             this is not the file's full contents; do not write it back to a file]\n"
+        ));
+    }
     Ok(format!("{path} lines {start}-{last}\n{body}{footer}"))
 }
 
@@ -1114,6 +1144,41 @@ mod tests {
         // The next line must still be reachable — a long line must not eat the
         // rest of the page.
         assert!(out.contains("short"), "{out}");
+    }
+
+    #[test]
+    fn a_page_carrying_a_truncated_line_says_so_in_the_footer() {
+        // WD-14. Today the only marker is one inline `…[line truncated]` in a
+        // 500-line page — easy to lose, and this branch is what makes losing
+        // it expensive: a read→write round trip makes the cut permanent and
+        // records it as a clean `modified`.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("wide.md"),
+            format!("{}\nshort\n", "z".repeat(MAX_LINE_BYTES * 2)),
+        )
+        .unwrap();
+
+        let out = read(dir.path(), serde_json::json!({ "path": "wide.md" }));
+
+        assert!(out.contains("1 line truncated"), "the count must be named: {out}");
+        assert!(
+            out.contains("not the file's full contents"),
+            "the footer must say what the truncation COST: {out}"
+        );
+    }
+
+    #[test]
+    fn a_page_with_nothing_truncated_carries_no_truncation_footer() {
+        // The other half. A footer asserted only on the truncated path would
+        // pass identically if it were printed unconditionally — and a page
+        // that always claims to be incomplete is worth nothing.
+        let dir = tempfile::tempdir().unwrap();
+        lined_file(dir.path(), "notes.md", 3);
+
+        let out = read(dir.path(), serde_json::json!({ "path": "notes.md" }));
+
+        assert!(!out.contains("truncated"), "{out}");
     }
 
     #[test]
