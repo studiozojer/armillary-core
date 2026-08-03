@@ -253,6 +253,36 @@ pub fn definitions() -> Vec<serde_json::Value> {
                 "required": ["path", "content"],
             },
         }),
+        serde_json::json!({
+            "name": "edit_file",
+            "description": "Replace an exact string in an existing file. `old_string` \
+                            must appear EXACTLY ONCE — include surrounding lines until \
+                            it is unique. Whitespace and indentation are significant. \
+                            Read the file first, and send the file's own text WITHOUT \
+                            read_file's line-number prefixes: the \"   12\\t\" at the \
+                            start of each line is display formatting, not file content, \
+                            and it is the most common reason an edit finds nothing. \
+                            This never creates a file — use `write_file` for that. \
+                            ALWAYS prefer this over rewriting a whole file.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative path to an existing file.",
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact text to replace. Must appear exactly once in the file.",
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Text to put in its place.",
+                    },
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        }),
     ]
 }
 
@@ -366,6 +396,12 @@ pub fn dispatch(
             ctx,
             required_str(input, "path", name)?,
             required_str(input, "content", name)?,
+        ),
+        "edit_file" => crate::write::edit_file(
+            ctx,
+            required_str(input, "path", name)?,
+            required_str(input, "old_string", name)?,
+            required_str(input, "new_string", name)?,
         ),
         other => Err(ToolError::new(
             "unknown_tool",
@@ -1077,7 +1113,10 @@ mod tests {
         // incidental.
         assert_eq!(
             names,
-            ["get_composition", "list_directory", "read_file", "find_files", "search", "write_file"]
+            [
+                "get_composition", "list_directory", "read_file", "find_files",
+                "search", "write_file", "edit_file"
+            ]
         );
         for d in &defs {
             assert_eq!(d["input_schema"]["type"], "object");

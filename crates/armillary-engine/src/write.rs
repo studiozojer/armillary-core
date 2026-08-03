@@ -274,6 +274,138 @@ pub(crate) fn write_file(
     })
 }
 
+/// **WD-16.** Does `old_string` look like `read_file` output rather than file
+/// content?
+///
+/// ycc's `editdiag.go` opens by naming its evidence: transcript analysis of
+/// real sessions shows the dominant Edit failure is "old_string not found",
+/// and their number-one diagnosed cause is the model pasting `old_string` with
+/// `read_file`'s line-number prefixes still attached. Our `read_page` renders
+/// `format!("{seen:>6}\t{}", line.text)` — byte-for-byte the format that regex
+/// was written against, so we have the exact hazard.
+///
+/// Their full diagnostic, with a whitespace-normalized scorer and a capped
+/// snippet echo, is 138 lines. This is the cheap check; it can grow if it
+/// proves insufficient. The prefix chars are ASCII digits, so `digits` is a
+/// byte count and the slice below is safe.
+fn looks_like_read_output(old_string: &str) -> bool {
+    old_string.lines().any(|line| {
+        let trimmed = line.trim_start_matches(' ');
+        let digits = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+        digits > 0 && trimmed[digits..].starts_with('\t')
+    })
+}
+
+/// Replace one unique occurrence of `old_string` with `new_string`.
+///
+/// **Exact matching only** (WD-6). No fuzzy matching, no regex, no line
+/// numbers, no patch format. Every harness that added a fuzzy chain then needed
+/// a guard against its own matcher — disproportionate spans, reindented
+/// replacements, escape drift, unicode mangling — and each of those corruption
+/// classes was *introduced* by the fuzzy layer. With exact matching they all
+/// degrade to `no_match`: a wasted round trip, not a damaged file. The right
+/// trade for a prose workspace under git with no in-session diff.
+///
+/// An edit never creates: it goes through `guard::resolve` alone, so a missing
+/// file is `not_found` rather than falling through to the create path.
+///
+/// There is deliberately no `replace_all`. The consequence is that
+/// `ambiguous_match` must not say only "include more surrounding text", because
+/// for a rename the honest answer is "call me N times".
+pub(crate) fn edit_file(
+    ctx: &ToolCtx,
+    path: &str,
+    old_string: &str,
+    new_string: &str,
+) -> Result<ToolOutcome, ToolError> {
+    if old_string.is_empty() {
+        return Err(ToolError::new(
+            "invalid_input",
+            "old_string is empty — use write_file to create or fully replace a file",
+        ));
+    }
+    if old_string == new_string {
+        return Err(ToolError::new(
+            "invalid_input",
+            "new_string is identical to old_string — this edit would change nothing",
+        ));
+    }
+    // WD-14 extended to this verb: inserting read_file's display text through
+    // an edit is the same corruption by the same route as writing it whole.
+    refuse_truncated_echo(new_string)?;
+
+    let _guard = write_lock();
+
+    let resolved = crate::guard::resolve(&ctx.root, path)?;
+    let is_manifest = refuse_composition_write(ctx, &resolved)?;
+
+    let meta = resolved
+        .metadata()
+        .map_err(|_| ToolError::new("not_found", format!("nothing at {path}")))?;
+    crate::tools::gate_openable(&resolved, path, meta.is_dir())?;
+    // Checked from metadata, so an oversized file is never loaded in order to
+    // be rejected — the same guard `read_whole` states, on a path that reaches
+    // bundles and lockfiles.
+    if meta.len() > crate::tools::MAX_BYTES {
+        return Err(ToolError::new("too_large", format!("{} bytes", meta.len())));
+    }
+
+    let raw =
+        std::fs::read(&resolved).map_err(|e| ToolError::new("read_failed", e.to_string()))?;
+    // Binary gets a refusal rather than a guess, and the SAME refusal
+    // `read_page` gives — the same condition answering with two different
+    // statuses is the drift the status table exists to prevent.
+    let original = String::from_utf8(raw)
+        .map_err(|_| ToolError::new("not_text", format!("{path} is not valid UTF-8")))?;
+
+    // Count first, mutate second. Deciding and acting in one pass is how a
+    // check ends up announcing a refusal it did not actually perform.
+    let occurrences = original.matches(old_string).count();
+    match occurrences {
+        0 => {
+            let hint = if looks_like_read_output(old_string) {
+                " — old_string carries read_file's line-number prefixes (the \
+                 \"   12\\t\" at the start of each line is display formatting, not \
+                 file content); send the file's own text without them"
+            } else {
+                " — re-read the file and copy the text exactly, whitespace included"
+            };
+            return Err(ToolError::new(
+                "no_match",
+                format!("old_string does not appear in {path}{hint}"),
+            ));
+        }
+        1 => {}
+        n => {
+            return Err(ToolError::new(
+                "ambiguous_match",
+                format!(
+                    "old_string appears {n} times in {path} — include more surrounding \
+                     text so exactly one match remains, or call edit_file once per \
+                     occurrence (there is no replace-all)"
+                ),
+            ))
+        }
+    }
+
+    let updated = original.replace(old_string, new_string);
+    refuse_unparseable_manifest(is_manifest, &updated)?;
+
+    std::fs::write(&resolved, &updated)
+        .map_err(|e| ToolError::new("write_failed", e.to_string()))?;
+
+    let rel = workspace_relative(&ctx.root, &resolved, path);
+    Ok(ToolOutcome {
+        text: format!("modified {rel} (1 replacement, {} bytes)\n", updated.len()),
+        effects: vec![Effect::FileChanged {
+            path: rel,
+            op: "modified",
+            before: Some(crate::hash::sha256_hex(original.as_bytes())),
+            after: crate::hash::sha256_hex(updated.as_bytes()),
+        }],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,6 +728,188 @@ mod tests {
         // Scoped to the manifests only: an ordinary `.toml` elsewhere is prose
         // as far as this engine is concerned.
         write_file(&ctx(&dir, false), "notes/broken.toml", "[not\nvalid = \n").unwrap();
+    }
+
+    // ---- edit_file ----
+
+    #[test]
+    fn edit_file_replaces_a_unique_match() {
+        let dir = ws();
+        fs::write(dir.path().join("notes/e.md"), "alpha\nbeta\ngamma\n").unwrap();
+
+        let out = edit_file(&ctx(&dir, false), "notes/e.md", "beta", "BETA").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("notes/e.md")).unwrap(),
+            "alpha\nBETA\ngamma\n"
+        );
+        let Effect::FileChanged {
+            op, before, after, ..
+        } = &out.effects[0];
+        assert_eq!(*op, "modified", "an edit never creates");
+        assert_eq!(
+            before.as_deref(),
+            Some(crate::hash::sha256_hex(b"alpha\nbeta\ngamma\n").as_str())
+        );
+        assert_eq!(after, &crate::hash::sha256_hex(b"alpha\nBETA\ngamma\n"));
+    }
+
+    #[test]
+    fn edit_file_refuses_an_ambiguous_match_and_changes_nothing() {
+        // MUTATION-CHECKED, and the DISK assertion is the half that matters. A
+        // check that announces ambiguity while still performing the first
+        // replacement passes a text-only test and silently corrupts a file —
+        // the "cap announced itself but did not bind" defect, ported.
+        let dir = ws();
+        let body = "same\nsame\n";
+        fs::write(dir.path().join("notes/e.md"), body).unwrap();
+
+        let err = edit_file(&ctx(&dir, false), "notes/e.md", "same", "changed").unwrap_err();
+
+        assert_eq!(err.status, "ambiguous_match");
+        assert!(err.detail.contains('2'), "the count must be named: {}", err.detail);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("notes/e.md")).unwrap(),
+            body,
+            "a refused edit must leave the file byte-identical"
+        );
+    }
+
+    #[test]
+    fn a_missing_match_diagnoses_the_line_number_prefix() {
+        // WD-16. ycc's evidence: transcript analysis shows the dominant Edit
+        // failure is "old_string not found", and their number-one diagnosed
+        // cause is the model pasting `old_string` with read_file's line-number
+        // prefixes still attached. Our `read_page` renders exactly the format
+        // that regex was written against, so we have the exact hazard.
+        let dir = ws();
+        let pasted = "     1\toriginal";
+
+        let err = edit_file(&ctx(&dir, false), "notes/existing.md", pasted, "x").unwrap_err();
+
+        assert_eq!(err.status, "no_match");
+        assert!(
+            err.detail.contains("line-number"),
+            "the dominant cause must be named: {}",
+            err.detail
+        );
+
+        // The other half: an ordinary miss must NOT get the hint, or the hint
+        // is noise on every failure and diagnoses nothing.
+        let plain = edit_file(&ctx(&dir, false), "notes/existing.md", "absent", "x").unwrap_err();
+        assert_eq!(plain.status, "no_match");
+        assert!(!plain.detail.contains("line-number"), "{}", plain.detail);
+    }
+
+    #[test]
+    fn edit_file_refuses_an_empty_old_string_and_points_at_write_file() {
+        let dir = ws();
+        let err = edit_file(&ctx(&dir, false), "notes/existing.md", "", "x").unwrap_err();
+
+        assert_eq!(err.status, "invalid_input");
+        assert!(err.detail.contains("write_file"), "{}", err.detail);
+    }
+
+    #[test]
+    fn edit_file_refuses_a_replacement_that_changes_nothing() {
+        // A mistake, not a no-op worth performing.
+        let dir = ws();
+        let err =
+            edit_file(&ctx(&dir, false), "notes/existing.md", "original", "original").unwrap_err();
+        assert_eq!(err.status, "invalid_input");
+    }
+
+    #[test]
+    fn edit_file_refuses_a_file_that_does_not_exist() {
+        // An edit never creates — WD-2's fallback is `write_file`'s alone.
+        let dir = ws();
+        let err = edit_file(&ctx(&dir, false), "notes/absent.md", "a", "b").unwrap_err();
+        assert_eq!(err.status, "not_found");
+    }
+
+    #[test]
+    fn edit_file_passes_the_same_gate_write_file_does() {
+        // WD-5, restored. The superseded plan violated this invariant in its
+        // second verb: `edit_file` checked neither `is_openable` nor
+        // is-a-directory, so it could modify files `read_file` refuses to open
+        // — `.gitattributes`, `.csv`, `.xml`, `.lock`, anything outside the
+        // twenty-extension allowlist.
+        let dir = ws();
+        fs::write(dir.path().join("notes/data.csv"), "a,b\n").unwrap();
+
+        let err = edit_file(&ctx(&dir, false), "notes/data.csv", "a", "z").unwrap_err();
+        assert_eq!(err.status, "not_openable");
+
+        let dir_err = edit_file(&ctx(&dir, false), "notes", "a", "z").unwrap_err();
+        assert_eq!(dir_err.status, "is_a_directory");
+    }
+
+    #[test]
+    fn edit_file_answers_not_text_on_a_non_utf8_file() {
+        // The same condition returning two different statuses — one of them a
+        // 500 for a legible user error — is the drift the status table exists
+        // to prevent. `read_page` says `not_text`; so does this.
+        let dir = ws();
+        fs::write(dir.path().join("notes/bad.md"), [0xff, 0xfe, 0x00]).unwrap();
+
+        let err = edit_file(&ctx(&dir, false), "notes/bad.md", "a", "b").unwrap_err();
+        assert_eq!(err.status, "not_text");
+    }
+
+    #[test]
+    fn edit_file_respects_the_composition_lock() {
+        let dir = ws();
+        let err = edit_file(&ctx(&dir, false), "modules.toml", "[router]", "[ROUTER]").unwrap_err();
+        assert_eq!(err.status, "composition_locked");
+    }
+
+    #[test]
+    fn a_granted_manifest_edit_must_still_parse() {
+        // WD-12 applies to the RESULT, not to the argument — an edit can break
+        // a manifest just as thoroughly as a rewrite.
+        let dir = ws();
+        let err = edit_file(&ctx(&dir, true), "modules.toml", "[router]", "[router").unwrap_err();
+
+        assert_eq!(err.status, "invalid_input");
+        assert!(
+            fs::read_to_string(dir.path().join("modules.toml"))
+                .unwrap()
+                .contains("[router]"),
+            "the old manifest must survive a refused edit"
+        );
+    }
+
+    #[test]
+    fn edit_file_refuses_a_new_string_carrying_the_truncation_marker() {
+        // WD-14, extended to this verb: inserting `…[line truncated]` through
+        // an edit is the same corruption by the same route.
+        let dir = ws();
+        let poisoned = format!("original {}", crate::tools::TRUNCATION_MARKER);
+
+        let err =
+            edit_file(&ctx(&dir, false), "notes/existing.md", "original", &poisoned).unwrap_err();
+
+        assert_eq!(err.status, "invalid_input");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("notes/existing.md")).unwrap(),
+            "original\n"
+        );
+    }
+
+    #[test]
+    fn a_multibyte_edit_does_not_corrupt_the_file() {
+        // `.爻` is three bytes per character and this workspace writes node
+        // files in it. Rust's `str::replace` is character-safe, so this is a
+        // regression pin rather than a fix — it exists so a future byte-indexed
+        // "optimization" cannot land quietly.
+        let dir = ws();
+        fs::write(dir.path().join("notes/n.爻"), "爻爻 keep 爻爻\n").unwrap();
+
+        edit_file(&ctx(&dir, false), "notes/n.爻", "keep", "kept").unwrap();
+
+        let after = fs::read_to_string(dir.path().join("notes/n.爻")).unwrap();
+        assert_eq!(after, "爻爻 kept 爻爻\n");
+        assert!(!after.contains('\u{FFFD}'));
     }
 
     #[test]
