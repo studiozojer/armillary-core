@@ -204,6 +204,7 @@ const HANDLED_TYPES: &[&str] = &[
     "return",
     "tool_use",
     "tool_result",
+    "file_changed",
 ];
 
 /// Resolve a boot event's `data.path` under `root`, through the same guard
@@ -806,6 +807,15 @@ pub fn project_context(
                     }],
                 });
             }
+
+            // WD-8: durable, deliberately NOT projected. The model already has
+            // this from `tool_result`; rendering it again duplicates
+            // information and spends tokens. Handled-by-skipping is still
+            // handled — P-3 wants a case for every durable type, not a message
+            // for every durable type. Without this arm the catch-all below
+            // renders `[unhandled event type: file_changed]` into the model's
+            // context, which is the opposite of the decision.
+            "file_changed" => {}
 
             // Never silent (P-3): visible in the transcript rather than
             // dropped, so a gap in coverage shows up where a human or the
@@ -1615,6 +1625,17 @@ mod tests {
                     "content": "fixture result",
                     "isError": false,
                 }),
+                // WD-8: this one is durable and deliberately projects NOTHING.
+                // It still belongs in the fixture — the assertion below is that
+                // no durable type reaches the catch-all, and "contributes no
+                // message" and "contributes an [unhandled] marker" are exactly
+                // what this test tells apart.
+                "file_changed" => json!({
+                    "path": "notes/example.md",
+                    "op": "modified",
+                    "before": "aa",
+                    "after": "bb",
+                }),
                 other => panic!("test fixture missing a data payload for durable type {other}"),
             };
             events.push(ev(seq, &id, t, data));
@@ -1654,6 +1675,46 @@ mod tests {
         let err = project_context(&events, dir.path()).unwrap_err();
 
         assert!(matches!(err, ProjectionError::BootDrift { ref path } if path == "boot.md"));
+    }
+
+    #[test]
+    fn file_changed_is_durable_and_has_an_explicit_reducer_arm() {
+        // MUTATION-CHECKED. P-3: the reducer obligation is enforced rather
+        // than remembered — adding a durable type fails the suite until a case
+        // exists for it.
+        assert!(DURABLE_TYPES.contains(&"file_changed"));
+        assert!(HANDLED_TYPES.contains(&"file_changed"));
+    }
+
+    #[test]
+    fn a_file_changed_event_contributes_nothing_to_the_projection() {
+        // MUTATION-CHECKED, and it asserts what the totality count CANNOT see.
+        // `project_context`'s match ends in a catch-all that renders
+        // `[unhandled event type: …]`, so "no arm" is not "not projected" — it
+        // is projected as noise. WD-8: the model already learned what happened
+        // from `tool_result`; rendering the event again duplicates information
+        // and spends tokens. P-1 makes the window a projection, so a durable
+        // event is not obliged to enter it.
+        let events = vec![
+            ev(1, "u1", "user_message", json!({"text": "write it"})),
+            ev(
+                2,
+                "fc1",
+                "file_changed",
+                json!({
+                    "path": "operators/tycho/todo.md",
+                    "op": "modified",
+                    "before": "aa", "after": "bb"
+                }),
+            ),
+        ];
+
+        let turn = project_context(&events, Path::new(".")).unwrap();
+        let rendered = format!("{:?}", turn.messages);
+
+        assert!(!rendered.contains("file_changed"), "{rendered}");
+        assert!(!rendered.contains("unhandled event type"), "{rendered}");
+        assert!(!rendered.contains("todo.md"), "{rendered}");
     }
 
     #[test]

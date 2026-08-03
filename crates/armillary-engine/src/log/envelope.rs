@@ -23,6 +23,12 @@ pub const DURABLE_TYPES: &[&str] = &[
     "return",
     "tool_use",
     "tool_result",
+    // A write's EFFECT, distinct from the `tool_use` that requested it (D-1).
+    // `tool_use` records what the model ASKED FOR and says nothing about what
+    // reached the disk; the intent/effect gap is not hypothetical (the sync
+    // work shipped a `verdict()` returning `current` for twenty-four repos
+    // having contacted nothing).
+    "file_changed",
 ];
 
 /// `{role, instance}` — I-2 requires actor be structured, never a free

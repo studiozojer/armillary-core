@@ -95,6 +95,26 @@ fn operator_label(events: &[EventEnvelope]) -> String {
         .to_string()
 }
 
+/// **WD-9.** Whether this instance may write the workspace manifests.
+///
+/// Read from `instance_created.data`, exactly as `operator_label` reads the
+/// operator: per-instance facts already live there, and deriving it from the
+/// log rather than from a side table keeps I-1's "the log is the truth" honest.
+///
+/// `pub` rather than private so `tests/routes.rs` can prove the WRITER
+/// (`routes::instances::create`) and this READER agree on the key. A private
+/// reader tested against a hand-built event proves only that the reader is
+/// self-consistent — which is the seam-defect shape this repo has shipped once
+/// already.
+pub fn may_write_composition(events: &[EventEnvelope]) -> bool {
+    events
+        .iter()
+        .find(|e| e.event_type == "instance_created")
+        .and_then(|e| e.data.get("mayWriteComposition"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 fn assistant_actor(operator: &str) -> Actor {
     Actor {
         role: Role::Operator,
@@ -295,6 +315,8 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
         }
     };
     let operator = operator_label(&events);
+    // Read once per turn, from the same event slice `operator_label` was given.
+    let write_grant = may_write_composition(&events);
 
     // Text produced by rounds already finished. The provider restarts its own
     // accumulator on every call, so without this the phone's bubble would jump
@@ -491,16 +513,50 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
                 return;
             }
 
-            let root = state.root.clone();
+            let ctx = crate::tools::ToolCtx {
+                root: state.root.clone(),
+                may_write_composition: write_grant,
+            };
             let (n, i) = (name.clone(), input.clone());
-            let executed = tokio::task::spawn_blocking(move || crate::tools::dispatch(&n, &i, &root))
+            let executed = tokio::task::spawn_blocking(move || crate::tools::dispatch(&n, &i, &ctx))
                 .await
                 .unwrap_or_else(|_| Err(crate::tools::ToolError { status: "tool_panicked", detail: String::new() }));
 
             let (status, content, is_error) = match executed {
                 Ok(out) => {
-                    produced_content |= !out.is_empty();
-                    ("ok".to_string(), out, false)
+                    for effect in &out.effects {
+                        // A `match`, not a `let`-destructure: when the git
+                        // verbs add a second variant, a missing case must be a
+                        // compile error rather than a silently dropped event.
+                        let ev = match effect {
+                            crate::tools::Effect::FileChanged { path, op, before, after } => NewEvent {
+                                // `Role::Tool`, matching `tool_result` — the
+                                // model asked, the tool answered.
+                                actor: Actor { role: Role::Tool, instance: None },
+                                event_type: "file_changed".to_string(),
+                                data: serde_json::json!({
+                                    "path": path, "op": op, "before": before, "after": after,
+                                }),
+                            },
+                        };
+                        // Appended BEFORE the tool_result below: the effect
+                        // preceded the report of it, and a replay should read
+                        // that way.
+                        if let Err(e) = append_child(&state, &stream, &assistant_id, ev).await {
+                            // I-5: a failed log write surfaces to its writer.
+                            // Deliberately NOT a `return` like the tool_use
+                            // failure above — the file is already on disk, so
+                            // this is a record we failed to keep, not a
+                            // mutation we failed to make, and abandoning the
+                            // turn would leave the model with no tool_result
+                            // for a write that actually happened.
+                            eprintln!(
+                                "log_write_failed appending file_changed for stream {stream:?}: {e:?}"
+                            );
+                        }
+                    }
+                    produced_content |= !out.text.is_empty();
+                    ("ok".to_string(), out.text, false)
                 }
                 Err(err) => {
                     // Escalate rather than repeat: a tool that just failed is
@@ -736,6 +792,49 @@ mod tests {
     use crate::provider::KeylessProvider;
     use crate::sessions::Sessions;
     use crate::state::{AppState, ModelConfig};
+
+    fn bare_event(seq: u64, id: &str, event_type: &str, data: serde_json::Value) -> EventEnvelope {
+        EventEnvelope {
+            stream: "s1".to_string(),
+            id: id.to_string(),
+            seq,
+            ts: "2026-08-02T00:00:00Z".to_string(),
+            actor: Actor {
+                role: Role::System,
+                instance: None,
+            },
+            event_type: event_type.to_string(),
+            thread: None,
+            parent: None,
+            version: 1,
+            cost: None,
+            data,
+        }
+    }
+
+    #[test]
+    fn the_composition_grant_is_read_from_instance_created_and_defaults_off() {
+        // WD-9. Per-instance facts live in `instance_created.data` — this reads
+        // the grant exactly as `operator_label` reads the operator, so the flag
+        // is log-derived rather than held in a side table that could disagree
+        // with the log. The default is asserted rather than assumed: a grant
+        // that defaults on is the whole protection gone.
+        let granted = vec![bare_event(
+            1,
+            "i1",
+            "instance_created",
+            serde_json::json!({ "operator": "tycho", "startedAt": "t", "mayWriteComposition": true }),
+        )];
+        let plain = vec![bare_event(
+            1,
+            "i1",
+            "instance_created",
+            serde_json::json!({ "operator": "tycho", "startedAt": "t" }),
+        )];
+
+        assert!(may_write_composition(&granted));
+        assert!(!may_write_composition(&plain));
+    }
 
     fn model_config() -> ModelConfig {
         ModelConfig {

@@ -215,6 +215,70 @@ pub fn definitions() -> Vec<serde_json::Value> {
     ]
 }
 
+/// What a tool body is allowed to know about the session it runs in.
+///
+/// Replaces the bare `&Path`. Tool bodies stay pure functions of their inputs
+/// — no log handle, no session, no runtime — so they remain testable with a
+/// `tempdir` alone. Anything a body needs to KNOW about the instance arrives
+/// here; anything it wants to CHANGE leaves via `ToolOutcome::effects`.
+pub struct ToolCtx {
+    pub root: PathBuf,
+    /// WD-9. Read from `instance_created.data.mayWriteComposition`, default
+    /// **off**. D-4 makes the manifest operator-writable in principle; this is
+    /// the per-session grant that decides whether *this* session is the one
+    /// doing it.
+    pub may_write_composition: bool,
+}
+
+/// A tool's rendered text, plus the durable facts its execution produced.
+///
+/// **Tool bodies describe effects; the loop records them.** Appending is
+/// `async` (`append_child(…).await`) and `dispatch` runs inside
+/// `spawn_blocking`, so a body could not await an append even if it held the
+/// handle — and event-appending belongs in the one place that already owns
+/// `state` and `stream`.
+pub struct ToolOutcome {
+    pub text: String,
+    pub effects: Vec<Effect>,
+}
+
+impl ToolOutcome {
+    /// The overwhelmingly common case: a tool that changed nothing.
+    pub(crate) fn text(text: String) -> Self {
+        ToolOutcome {
+            text,
+            effects: Vec::new(),
+        }
+    }
+}
+
+/// A durable fact produced by executing a tool, for the loop to append.
+///
+/// An enum with one variant today, and deliberately so: the parallel window's
+/// git verbs can add their own without touching this seam again, and the loop's
+/// `match` over it means a new variant is a compile error rather than a
+/// silently dropped event.
+pub enum Effect {
+    FileChanged {
+        /// **WD-13.** The RESOLVED workspace-relative path, never the request
+        /// spelling. WD-11 canonicalizes precisely because one file has
+        /// several spellings; recording the model's own string would give two
+        /// writes to one inode two events a consumer cannot join, and break
+        /// the before/after hash chain across them. D-1's whole claim is a
+        /// machine fact the model cannot narrate over, and a path the model
+        /// chose is exactly a narratable one.
+        path: String,
+        /// `"created"` or `"modified"`. **WD-7: two ops, because two verbs.**
+        /// `moved`/`deleted` were written into the decisions doc before their
+        /// verbs existed; an op no verb emits is an unreachable branch a
+        /// reducer must nonetheless handle.
+        op: &'static str,
+        /// `None` on create — there was no prior content to hash.
+        before: Option<String>,
+        after: String,
+    },
+}
+
 /// Execute one tool call.
 ///
 /// **An unknown name is an error result, never nothing.** Both surveyed
@@ -222,27 +286,37 @@ pub fn definitions() -> Vec<serde_json::Value> {
 /// dangle, and they are right for a reason measured here: a `tool_use` with no
 /// `tool_result` is a 400 that kills every later turn. A stale or misspelled
 /// name must come back as a refusal the model can read.
-pub fn dispatch(name: &str, input: &serde_json::Value, root: &Path) -> Result<String, ToolError> {
+pub fn dispatch(
+    name: &str,
+    input: &serde_json::Value,
+    ctx: &ToolCtx,
+) -> Result<ToolOutcome, ToolError> {
+    let root = ctx.root.as_path();
     match name {
-        "get_composition" => get_composition(root),
-        "list_directory" => list_directory(root, required_str(input, "path", name)?),
+        "get_composition" => get_composition(root).map(ToolOutcome::text),
+        "list_directory" => {
+            list_directory(root, required_str(input, "path", name)?).map(ToolOutcome::text)
+        }
         "read_file" => read_page(
             root,
             required_str(input, "path", name)?,
             optional_usize(input, "offset", 1)?,
             optional_usize(input, "limit", DEFAULT_LINES)?,
-        ),
+        )
+        .map(ToolOutcome::text),
         "find_files" => crate::search::find_files(
             root,
             required_str(input, "pattern", name)?,
             optional_str(input, "path"),
-        ),
+        )
+        .map(ToolOutcome::text),
         "search" => crate::search::search(
             root,
             required_str(input, "query", name)?,
             optional_str(input, "path"),
             input.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false),
-        ),
+        )
+        .map(ToolOutcome::text),
         other => Err(ToolError::new(
             "unknown_tool",
             format!("no tool named {other}"),
@@ -763,6 +837,41 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// A context over a root, with no composition grant — what every read verb
+    /// runs under.
+    fn ctx(root: &Path) -> ToolCtx {
+        ToolCtx {
+            root: root.to_path_buf(),
+            may_write_composition: false,
+        }
+    }
+
+    /// The switch, called the way it was before WD-10.
+    ///
+    /// `ToolCtx`/`ToolOutcome` exist so a WRITE can describe its effects; a
+    /// read has none, so this keeps the twenty-odd existing tests reading
+    /// exactly as they did rather than growing a `.text` at every assertion.
+    fn call(name: &str, input: serde_json::Value, root: &Path) -> Result<String, ToolError> {
+        dispatch(name, &input, &ctx(root)).map(|o| o.text)
+    }
+
+    #[test]
+    fn an_ordinary_tool_produces_text_and_no_effects() {
+        // The seam's contract: reading changes nothing, so a read verb's
+        // outcome carries an empty effect list. Pins that `effects` is not
+        // accidentally populated by the plumbing itself.
+        let dir = tree_fixture();
+        let out = dispatch(
+            "list_directory",
+            &serde_json::json!({ "path": "" }),
+            &ctx(dir.path()),
+        )
+        .unwrap();
+
+        assert!(!out.text.is_empty());
+        assert!(out.effects.is_empty(), "a read must record no effect");
+    }
+
     /// A workspace shaped like the real one: a public manifest, a private
     /// overlay, one protocol whose source exists and one whose source does not.
     fn workspace() -> tempfile::TempDir {
@@ -792,7 +901,7 @@ mod tests {
     #[test]
     fn get_composition_reports_what_the_manifests_declare() {
         let dir = workspace();
-        let out = dispatch("get_composition", &serde_json::json!({}), dir.path()).unwrap();
+        let out = call("get_composition", serde_json::json!({}), dir.path()).unwrap();
 
         assert!(out.contains("tycho"), "{out}");
         assert!(out.contains("kairos-engine"), "{out}");
@@ -804,7 +913,7 @@ mod tests {
         // C-3, and the reason it exists: a local model once read commented-out
         // examples as a live composition. A TOML parser makes it impossible.
         let dir = workspace();
-        let out = dispatch("get_composition", &serde_json::json!({}), dir.path()).unwrap();
+        let out = call("get_composition", serde_json::json!({}), dir.path()).unwrap();
 
         assert!(
             !out.contains("ghost"),
@@ -815,7 +924,7 @@ mod tests {
     #[test]
     fn protocol_presence_is_reported_because_a_missing_source_is_skipped_not_an_error() {
         let dir = workspace();
-        let out = dispatch("get_composition", &serde_json::json!({}), dir.path()).unwrap();
+        let out = call("get_composition", serde_json::json!({}), dir.path()).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
 
         let by_name = |n: &str| -> bool {
@@ -838,7 +947,7 @@ mod tests {
         // A quarter of `/composition`'s bytes are hex a model cannot verify and
         // cannot act on. Drift detection is an engine concern.
         let dir = workspace();
-        let out = dispatch("get_composition", &serde_json::json!({}), dir.path()).unwrap();
+        let out = call("get_composition", serde_json::json!({}), dir.path()).unwrap();
 
         assert!(!out.contains("sha256"), "{out}");
     }
@@ -870,7 +979,7 @@ mod tests {
     fn a_bare_clone_composes_nothing_and_that_is_not_an_error() {
         // C-4: presence-gated throughout. A bare clone is a working host.
         let dir = tempfile::tempdir().unwrap();
-        let out = dispatch("get_composition", &serde_json::json!({}), dir.path())
+        let out = call("get_composition", serde_json::json!({}), dir.path())
             .expect("a bare clone is a working host, not a failure");
 
         assert!(!out.contains("tycho"), "{out}");
@@ -882,7 +991,7 @@ mod tests {
         // so a stale or misspelled name must come back as something the model
         // can read.
         let dir = workspace();
-        let err = dispatch("read_the_future", &serde_json::json!({}), dir.path()).unwrap_err();
+        let err = call("read_the_future", serde_json::json!({}), dir.path()).unwrap_err();
 
         assert_eq!(err.status, "unknown_tool");
         assert!(err.detail.contains("read_the_future"));
@@ -924,9 +1033,9 @@ mod tests {
     #[test]
     fn list_directory_names_entries_and_marks_which_are_directories() {
         let dir = tree_fixture();
-        let out = dispatch(
+        let out = call(
             "list_directory",
-            &serde_json::json!({ "path": "" }),
+            serde_json::json!({ "path": "" }),
             dir.path(),
         )
         .unwrap();
@@ -947,7 +1056,7 @@ mod tests {
         for n in 0..MAX_ENTRIES + 11 {
             fs::write(dir.path().join(format!("note-{n:04}.md")), "x").unwrap();
         }
-        let out = dispatch("list_directory", &serde_json::json!({ "path": "" }), dir.path())
+        let out = call("list_directory", serde_json::json!({ "path": "" }), dir.path())
             .unwrap();
 
         assert!(
@@ -966,7 +1075,7 @@ mod tests {
         // path, the truncation footer's own "of 511" satisfied it and the
         // header's count was tested by nothing.
         let dir = tree_fixture();
-        let out = dispatch("list_directory", &serde_json::json!({ "path": "" }), dir.path())
+        let out = call("list_directory", serde_json::json!({ "path": "" }), dir.path())
             .unwrap();
 
         assert!(out.contains("2 entries"), "commons/ and README.md: {out}");
@@ -976,7 +1085,7 @@ mod tests {
     #[test]
     fn credentials_and_build_output_never_reach_a_listing() {
         let dir = tree_fixture();
-        let out = dispatch("list_directory", &serde_json::json!({ "path": "" }), dir.path())
+        let out = call("list_directory", serde_json::json!({ "path": "" }), dir.path())
             .unwrap();
 
         assert!(!out.contains(".env"), "{out}");
@@ -989,9 +1098,9 @@ mod tests {
         // something.
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("empty")).unwrap();
-        let out = dispatch(
+        let out = call(
             "list_directory",
-            &serde_json::json!({ "path": "empty" }),
+            serde_json::json!({ "path": "empty" }),
             dir.path(),
         )
         .unwrap();
@@ -1002,9 +1111,9 @@ mod tests {
     #[test]
     fn list_directory_refuses_a_file_and_names_the_recovery() {
         let dir = tree_fixture();
-        let err = dispatch(
+        let err = call(
             "list_directory",
-            &serde_json::json!({ "path": "README.md" }),
+            serde_json::json!({ "path": "README.md" }),
             dir.path(),
         )
         .unwrap_err();
@@ -1015,9 +1124,9 @@ mod tests {
     #[test]
     fn list_directory_carries_the_guards_own_code_for_a_denied_path() {
         let dir = tree_fixture();
-        let err = dispatch(
+        let err = call(
             "list_directory",
-            &serde_json::json!({ "path": "node_modules" }),
+            serde_json::json!({ "path": "node_modules" }),
             dir.path(),
         )
         .unwrap_err();
@@ -1029,7 +1138,7 @@ mod tests {
     fn a_tool_call_missing_its_required_path_is_an_error_result_not_a_panic() {
         let dir = tree_fixture();
         for name in ["list_directory", "read_file"] {
-            let err = dispatch(name, &serde_json::json!({}), dir.path()).unwrap_err();
+            let err = call(name, serde_json::json!({}), dir.path()).unwrap_err();
             assert_eq!(err.status, "invalid_input", "{name}");
             assert!(err.detail.contains("path"), "{name}: {}", err.detail);
         }
@@ -1038,7 +1147,7 @@ mod tests {
     // ---- read_file (D15) ----
 
     fn read(dir: &Path, input: serde_json::Value) -> String {
-        dispatch("read_file", &input, dir).unwrap()
+        call("read_file", input, dir).unwrap()
     }
 
     /// A file of `n` lines, each `line-0001`-shaped so a window is identifiable.
@@ -1271,7 +1380,7 @@ mod tests {
             ("nope.md", "not_found"),
             ("../escape.md", "outside_workspace"),
         ] {
-            let err = dispatch("read_file", &serde_json::json!({ "path": path }), dir.path())
+            let err = call("read_file", serde_json::json!({ "path": path }), dir.path())
                 .unwrap_err();
             assert_eq!(err.status, status, "{path}");
         }
@@ -1284,7 +1393,7 @@ mod tests {
         // serves a credential.
         let dir = tree_fixture();
         let via_route = read_whole(dir.path(), ".env").unwrap_err();
-        let via_tool = dispatch("read_file", &serde_json::json!({ "path": ".env" }), dir.path())
+        let via_tool = call("read_file", serde_json::json!({ "path": ".env" }), dir.path())
             .unwrap_err();
 
         assert_eq!(via_route.status, via_tool.status);
@@ -1301,17 +1410,17 @@ mod tests {
         fs::write(dir.path().join("modules.toml"), "[router]\ncontains = [\"a.md\"]\n").unwrap();
         fs::write(dir.path().join("a.md"), "needle\n").unwrap();
 
-        let found = dispatch(
+        let found = call(
             "search",
-            &serde_json::json!({ "query": "needle" }),
+            serde_json::json!({ "query": "needle" }),
             dir.path(),
         )
         .unwrap();
         assert!(found.contains("a.md"), "{found}");
 
-        let listed = dispatch(
+        let listed = call(
             "find_files",
-            &serde_json::json!({ "pattern": "*.md" }),
+            serde_json::json!({ "pattern": "*.md" }),
             dir.path(),
         )
         .unwrap();
@@ -1322,7 +1431,7 @@ mod tests {
     fn a_search_verb_missing_its_required_argument_is_an_error_not_a_panic() {
         let dir = tree_fixture();
         for (name, key) in [("search", "query"), ("find_files", "pattern")] {
-            let err = dispatch(name, &serde_json::json!({}), dir.path()).unwrap_err();
+            let err = call(name, serde_json::json!({}), dir.path()).unwrap_err();
             assert_eq!(err.status, "invalid_input", "{name}");
             assert!(err.detail.contains(key), "{name}: {}", err.detail);
         }
