@@ -25,6 +25,16 @@ use std::time::SystemTime;
 pub struct CreateRequest {
     #[serde(default)]
     pub operator: Option<String>,
+    /// **WD-9.** Whether this instance may write `modules.toml` /
+    /// `modules.local.toml`. Defaults to **false**: D-4 makes the manifest
+    /// operator-writable in principle, and this is the per-session grant that
+    /// decides whether *this* session is the one doing it.
+    ///
+    /// One bit today, and knowingly a degenerate case of a glob-scoped grant —
+    /// when `delete_file` and `move_file` arrive, a second boolean is the wrong
+    /// move and the shape to grow into is `patterns: ["modules*.toml"]`.
+    #[serde(default)]
+    pub may_write_composition: bool,
 }
 
 #[derive(Serialize, Debug, PartialEq)]
@@ -35,6 +45,7 @@ pub struct Instance {
     pub stream: String,
     pub started_at: String,
     pub last_seq: u64,
+    pub may_write_composition: bool,
 }
 
 #[derive(Serialize)]
@@ -61,12 +72,23 @@ fn instance_from_first_event(stream: &str, first: &EventEnvelope, head_seq: u64)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // Defaulted, not required: an instance created before this field existed
+    // must list as `false` rather than fail to parse. The same defaulting
+    // `loop_::may_write_composition` uses — and the registry being log-derived
+    // means this is where every listing and attach gets it.
+    let may_write_composition = first
+        .data
+        .get("mayWriteComposition")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     Some(Instance {
         id: stream.to_string(),
         operator,
         stream: stream.to_string(),
         started_at,
         last_seq: head_seq,
+        may_write_composition,
     })
 }
 
@@ -328,6 +350,7 @@ pub async fn create(
     // `operator` is moved into the `instance_created` payload below; B-2 needs
     // the name again afterwards to resolve that operator's declared boot.
     let operator_name = operator.clone();
+    let may_write_composition = body.may_write_composition;
     let id = uuid::Uuid::new_v4().to_string();
     let started_at = humantime::format_rfc3339_millis(SystemTime::now()).to_string();
 
@@ -342,7 +365,11 @@ pub async fn create(
                         instance: None,
                     },
                     event_type: "instance_created".to_string(),
-                    data: serde_json::json!({ "operator": operator, "startedAt": started_at }),
+                    data: serde_json::json!({
+                        "operator": operator,
+                        "startedAt": started_at,
+                        "mayWriteComposition": may_write_composition,
+                    }),
                 },
             )
             .map_err(SessionError::into_response)
