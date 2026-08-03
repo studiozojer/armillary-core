@@ -200,6 +200,38 @@ async fn health_reports_ok() {
 }
 
 #[tokio::test]
+async fn health_reports_the_build_it_is_answering_from() {
+    // The defect this closes: `version` is the crate version from Cargo.toml,
+    // unchanged in months and never going to change. So a tool that has just
+    // been merged but not rebuilt answers `unknown_tool`, and from a phone
+    // that is indistinguishable from the tool never having shipped —
+    // absence-vs-refusal, one layer below the branch built to prevent it.
+    let (_, json) = get_json(app_over(|_| {}), "/health").await;
+
+    let commit = json["commit"].as_str().expect("health must report a commit");
+    let version = json["version"].as_str().unwrap();
+
+    assert!(!commit.is_empty(), "an empty commit answers nothing");
+
+    // The repair that would defeat the whole point: aliasing `commit` to the
+    // constant we are trying to get away from. Pinned so it cannot pass review
+    // as a fix.
+    assert_ne!(
+        commit, version,
+        "commit must carry build identity, not restate the frozen crate version"
+    );
+
+    // The build script's contract, in the only two shapes it may take: a hex
+    // revision, or the honest admission that this build could not tell. A
+    // plausible-looking value that is neither is the failure mode worth
+    // catching — a stamp that lies is worse than no stamp.
+    assert!(
+        commit == "unknown" || commit.chars().all(|c| c.is_ascii_hexdigit()),
+        "a commit is a hex revision or `unknown`, got {commit:?}"
+    );
+}
+
+#[tokio::test]
 async fn composition_is_byte_derived_and_hashed() {
     let router = app_over(|root| {
         std::fs::write(
