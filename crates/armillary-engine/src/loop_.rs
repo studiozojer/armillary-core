@@ -965,6 +965,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_write_through_a_real_turn_appends_file_changed_before_its_tool_result() {
+        // MUTATION-CHECKED. The unit tests stop at `dispatch` and prove the
+        // verb produces an Effect; nothing else proves the LOOP turns that
+        // Effect into a durable event. That is the whole of WD-10's seam, and
+        // a body that describes an effect no one records is worth nothing.
+        //
+        // Order is asserted, not incidental: `file_changed` precedes
+        // `tool_result` because the effect preceded the report of it, and a
+        // replay should read that way.
+        let data_dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("modules.toml"), "[[repos]]\nname='r'\npath='p'\n")
+            .unwrap();
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance(&sessions, Some("tycho")).await;
+
+        let provider = std::sync::Arc::new(RoundScript::new(vec![
+            calls_with(
+                "toolu_w1",
+                "write_file",
+                serde_json::json!({ "path": "notes.md", "content": "written by a turn\n" }),
+            ),
+            says("done"),
+        ]));
+        let state = state_with(provider, sessions.clone(), root.path()).await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+
+        // The write is real, on the real disk.
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("notes.md")).unwrap(),
+            "written by a turn\n"
+        );
+
+        let events = sessions.store().read_from(&id, 0).unwrap();
+        let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "instance_created",
+                "user_message",
+                "assistant_message",
+                "tool_use",
+                "file_changed",
+                "tool_result",
+                "assistant_message"
+            ],
+            "{types:?}"
+        );
+
+        let changed = events
+            .iter()
+            .find(|e| e.event_type == "file_changed")
+            .unwrap();
+        assert_eq!(changed.data["path"], "notes.md");
+        assert_eq!(changed.data["op"], "created");
+        assert!(changed.data["before"].is_null(), "a create has no prior content");
+        assert_eq!(
+            changed.data["after"],
+            crate::hash::sha256_hex(b"written by a turn\n")
+        );
+        // `Role::Tool`, matching `tool_result` — the model asked, the tool
+        // answered.
+        assert_eq!(changed.actor.role, Role::Tool);
+        // Durable, so it must carry a real seq (I-4: 0 is transient).
+        assert!(changed.seq > 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_write_emits_no_file_changed_at_all() {
+        // D-1's central discipline: this records EFFECT, not intent. The moment
+        // it logs a refusal it is a second copy of `tool_use` and worth
+        // nothing. A guard denial is a `tool_result` error and nothing else.
+        let data_dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("modules.toml"), "[[repos]]\nname='r'\npath='p'\n")
+            .unwrap();
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance(&sessions, Some("tycho")).await;
+
+        let provider = std::sync::Arc::new(RoundScript::new(vec![
+            calls_with(
+                "toolu_w1",
+                "write_file",
+                serde_json::json!({ "path": "secrets.json", "content": "{}" }),
+            ),
+            says("refused"),
+        ]));
+        let state = state_with(provider, sessions.clone(), root.path()).await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+
+        assert!(!root.path().join("secrets.json").exists());
+
+        let events = sessions.store().read_from(&id, 0).unwrap();
+        assert!(
+            !events.iter().any(|e| e.event_type == "file_changed"),
+            "a refusal logged an effect it never had"
+        );
+        let result = events
+            .iter()
+            .find(|e| e.event_type == "tool_result")
+            .unwrap();
+        assert_eq!(result.data["status"], "denied_credential");
+        assert_eq!(result.data["isError"], true);
+    }
+
+    #[tokio::test]
     async fn a_tool_call_is_executed_and_answered_and_the_turn_continues() {
         let data_dir = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
