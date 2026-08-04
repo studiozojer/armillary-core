@@ -40,8 +40,10 @@ pub enum GitError {
     Failed(String),
     /// A request-derived value was refused before any subprocess ran.
     /// Distinct from `Failed` because it is the CALLER's input that was
-    /// wrong, not git — a route turns this into 400 and the others into 500,
-    /// and string-matching a message to tell them apart is not a seam.
+    /// wrong, not git. The intended contract is that a future route handler
+    /// turns this into 400 and the others into 500 — no such handler exists
+    /// yet, but the variant is split now so telling them apart never depends
+    /// on string-matching a message.
     InvalidArg(String),
 }
 
