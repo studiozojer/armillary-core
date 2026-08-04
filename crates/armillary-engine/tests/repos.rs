@@ -178,17 +178,29 @@ async fn changes_lists_untracked_and_modified_files() {
 }
 
 #[tokio::test]
-async fn log_limit_defaults_to_fifty_and_is_capped_at_two_hundred() {
+async fn log_limit_is_applied_to_the_request() {
+    // A body-COUNT assertion, not a status-code one: the fixture has 6
+    // commits regardless of what is requested, so a status-only check here
+    // would pass identically whether the route's clamp/limit plumbing is
+    // wired up or deleted outright. Requesting 2 must return exactly 2.
     let (root, _remote) = live_workspace_with_sync();
     let repo = root.join("repos/jianyi");
     for i in 0..5 {
         commit(&repo, &format!("f{i}.md"), "x");
     }
-    // 1 seed commit + 5 = 6 total, well under both the default and the cap —
-    // this only proves the route does not reject an absent `limit`.
-    let body = get_json(&root, "/repos/jianyi/log").await;
-    assert_eq!(body.as_array().unwrap().len(), 6);
+    let body = get_json(&root, "/repos/jianyi/log?limit=2").await;
+    assert_eq!(body.as_array().unwrap().len(), 2);
+}
 
-    // An oversized limit is clamped, never rejected (400).
-    assert_eq!(get_status(&root, "/repos/jianyi/log?limit=99999").await, 200);
+#[tokio::test]
+async fn a_malformed_limit_falls_back_to_the_default_rather_than_400() {
+    // The defect this closes: axum's derived `Query<LogQuery>` extractor
+    // 400s on a present-but-unparseable value when the field type is
+    // `Option<u32>`, because `Option` only defaults a MISSING key, not a
+    // malformed one. `clamp_limit`'s own unit tests (`routes/repos.rs`)
+    // cover the parsing directly; this proves the route wiring actually
+    // reaches the request at all, over real HTTP.
+    let (root, _remote) = live_workspace_with_sync();
+    assert_eq!(get_status(&root, "/repos/jianyi/log?limit=abc").await, 200);
+    assert_eq!(get_status(&root, "/repos/jianyi/log?limit=-1").await, 200);
 }

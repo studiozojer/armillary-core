@@ -92,9 +92,16 @@ pub async fn one(
     Ok(Json(repos::read_one(&root, &module, true).await))
 }
 
+/// `limit` is `Option<String>`, deliberately NOT `Option<u32>`. Axum's
+/// derived `Query` extractor only defaults a field on a MISSING key — a
+/// present-but-unparseable value (`?limit=abc`, `?limit=-1`) fails
+/// deserialization and 400s before this handler's body ever runs, which is
+/// the opposite of "clamp, never reject". Parsing has to happen past the
+/// extractor, in `clamp_limit`, where a failure can fall back to the
+/// default instead of refusing the request.
 #[derive(Deserialize)]
 pub struct LogQuery {
-    limit: Option<u32>,
+    limit: Option<String>,
 }
 
 /// Default page size for `GET /repos/{name}/log`, and its ceiling. Clamped,
@@ -103,6 +110,24 @@ pub struct LogQuery {
 /// as you reasonably can") is legible either way.
 const DEFAULT_LOG_LIMIT: u32 = 50;
 const MAX_LOG_LIMIT: u32 = 200;
+
+/// The requested `limit` -> the number actually used.
+///
+/// Total, not partial: every input produces a `u32`, none produce an error.
+/// A missing key (`None`) and an unparseable one (`Some("abc")`,
+/// `Some("-1")` — `-1` cannot parse as `u32` at all, not merely "out of
+/// range") both fall back to `DEFAULT_LOG_LIMIT` identically; anything that
+/// DOES parse is capped at `MAX_LOG_LIMIT` rather than rejected. A pure
+/// function on purpose — the earlier defect here (axum's `Option<u32>`
+/// extractor 400ing on a malformed value before the handler ran) is exactly
+/// the kind of thing that stays invisible behind a test asserting only a
+/// status code on a fixture too small to need clamping; testing this
+/// directly, argument in and `u32` out, is what actually discriminates it.
+fn clamp_limit(raw: Option<&str>) -> u32 {
+    raw.and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_LOG_LIMIT)
+        .min(MAX_LOG_LIMIT)
+}
 
 #[derive(Serialize)]
 pub struct Commit {
@@ -135,7 +160,7 @@ pub async fn log(
     let root = state.root.clone();
     let module = repos::resolve(&root, &name)
         .ok_or((StatusCode::NOT_FOUND, "unknown_repo".to_string()))?;
-    let limit = q.limit.unwrap_or(DEFAULT_LOG_LIMIT).min(MAX_LOG_LIMIT);
+    let limit = clamp_limit(q.limit.as_deref());
     let abs = root.join(&module.path);
 
     let entries = git::log(&abs, limit, git::DEFAULT_TIMEOUT)
@@ -184,4 +209,43 @@ pub async fn changes(
         .map_err(git_error_response)?;
 
     Ok(Json(status.files))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_limit_defaults_when_the_query_key_is_absent() {
+        assert_eq!(clamp_limit(None), DEFAULT_LOG_LIMIT);
+    }
+
+    #[test]
+    fn clamp_limit_accepts_an_explicit_zero() {
+        assert_eq!(clamp_limit(Some("0")), 0);
+    }
+
+    #[test]
+    fn clamp_limit_passes_an_ordinary_value_through() {
+        assert_eq!(clamp_limit(Some("5")), 5);
+    }
+
+    #[test]
+    fn clamp_limit_caps_an_oversized_value_rather_than_rejecting_it() {
+        assert_eq!(clamp_limit(Some("99999")), MAX_LOG_LIMIT);
+    }
+
+    #[test]
+    fn clamp_limit_falls_back_to_the_default_on_a_negative_value() {
+        // "-1" cannot parse as a `u32` at all — this is the exact input
+        // that made axum's derived `Option<u32>` extractor 400 before the
+        // handler body ever ran, which `Option<String>` + `clamp_limit`
+        // exists to fix.
+        assert_eq!(clamp_limit(Some("-1")), DEFAULT_LOG_LIMIT);
+    }
+
+    #[test]
+    fn clamp_limit_falls_back_to_the_default_on_garbage() {
+        assert_eq!(clamp_limit(Some("abc")), DEFAULT_LOG_LIMIT);
+    }
 }

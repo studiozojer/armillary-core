@@ -704,12 +704,15 @@ pub struct LogEntry {
 /// appear in a commit's metadata.
 ///
 /// **The subject is the field to think about, and `%s` already settles it**:
-/// git's own `%s` placeholder is the commit message's FIRST LINE — a commit
-/// authored across multiple paragraphs still renders as one line under `%s`,
-/// with the paragraph break simply not included (it is not joined with a
-/// space; it is truncated at the first blank line). So a raw newline inside
-/// one entry's fields cannot occur, and splitting entries on `\n` needs no
-/// separate escaping scheme for the subject.
+/// git's own `%s` placeholder is the commit message's first PARAGRAPH (the
+/// text up to the first blank line), with any line breaks WITHIN that
+/// paragraph joined by a single space — verified live: a two-line first
+/// paragraph followed by a blank line and a body renders under `%s` as those
+/// two lines joined with `" "`, and the body paragraph is dropped entirely,
+/// not appended. So a raw newline inside one entry's fields cannot occur
+/// (an embedded break becomes a space, never a newline, and anything past
+/// the first blank line never reaches `%s` at all), and splitting entries
+/// on `\n` needs no separate escaping scheme for the subject.
 ///
 /// `limit` is always a `u32` rendered as a plain decimal by the caller — it
 /// can never begin with `-` and be read as a flag, so no `validate_arg` call
