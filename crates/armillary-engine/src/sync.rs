@@ -305,7 +305,7 @@ async fn one_repo(abs: &Path, module: DeclaredModule, perform: bool) -> RepoRepo
     };
 
     match verdict {
-        Verdict::Behind { commits } if perform => match git::fast_forward(abs, t).await {
+        Verdict::Behind { commits } if perform => match git::pull_ff(abs, t).await {
             Ok(()) => {
                 report.status = "synced";
                 report.reason = None;
