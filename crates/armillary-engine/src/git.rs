@@ -18,7 +18,7 @@
 //! remotes, and libgit2 reimplements a subset that diverges exactly there.
 //! Shelling out is the narrower real risk despite being the scarier word.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
@@ -290,16 +290,72 @@ pub fn last_fetch(repo: &Path) -> Option<String> {
 
 /// Linked working trees sharing this repo's `.git`.
 ///
-/// A `read_dir` of `.git/worktrees/`, which `git worktree add` populates with
-/// one directory per linked tree. Counts linked trees ONLY — the checkout
-/// being read is not among them, which is why an ordinary repo answers 0 and
-/// `git worktree list` prints one line more than this number.
+/// A `read_dir` of the `worktrees/` directory that `git worktree add`
+/// populates with one directory per linked tree. Counts linked trees ONLY —
+/// the checkout being read is not among them, which is why an ordinary main
+/// checkout with one linked tree answers 1 and `git worktree list` prints two
+/// lines.
+///
+/// **`repo`'s own `.git` may be a directory OR a file**, and both are
+/// resolved to the same family directory. A main checkout's `.git` is a
+/// directory, and `worktrees/` sits directly inside it. A linked worktree's
+/// `.git` is instead a FILE — `gitdir: <path-into-the-main-checkout's>
+/// worktrees/<name>` — and reading THAT `<name>` directory's *parent* lands
+/// back on the one shared `worktrees/` directory, so a linked tree reports
+/// the same family count the main checkout would. Getting this wrong reads
+/// as data loss rather than a missing feature: before this resolution
+/// existed, `read_dir` on a linked tree's (nonexistent) `<repo>/.git/
+/// worktrees/` failed and `unwrap_or(0)` turned that failure into the exact
+/// same `0` a healthy solo checkout reports — "I could not look" and "there
+/// is nothing here" are different facts, and only one of them is true. Found
+/// live in review, 2026-08-04.
+///
+/// A submodule's `.git` is a file too (`gitdir: ../.git/modules/<name>`), but
+/// that path's parent is named `modules/`, not `worktrees/` —
+/// `worktree_family_dir` returns `None` for it and this answers a genuine 0,
+/// not a swallowed error.
+///
+/// What is still swallowed to 0, and left that way as an accepted
+/// conflation at this level: a `.git` that is neither a readable directory
+/// nor a readable file (permissions, a dangling mount) is indistinguishable
+/// from "no linked trees." Both a stat and a `read_dir` failure earn a
+/// `bool`-shaped "no answer" the same way `is_dirty`'s comment discusses for
+/// its own case, and a `u32` has no natural way to carry that distinction
+/// without becoming an `Option`, which no caller of this v1 needs yet.
 ///
 /// Counted, never enumerated or actioned, in v1 (design D9).
 pub fn worktree_count(repo: &Path) -> u32 {
-    std::fs::read_dir(repo.join(".git").join("worktrees"))
+    let dot_git = repo.join(".git");
+    let worktrees_dir = match std::fs::metadata(&dot_git) {
+        Ok(meta) if meta.is_dir() => dot_git.join("worktrees"),
+        Ok(_file) => match worktree_family_dir(repo, &dot_git) {
+            Some(dir) => dir,
+            None => return 0,
+        },
+        Err(_) => return 0,
+    };
+    std::fs::read_dir(worktrees_dir)
         .map(|entries| entries.flatten().count() as u32)
         .unwrap_or(0)
+}
+
+/// Resolve a `.git` FILE (`gitdir: <path>`) to the shared `worktrees/`
+/// directory it points into — `None` when it points somewhere else, which is
+/// how a submodule's `gitdir: ../.git/modules/<name>` is told apart from a
+/// linked worktree's `gitdir: /.../worktrees/<name>`: only the latter's
+/// PARENT is named `worktrees`.
+///
+/// The path after `gitdir:` is absolute for a linked worktree and typically
+/// relative for a submodule (`../.git/modules/<name>`, verified live against
+/// both cases 2026-08-04) — resolved against `repo`, not the process's cwd,
+/// via `Path::join`, whose stdlib-documented behavior already does the right
+/// thing for both: joining an absolute path onto `repo` discards `repo` and
+/// keeps the absolute one; joining a relative path appends it.
+fn worktree_family_dir(repo: &Path, dot_git_file: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(dot_git_file).ok()?;
+    let raw = contents.trim().strip_prefix("gitdir:")?.trim();
+    let parent = repo.join(raw).parent()?.to_path_buf();
+    (parent.file_name()? == "worktrees").then_some(parent)
 }
 
 /// Whether the repo declares submodules. They are fetched, never updated —
@@ -776,6 +832,20 @@ mod tests {
         // The main checkout is NOT counted — .git/worktrees/ holds linked trees
         // only, which is why this is 1 and `git worktree list` prints 2 lines.
         assert_eq!(worktree_count(&clone), 1);
+    }
+
+    #[test]
+    fn worktree_count_from_a_linked_tree_reports_the_family_not_zero() {
+        // A linked tree's OWN `.git` is a file (`gitdir: <path>`), not a
+        // directory — before the gitdir resolution, `read_dir` on the
+        // (nonexistent) "<wt>/.git/worktrees" failed and `unwrap_or(0)`
+        // silently reported the same 0 a solo checkout with no linked trees
+        // reports. Reading FROM the linked tree must answer the same family
+        // count the main checkout would, not swallow the lookup failure.
+        let (_remote, clone) = remote_and_clone();
+        let wt = clone.join(".worktrees/topic");
+        git_sync(&clone, &["worktree", "add", wt.to_str().unwrap(), "-b", "topic"]);
+        assert_eq!(worktree_count(&wt), 1);
     }
 
     #[test]
