@@ -217,8 +217,14 @@ pub fn parse_status_v2(stdout: &str) -> StatusV2 {
             (Some("branch.oid"), Some(v)) => head = Some(v.trim().to_string()),
             (Some("branch.head"), Some(v)) => {
                 let v = v.trim();
-                // git prints the literal "(detached)" here, never a branch
-                // named that — a branch cannot contain parentheses this way.
+                // git prints this literal for a detached HEAD, but a branch
+                // actually named "(detached)" is indistinguishable here and
+                // is misread as detached too — porcelain v2's own format
+                // carries no marker beyond the string itself, so this parser
+                // inherits the ambiguity. Closing it costs a second fork per
+                // repo (`git symbolic-ref -q HEAD`), spent to guard a branch
+                // name nobody uses; deliberately not paid, because both
+                // readings block the identical set of verbs.
                 if v != "(detached)" {
                     branch = Some(v.to_string());
                 }
