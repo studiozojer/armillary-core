@@ -90,6 +90,37 @@ fn live_workspace_with_sync() -> (PathBuf, PathBuf) {
     (root, remote)
 }
 
+/// `live_workspace_with_sync`, but with NO `[router]` gate declared at all —
+/// neither `sync` nor `push`. Every verb must refuse against this fixture;
+/// it is the "nothing granted" half of the two-gate story.
+fn live_workspace() -> (PathBuf, PathBuf) {
+    let root = tempfile::tempdir().unwrap().keep();
+    git_sync(&root, &["init", "--initial-branch=main", "."]);
+
+    let (remote, _first) = remote_and_clone();
+    let module = root.join("repos").join("jianyi");
+    std::fs::create_dir_all(root.join("repos")).unwrap();
+    git_sync(&root, &["clone", remote.to_str().unwrap(), module.to_str().unwrap()]);
+
+    std::fs::write(
+        root.join("modules.local.toml"),
+        "[[repos]]\nname = \"jianyi\"\npath = \"repos/jianyi\"\n",
+    )
+    .unwrap();
+    (root, remote)
+}
+
+/// Push a new commit into `remote` from a third clone, so an existing clone
+/// becomes genuinely behind rather than being told it is. Mirrors
+/// `armillary_engine::testgit::advance_remote`, unreachable from here (see
+/// this file's header).
+fn advance_remote(remote: &Path) {
+    let other = tempfile::tempdir().unwrap().keep();
+    git_sync(&other, &["clone", remote.to_str().unwrap(), other.to_str().unwrap()]);
+    commit(&other, "from-elsewhere.md", "two");
+    git_sync(&other, &["push", "origin", "main"]);
+}
+
 fn build_app(root: &Path) -> axum::Router {
     let data_dir = tempfile::tempdir().unwrap().keep();
     let store = LogStore::open(&data_dir).unwrap();
@@ -116,6 +147,37 @@ async fn get_json(root: &Path, uri: &str) -> serde_json::Value {
 async fn get_status(root: &Path, uri: &str) -> u16 {
     let response = build_app(root)
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    response.status().as_u16()
+}
+
+async fn post_json(root: &Path, uri: &str) -> serde_json::Value {
+    let response = build_app(root)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+}
+
+async fn post_status(root: &Path, uri: &str) -> u16 {
+    let response = build_app(root)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     response.status().as_u16()
@@ -203,4 +265,58 @@ async fn a_malformed_limit_falls_back_to_the_default_rather_than_400() {
     let (root, _remote) = live_workspace_with_sync();
     assert_eq!(get_status(&root, "/repos/jianyi/log?limit=abc").await, 200);
     assert_eq!(get_status(&root, "/repos/jianyi/log?limit=-1").await, 200);
+}
+
+#[tokio::test]
+async fn pull_fast_forwards_and_returns_the_new_state() {
+    let (root, remote) = live_workspace_with_sync();
+    advance_remote(&remote);
+    post_json(&root, "/repos/jianyi/fetch").await;
+    let body = post_json(&root, "/repos/jianyi/pull").await;
+
+    assert!(root.join("repos/jianyi/from-elsewhere.md").exists());
+    assert_eq!(body["position"]["behind"], 0, "the response must be POST-mutation state");
+}
+
+#[tokio::test]
+async fn pull_refuses_a_dirty_repo_and_leaves_the_working_tree_alone() {
+    let (root, remote) = live_workspace_with_sync();
+    advance_remote(&remote);
+    let seed = root.join("repos/jianyi/seed.md");
+    std::fs::write(&seed, "my uncommitted edit").unwrap();
+    post_json(&root, "/repos/jianyi/fetch").await;
+    post_json(&root, "/repos/jianyi/pull").await;
+
+    assert_eq!(std::fs::read_to_string(&seed).unwrap(), "my uncommitted edit");
+    assert!(!root.join("repos/jianyi/from-elsewhere.md").exists());
+}
+
+#[tokio::test]
+async fn push_is_403_when_only_sync_is_granted() {
+    let (root, _remote) = live_workspace_with_sync(); // sync = true, no push key
+    assert_eq!(post_status(&root, "/repos/jianyi/push").await, 403);
+}
+
+#[tokio::test]
+async fn every_verb_is_403_when_nothing_is_granted() {
+    let (root, _remote) = live_workspace(); // no gates at all
+    for path in ["/repos/jianyi/fetch", "/repos/jianyi/pull", "/repos/jianyi/push", "/repos/fetch"] {
+        assert_eq!(post_status(&root, path).await, 403, "{path} must refuse");
+    }
+}
+
+#[tokio::test]
+async fn a_total_fetch_failure_does_not_read_as_success() {
+    // The whole-branch review's worst finding on the shipped branch: the
+    // screen reported every repo `current` having contacted nothing.
+    let (root, _remote) = live_workspace_with_sync();
+    git_sync(&root.join("repos/jianyi"), &["remote", "remove", "origin"]);
+    let body = post_json(&root, "/repos/fetch").await;
+    let jianyi = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "jianyi")
+        .unwrap();
+    assert!(jianyi["fetch_error"].is_string(), "a failed fetch must be on the wire");
 }
