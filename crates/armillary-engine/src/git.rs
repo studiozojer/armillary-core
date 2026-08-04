@@ -154,6 +154,101 @@ pub async fn newest_commit(repo: &Path, timeout: Duration) -> Result<Option<Stri
     Ok(Some(out.stdout))
 }
 
+/// Where HEAD sits relative to its upstream.
+///
+/// **An enum over what is KNOWABLE, not over which fact wins.** `Verdict`
+/// below ranks six conditions and returns one, so `ahead` — parsed, used
+/// once, and discarded — never reaches the wire, and a repo with three
+/// unpushed commits reports `Current`. Here `Detached` and `NoUpstream` are
+/// not competing with "behind"; they are states in which "behind" has no
+/// meaning, which is why they are variants and `ahead`/`behind` are fields
+/// inside the one variant where they are defined.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum Position {
+    Tracking { upstream: String, ahead: u32, behind: u32 },
+    /// An upstream is configured but its remote-tracking ref is absent —
+    /// merged and pruned, or never fetched. Ahead/behind are unknowable, and
+    /// git says so by omitting `branch.ab` while still printing
+    /// `branch.upstream`. Found by running the command rather than reasoning
+    /// about it; live in this workspace on 2026-08-04.
+    UpstreamGone { upstream: String },
+    NoUpstream,
+    Detached,
+}
+
+/// Everything one `git status --porcelain=v2 --branch` yields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusV2 {
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub position: Position,
+    pub dirty_files: u32,
+}
+
+/// Parse `--porcelain=v2 --branch` output.
+///
+/// Header lines begin `# `; everything else is one changed path. The four
+/// positions fall out of which headers are PRESENT — git omits
+/// `branch.upstream` when nothing is tracked and omits `branch.ab` when the
+/// tracking ref is missing, so absence carries the meaning and the parser
+/// needs no sentinel for "undefined".
+///
+/// Unparseable `branch.ab` degrades to `UpstreamGone` rather than to
+/// `Tracking { 0, 0 }`: the first says "we don't know", the second says
+/// "you're up to date", and only one of those is honest about a line we
+/// failed to read.
+pub fn parse_status_v2(stdout: &str) -> StatusV2 {
+    let mut head = None;
+    let mut branch = None;
+    let mut upstream: Option<String> = None;
+    let mut ab: Option<(u32, u32)> = None;
+    let mut dirty_files = 0u32;
+
+    for line in stdout.lines() {
+        let Some(header) = line.strip_prefix("# ") else {
+            if !line.trim().is_empty() {
+                dirty_files += 1;
+            }
+            continue;
+        };
+        let mut parts = header.splitn(2, ' ');
+        match (parts.next(), parts.next()) {
+            (Some("branch.oid"), Some(v)) => head = Some(v.trim().to_string()),
+            (Some("branch.head"), Some(v)) => {
+                let v = v.trim();
+                // git prints the literal "(detached)" here, never a branch
+                // named that — a branch cannot contain parentheses this way.
+                if v != "(detached)" {
+                    branch = Some(v.to_string());
+                }
+            }
+            (Some("branch.upstream"), Some(v)) => upstream = Some(v.trim().to_string()),
+            (Some("branch.ab"), Some(v)) => ab = parse_ab(v),
+            _ => {}
+        }
+    }
+
+    let position = match (branch.is_some(), upstream, ab) {
+        (false, _, _) => Position::Detached,
+        (true, None, _) => Position::NoUpstream,
+        (true, Some(u), None) => Position::UpstreamGone { upstream: u },
+        (true, Some(u), Some((ahead, behind))) => {
+            Position::Tracking { upstream: u, ahead, behind }
+        }
+    };
+
+    StatusV2 { head, branch, position, dirty_files }
+}
+
+/// `+3 -1` -> `(3, 1)`. `None` on anything else.
+fn parse_ab(value: &str) -> Option<(u32, u32)> {
+    let mut parts = value.split_whitespace();
+    let ahead = parts.next()?.strip_prefix('+')?.parse().ok()?;
+    let behind = parts.next()?.strip_prefix('-')?.parse().ok()?;
+    Some((ahead, behind))
+}
+
 /// What a repo's local state permits.
 ///
 /// Exactly one verdict per repo, and the precedence below is load-bearing
@@ -527,5 +622,74 @@ mod tests {
         git_sync(&solo, &["init", "--initial-branch=main", "."]);
         commit(&solo, "alone.md", "solo");
         assert!(fetch(&solo, DEFAULT_TIMEOUT).await.is_err());
+    }
+
+    #[test]
+    fn parses_a_tracking_branch_with_both_counts() {
+        let out = "# branch.oid 00f45bf037e0b34f312360d54a6e778107da42f7\n\
+                   # branch.head feat/whyte-subheaders\n\
+                   # branch.upstream origin/feat/whyte-subheaders\n\
+                   # branch.ab +3 -1\n";
+        let s = parse_status_v2(out);
+        assert_eq!(s.branch.as_deref(), Some("feat/whyte-subheaders"));
+        assert_eq!(s.head.as_deref(), Some("00f45bf037e0b34f312360d54a6e778107da42f7"));
+        assert_eq!(
+            s.position,
+            Position::Tracking { upstream: "origin/feat/whyte-subheaders".into(), ahead: 3, behind: 1 }
+        );
+        assert_eq!(s.dirty_files, 0);
+    }
+
+    #[test]
+    fn an_upstream_without_an_ab_line_is_upstream_gone_not_zero_zero() {
+        // Verified live 2026-08-04 against armillary-core/.worktrees/workspace-sync:
+        // an upstream is configured, its remote-tracking ref is gone (merged and
+        // pruned), and git omits `branch.ab` entirely. Read as Tracking{0,0} this
+        // renders "up to date" for a repo whose upstream no longer exists.
+        let out = "# branch.oid 40fcfa9c6a13b6c104d8b1a8ae23ea1f25f4b6ce\n\
+                   # branch.head feat/workspace-sync\n\
+                   # branch.upstream origin/feat/workspace-sync\n";
+        let s = parse_status_v2(out);
+        assert_eq!(
+            s.position,
+            Position::UpstreamGone { upstream: "origin/feat/workspace-sync".into() }
+        );
+    }
+
+    #[test]
+    fn a_branch_with_no_upstream_line_is_no_upstream() {
+        let out = "# branch.oid 270ce701866b36c8da2126bcd9b74e8a0629c050\n\
+                   # branch.head main\n";
+        assert_eq!(parse_status_v2(out).position, Position::NoUpstream);
+    }
+
+    #[test]
+    fn the_literal_detached_marker_is_detached_and_leaves_branch_none() {
+        let out = "# branch.oid cd0a50fbcc83b6e783c0520263b4a43734d79e4d\n\
+                   # branch.head (detached)\n";
+        let s = parse_status_v2(out);
+        assert_eq!(s.position, Position::Detached);
+        assert_eq!(s.branch, None);
+        // The oid is still wanted — it is the only thing identifying where HEAD is.
+        assert!(s.head.is_some());
+    }
+
+    #[test]
+    fn dirty_files_counts_every_entry_kind_including_untracked() {
+        // 1 = ordinary change, 2 = rename, u = unmerged, ? = untracked.
+        // All four are "this working tree has uncommitted work" and all four count.
+        let out = "# branch.oid abc123\n\
+                   # branch.head main\n\
+                   1 .M N... 100644 100644 100644 aaa bbb src/lib.rs\n\
+                   2 R. N... 100644 100644 100644 ccc ddd R100 new.rs\told.rs\n\
+                   u UU N... 100644 100644 100644 100644 eee fff ggg conflict.rs\n\
+                   ? untracked.md\n";
+        assert_eq!(parse_status_v2(out).dirty_files, 4);
+    }
+
+    #[test]
+    fn a_header_only_output_from_a_clean_repo_is_not_dirty() {
+        let out = "# branch.oid abc123\n# branch.head main\n# branch.ab +0 -0\n";
+        assert_eq!(parse_status_v2(out).dirty_files, 0);
     }
 }
