@@ -17,6 +17,7 @@ pub mod loop_;
 pub mod log;
 pub mod projection;
 pub mod provider;
+pub mod repos;
 pub mod routes;
 mod search;
 pub mod sessions;

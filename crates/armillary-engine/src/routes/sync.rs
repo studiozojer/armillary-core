@@ -1,4 +1,4 @@
-use crate::{state::SharedState, sync};
+use crate::{repos, state::SharedState, sync};
 use axum::{extract::State, http::StatusCode, Json};
 
 /// `GET /sync` — what the local refs say, without touching the network.
@@ -21,7 +21,7 @@ pub async fn status(State(state): State<SharedState>) -> Json<sync::SyncReport> 
 pub async fn sweep(
     State(state): State<SharedState>,
 ) -> Result<Json<sync::SyncReport>, (StatusCode, String)> {
-    if !sync::gate_enabled(&state.root) {
+    if !repos::gate_enabled(&state.root) {
         return Err((
             StatusCode::FORBIDDEN,
             "this workspace has not granted the engine authority to run git. \

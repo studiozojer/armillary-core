@@ -235,7 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `Router.extra`, which C-5 forbids validating, so a misspelled `snyc`
     // disables the feature with no error anywhere. One line at startup is what
     // turns a silent typo into a visible one.
-    if armillary_engine::sync::gate_enabled(&root) {
+    if armillary_engine::repos::gate_enabled(&root) {
         eprintln!("sync: enabled by [router] sync — POST /sync will fetch and fast-forward");
     } else {
         eprintln!(

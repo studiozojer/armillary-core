@@ -1,0 +1,453 @@
+//! The repo set: which composed modules are actual git checkouts on disk,
+//! the authority gate that permits git to run at all, and each one's live
+//! state.
+//!
+//! **The repo set is manifest-derived, never discovered.** The same
+//! `parse_workspace` call that backs `/composition` produces it, so there is
+//! one enumeration rather than two, composing a new repo makes it sync
+//! itself, and `repos/external/` stays invisible because it was never
+//! declared.
+//!
+//! Manifest-derivation is correct and *silent*, which is the wrong shape on
+//! its own — a sweep that skips an undeclared module without saying so reads
+//! identically to a sweep that had nothing to skip. `undeclared_checkouts` is
+//! the answer to that, and it paid for itself before it was written:
+//! enumerating for this design is what surfaced `operators/ariadne`, on disk
+//! since 2026-07-24 and in no manifest.
+//!
+//! `RepoState` and `read_one` are the other half: one repo's full status,
+//! read without a fetch and without a mutation — the write verbs live in
+//! `git.rs`, and `sync.rs`'s `sweep` is what calls them before asking here.
+
+use std::path::Path;
+
+/// A module the manifest declares AND that exists on disk as a git checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredModule {
+    pub name: String,
+    /// Relative to the workspace root. The router root itself is `"."`.
+    pub path: String,
+}
+
+/// The directories scanned one level deep for undeclared checkouts.
+const MODULE_CONTAINERS: [&str; 2] = ["operators", "repos"];
+
+/// Every composed module that is actually a checkout, router root first.
+///
+/// A declared module that was never cloned is omitted rather than reported as
+/// an error — C-4, the same rule that lets a bare clone be a working host.
+/// Presence is tested by `<path>/.git` existing at all, which covers both an
+/// ordinary clone (a directory) and a worktree or submodule (a file).
+pub fn declared_modules(root: &Path) -> Vec<DeclaredModule> {
+    let mut out = Vec::new();
+
+    let is_checkout = |rel: &str| root.join(rel).join(".git").exists();
+
+    // The router root is not a module and is never in the manifest — it is the
+    // repo this whole workspace is. Named "armillary" so the report has
+    // something to print beside a bare ".".
+    if root.join(".git").exists() {
+        out.push(DeclaredModule {
+            name: "armillary".to_string(),
+            path: ".".to_string(),
+        });
+    }
+
+    let Ok(composition) = armillary_composition::parse_workspace(root) else {
+        // A malformed manifest is a warning posture everywhere else in this
+        // engine (see main::declared_boot) and is one here too: sweep the root
+        // rather than refusing to sweep anything.
+        return out;
+    };
+
+    for module in composition
+        .operators
+        .iter()
+        .chain(composition.commons.iter())
+        .chain(composition.repos.iter())
+    {
+        if is_checkout(&module.path) {
+            out.push(DeclaredModule {
+                name: module.name.clone(),
+                path: module.path.clone(),
+            });
+        }
+    }
+
+    out
+}
+
+/// Git checkouts sitting one level under `operators/` or `repos/` that no
+/// manifest declares.
+///
+/// **Depth 1 only.** `repos/external/` holds reference clones a level deeper,
+/// and not descending is what keeps them out of the report — the same promise
+/// D2 makes about them never being swept.
+pub fn undeclared_checkouts(root: &Path, declared: &[DeclaredModule]) -> Vec<String> {
+    let known: std::collections::BTreeSet<&str> =
+        declared.iter().map(|m| m.path.as_str()).collect();
+    let mut found = Vec::new();
+
+    for container in MODULE_CONTAINERS {
+        let Ok(entries) = std::fs::read_dir(root.join(container)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+                continue;
+            };
+            let rel = format!("{container}/{name}");
+            if known.contains(rel.as_str()) {
+                continue;
+            }
+            if root.join(&rel).join(".git").exists() {
+                found.push(rel);
+            }
+        }
+    }
+
+    found.sort();
+    found
+}
+
+/// Whether this workspace has granted the engine authority to run git.
+///
+/// Read **per request**, not cached in `AppState`. That diverges from
+/// `[router] boot` — which is read once at startup because changing WHICH file
+/// boots is a restart-level change — and the divergence is deliberate: this
+/// costs one small TOML parse on a route that is about to spawn two dozen
+/// subprocesses, and it means granting or revoking the authority takes effect
+/// when the file is saved rather than when the daemon is next restarted.
+///
+/// The key rides in `Router.extra`, C-5's escape hatch, so `armillary-composition`
+/// needs no new field and `conformance/` is untouched — and a change to
+/// `conformance/` is a change to every implementation of the standard.
+///
+/// **Fails closed everywhere**: absent, misspelled, non-boolean, or an
+/// unparseable manifest all mean disabled. The cost is that a typo is silent,
+/// which `main.rs`'s startup banner is what pays for.
+pub fn gate_enabled(root: &Path) -> bool {
+    armillary_composition::parse_workspace(root)
+        .ok()
+        .and_then(|c| c.router.extra.get("sync").and_then(|v| v.as_bool()))
+        .unwrap_or(false)
+}
+
+use crate::git::{self, GitError, Position};
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RepoState {
+    pub name: String,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub position: Position,
+    pub dirty_files: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fetch: Option<String>,
+    /// Single-repo routes only (D5) — see `read_one`'s `with_commit`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub newest_commit: Option<String>,
+    pub worktrees: u32,
+    pub submodules: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetch_error: Option<String>,
+    /// When set, every field above is a type default rather than a
+    /// measurement, and the client MUST branch on this before rendering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_error: Option<String>,
+}
+
+/// Read one repo's full state. Performs no network call and no mutation —
+/// the verbs in `git.rs` act first (fetch, pull, push), and callers reach
+/// this afterward to build the response.
+///
+/// `with_commit` gates the second fork for `newest_commit` (D5): `false` on
+/// the list route, where the cost multiplies by twenty-four composed repos —
+/// the entire savings this design exists to bank — and `true` on the
+/// single-repo page, where one extra fork is unmeasurable.
+pub async fn read_one(root: &Path, module: &DeclaredModule, with_commit: bool) -> RepoState {
+    let abs = root.join(&module.path);
+    let t = git::DEFAULT_TIMEOUT;
+
+    let mut state = RepoState {
+        name: module.name.clone(),
+        path: module.path.clone(),
+        head: None,
+        branch: None,
+        position: Position::Detached,
+        dirty_files: 0,
+        last_fetch: git::last_fetch(&abs),
+        newest_commit: None,
+        worktrees: git::worktree_count(&abs),
+        submodules: git::has_submodules(&abs),
+        fetch_error: None,
+        read_error: None,
+    };
+
+    match git::status_v2(&abs, t).await {
+        Ok(s) => {
+            state.head = s.head;
+            state.branch = s.branch;
+            state.position = s.position;
+            state.dirty_files = s.dirty_files;
+        }
+        Err(e) => {
+            state.read_error = Some(match e {
+                GitError::Timeout => "timed out".to_string(),
+                GitError::Failed(msg) => msg,
+                // Unreachable in practice: `status_v2` passes only literal
+                // args, never anything request-derived. Carried like `Failed`
+                // rather than panicking or dropping it, matching the
+                // treatment `sync::one_repo` gives the same variant.
+                GitError::InvalidArg(msg) => msg,
+            });
+            return state;
+        }
+    }
+
+    if with_commit {
+        // Read LAST and only here: a caller that mutated must see the commit
+        // its mutation landed, not the one it already had.
+        state.newest_commit = git::newest_commit(&abs, t).await.ok().flatten();
+    }
+    state
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// A workspace whose declared modules exist on disk as git checkouts.
+    /// `.git` is created as a plain directory — every function under test asks
+    /// only whether it EXISTS, never for its contents, so a real `git init` per
+    /// module would cost seconds of test time to prove nothing extra.
+    fn workspace() -> PathBuf {
+        let root = tempfile::tempdir().unwrap().keep();
+        fs::write(
+            root.join("modules.toml"),
+            "[router]\ncontains = [\"CLAUDE.md\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("modules.local.toml"),
+            "[[operators]]\nname = \"tycho\"\npath = \"operators/tycho\"\n\n\
+             [[commons]]\nname = \"zojercommons\"\npath = \"zojercommons\"\n\n\
+             [[repos]]\nname = \"jianyi\"\npath = \"repos/jianyi\"\n",
+        )
+        .unwrap();
+        for p in ["operators/tycho", "zojercommons", "repos/jianyi"] {
+            fs::create_dir_all(root.join(p).join(".git")).unwrap();
+        }
+        fs::create_dir_all(root.join(".git")).unwrap();
+        root
+    }
+
+    #[test]
+    fn declared_modules_includes_the_router_root_first() {
+        let root = workspace();
+        let got = declared_modules(&root);
+        assert_eq!(got[0].path, ".");
+        assert_eq!(got[0].name, "armillary");
+    }
+
+    #[test]
+    fn declared_modules_reads_operators_commons_and_repos() {
+        let root = workspace();
+        // Bound to a local first: `.iter()` on the call result directly borrows
+        // a temporary that the `let` statement's own type annotation forces to
+        // outlive its statement, and the borrow checker rejects that.
+        let declared = declared_modules(&root);
+        let paths: Vec<&str> = declared.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(paths, vec![".", "operators/tycho", "zojercommons", "repos/jianyi"]);
+    }
+
+    #[test]
+    fn declared_modules_omits_a_declared_module_that_is_not_cloned() {
+        // C-4: a workspace that composes something absent is a working host.
+        // A module declared but never cloned is not an error and not a sync
+        // target; it is simply not there.
+        let root = workspace();
+        fs::write(
+            root.join("modules.local.toml"),
+            "[[repos]]\nname = \"never-cloned\"\npath = \"repos/never-cloned\"\n",
+        )
+        .unwrap();
+        let declared = declared_modules(&root);
+        let paths: Vec<&str> = declared.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(paths, vec!["."]);
+    }
+
+    #[test]
+    fn declared_modules_is_just_the_root_when_nothing_is_composed() {
+        let root = tempfile::tempdir().unwrap().keep();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        assert_eq!(declared_modules(&root).len(), 1);
+    }
+
+    #[test]
+    fn undeclared_checkouts_finds_a_module_on_disk_and_not_in_the_manifest() {
+        let root = workspace();
+        fs::create_dir_all(root.join("operators/ariadne").join(".git")).unwrap();
+        let declared = declared_modules(&root);
+        assert_eq!(undeclared_checkouts(&root, &declared), vec!["operators/ariadne"]);
+    }
+
+    #[test]
+    fn undeclared_checkouts_is_empty_when_the_manifest_is_complete() {
+        let root = workspace();
+        let declared = declared_modules(&root);
+        assert!(undeclared_checkouts(&root, &declared).is_empty());
+    }
+
+    #[test]
+    fn undeclared_checkouts_ignores_a_directory_that_is_not_a_checkout() {
+        // `operators/blank` is a scratch template, not a clone.
+        let root = workspace();
+        fs::create_dir_all(root.join("operators/blank")).unwrap();
+        let declared = declared_modules(&root);
+        assert!(undeclared_checkouts(&root, &declared).is_empty());
+    }
+
+    #[test]
+    fn undeclared_checkouts_does_not_descend_into_a_container_directory() {
+        // `repos/external/` holds reference clones one level deeper. Scanning
+        // depth 1 only is what keeps them invisible, matching D2's promise that
+        // an undeclared container stays out of the sweep entirely.
+        let root = workspace();
+        fs::create_dir_all(root.join("repos/external/pi").join(".git")).unwrap();
+        let declared = declared_modules(&root);
+        assert!(undeclared_checkouts(&root, &declared).is_empty());
+    }
+
+    #[test]
+    fn gate_is_off_when_nothing_declares_it() {
+        let root = workspace();
+        assert!(!gate_enabled(&root));
+    }
+
+    #[test]
+    fn gate_is_on_when_the_router_declares_sync_true() {
+        let root = workspace();
+        fs::write(
+            root.join("modules.local.toml"),
+            "[router]\nsync = true\n",
+        )
+        .unwrap();
+        assert!(gate_enabled(&root));
+    }
+
+    #[test]
+    fn gate_is_off_when_the_key_is_misspelled() {
+        // `extra` is unvalidated by design (C-5 forbids deny_unknown_fields),
+        // so a typo disables the feature silently. This test exists to make
+        // that behaviour deliberate rather than discovered — the startup
+        // banner in main.rs is what makes it visible to a human.
+        let root = workspace();
+        fs::write(root.join("modules.local.toml"), "[router]\nsnyc = true\n").unwrap();
+        assert!(!gate_enabled(&root));
+    }
+
+    #[test]
+    fn gate_is_off_when_the_value_is_not_a_boolean() {
+        let root = workspace();
+        fs::write(root.join("modules.local.toml"), "[router]\nsync = \"yes\"\n").unwrap();
+        assert!(!gate_enabled(&root));
+    }
+
+    #[test]
+    fn gate_is_off_when_the_manifest_is_malformed() {
+        // Fail closed. A broken manifest must not grant an authority.
+        let root = workspace();
+        fs::write(root.join("modules.local.toml"), "[router\nsync = ").unwrap();
+        assert!(!gate_enabled(&root));
+    }
+
+    use crate::testgit::{commit, git_sync, remote_and_clone};
+
+    /// A workspace whose declared modules are REAL clones of a shared bare
+    /// remote. Returns (root, remote).
+    fn live_workspace() -> (PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap().keep();
+        git_sync(&root, &["init", "--initial-branch=main", "."]);
+
+        let (remote, _first) = remote_and_clone();
+        let module = root.join("repos").join("jianyi");
+        fs::create_dir_all(root.join("repos")).unwrap();
+        git_sync(
+            &root,
+            &["clone", remote.to_str().unwrap(), module.to_str().unwrap()],
+        );
+
+        fs::write(
+            root.join("modules.local.toml"),
+            "[router]\nsync = true\n\n\
+             [[repos]]\nname = \"jianyi\"\npath = \"repos/jianyi\"\n",
+        )
+        .unwrap();
+        (root, remote)
+    }
+
+    fn module(name: &str, path: &str) -> DeclaredModule {
+        DeclaredModule { name: name.to_string(), path: path.to_string() }
+    }
+
+    #[tokio::test]
+    async fn ahead_survives_to_the_state() {
+        // THE regression test for the founding bug. Under the shipped Verdict
+        // this repo reported `current`: ahead was parsed, used once for the
+        // diverged test, and thrown away with no field to carry it.
+        let (root, _remote) = live_workspace();
+        commit(&root.join("repos/jianyi"), "mine.md", "unpushed");
+
+        let s = read_one(&root, &module("jianyi", "repos/jianyi"), false).await;
+        match s.position {
+            Position::Tracking { ahead, behind, .. } => {
+                assert_eq!(ahead, 1, "unpushed work must reach the wire");
+                assert_eq!(behind, 0);
+            }
+            other => panic!("expected Tracking, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dirty_and_ahead_are_both_present_at_once() {
+        // The collapse this design exists to end: under a precedence ladder
+        // one of these erased the other.
+        let (root, _remote) = live_workspace();
+        let repo = root.join("repos/jianyi");
+        commit(&repo, "mine.md", "unpushed");
+        std::fs::write(repo.join("seed.md"), "edited").unwrap();
+
+        let s = read_one(&root, &module("jianyi", "repos/jianyi"), false).await;
+        assert_eq!(s.dirty_files, 1);
+        assert!(matches!(s.position, Position::Tracking { ahead: 1, .. }));
+    }
+
+    #[tokio::test]
+    async fn newest_commit_is_absent_on_a_list_read_and_present_on_a_page_read() {
+        // D5: the list shows last-FETCH, so it must not pay a second fork per
+        // repo.
+        let (root, _remote) = live_workspace();
+        let m = module("jianyi", "repos/jianyi");
+        assert_eq!(read_one(&root, &m, false).await.newest_commit, None);
+        assert!(read_one(&root, &m, true).await.newest_commit.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_repo_reports_read_error_and_not_a_clean_state() {
+        let root = tempfile::tempdir().unwrap().keep();
+        fs::create_dir_all(root.join("repos/ghost")).unwrap();
+        let s = read_one(&root, &module("ghost", "repos/ghost"), false).await;
+        assert!(s.read_error.is_some(), "a non-repo must not read as clean");
+        assert_eq!(s.dirty_files, 0);
+        assert_eq!(s.branch, None);
+    }
+}

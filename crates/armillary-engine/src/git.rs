@@ -264,6 +264,23 @@ fn parse_ab(value: &str) -> Option<(u32, u32)> {
     Some((ahead, behind))
 }
 
+/// One `git status --porcelain=v2 --branch` — branch, upstream, ahead,
+/// behind, and every changed path, in a single fork.
+///
+/// Replaces four invocations (`rev-parse --abbrev-ref HEAD`, `rev-parse
+/// @{u}`, `rev-list --left-right --count`, `status --porcelain`) with one,
+/// which is the entire cost argument for taking the list route from six
+/// processes per repo down to one. `git2`/libgit2 was rejected for this at
+/// the module level (see the file header) on credential-path grounds, not
+/// performance, so the fork count is what this function alone is paid to fix.
+pub async fn status_v2(repo: &Path, timeout: Duration) -> Result<StatusV2, GitError> {
+    let out = run_git(repo, &["status", "--porcelain=v2", "--branch"], timeout).await?;
+    if !out.ok() {
+        return Err(GitError::Failed(out.stderr));
+    }
+    Ok(parse_status_v2(&out.stdout))
+}
+
 /// When this repo last successfully reached its remote, ISO 8601.
 ///
 /// The mtime of `.git/FETCH_HEAD`. Git writes that file on a fetch that
