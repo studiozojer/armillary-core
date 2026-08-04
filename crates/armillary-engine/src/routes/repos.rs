@@ -20,14 +20,15 @@
 //! anything. Each follows the same shape: resolve the name (404 on a miss,
 //! before the gate is even checked — an unknown repo is not this workspace's
 //! business to refuse or permit), check the one gate that verb requires (403
-//! naming the exact table and key, matching `routes::sync`'s wording), act,
-//! then `read_one(root, &module, true)` for the response — **never** the
-//! state computed before acting. A git failure during the act step does not
-//! 500; it lands in the response's `fetch_error`, because twenty-three good
-//! answers and one error is the useful outcome (repos.rs's `fetch_all`
-//! already makes this promise for the group verb; the per-repo verbs make it
-//! too, reusing the same field rather than inventing a second one RepoState
-//! would need to carry for no reader that needs to tell them apart).
+//! naming the exact table and key, worded identically across every verb this
+//! module gates), act, then `read_one(root, &module, true)` for the response
+//! — **never** the state computed before acting. A git failure during the
+//! act step does not 500; it lands in the response's `fetch_error`, because
+//! twenty-three good answers and one error is the useful outcome (repos.rs's
+//! `fetch_all` already makes this promise for the group verb; the per-repo
+//! verbs make it too, reusing the same field rather than inventing a second
+//! one RepoState would need to carry for no reader that needs to tell them
+//! apart).
 
 use crate::git::{self, GitError};
 use crate::repos;
@@ -73,11 +74,11 @@ fn verb_error_message(e: GitError) -> String {
     }
 }
 
-/// 403 for a missing `[router] sync = true` grant. Wording matches
-/// `routes::sync::sweep`'s refusal for the identical gate — `Router.extra`
-/// is unvalidated by design (C-5), so a misspelled `snyc` must read exactly
-/// like a deliberate off, and a second, differently-worded refusal here
-/// would make that indistinguishable from a genuine second gate.
+/// 403 for a missing `[router] sync = true` grant. One function shared by
+/// every verb this gate covers (fetch, fetch-one, pull) — `Router.extra` is
+/// unvalidated by design (C-5), so a misspelled `snyc` must read exactly
+/// like a deliberate off, and a second, differently-worded refusal for the
+/// same gate would make that indistinguishable from a genuine second gate.
 fn sync_gate_denied() -> (StatusCode, String) {
     (
         StatusCode::FORBIDDEN,
@@ -314,8 +315,8 @@ pub async fn fetch_one(
 /// bare `--ff-only` call, silently carrying someone's in-progress edit
 /// forward under a commit that never saw it. The explicit `is_dirty` check
 /// closes that gap by refusing on ANY uncommitted change, not just a
-/// conflicting one — matching `git::Verdict`'s own precedence, where `Dirty`
-/// blocks a fast-forward outright.
+/// conflicting one — dirty blocks a fast-forward outright, full stop, the
+/// same precedence this workspace has always given it.
 pub async fn pull(
     State(state): State<SharedState>,
     Path(name): Path<String>,

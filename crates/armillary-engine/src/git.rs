@@ -105,40 +105,12 @@ pub async fn run_git(
     }
 }
 
-/// The current branch, or `None` when HEAD is detached.
-///
-/// `--abbrev-ref HEAD` prints the literal string `HEAD` in the detached case,
-/// which is why the comparison below is against a name and not against an exit
-/// code.
-pub async fn branch(repo: &Path, timeout: Duration) -> Result<Option<String>, GitError> {
-    let out = run_git(repo, &["rev-parse", "--abbrev-ref", "HEAD"], timeout).await?;
-    if !out.ok() || out.stdout.is_empty() || out.stdout == "HEAD" {
-        return Ok(None);
-    }
-    Ok(Some(out.stdout))
-}
-
-/// The tracking branch (`origin/main`), or `None` when the current branch
-/// tracks nothing.
-pub async fn upstream(repo: &Path, timeout: Duration) -> Result<Option<String>, GitError> {
-    let out = run_git(
-        repo,
-        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-        timeout,
-    )
-    .await?;
-    if !out.ok() || out.stdout.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(out.stdout))
-}
-
 /// True when the working tree has anything uncommitted, **including untracked
-/// files**. `--porcelain` reports those by default and that is wanted: a new
-/// uncommitted note in the commons is work, and a sweep must not act around it.
+/// files**. `--porcelain` reports those by default and that is wanted: an
+/// uncommitted edit is work, and a fast-forward must not act around it.
 ///
-/// Unlike `branch`/`upstream`/`newest_commit`, a git failure here is `Err`, not
-/// folded into `Ok(false)`: `bool` has no natural "no answer" value the way
+/// Unlike `newest_commit`, a git failure here is `Err`, not folded into
+/// `Ok(false)`: `bool` has no natural "no answer" value the way
 /// `Option<String>` does, so silently reporting "not dirty" would misrepresent
 /// a status call that never actually ran.
 pub async fn is_dirty(repo: &Path, timeout: Duration) -> Result<bool, GitError> {
@@ -165,11 +137,11 @@ pub async fn newest_commit(repo: &Path, timeout: Duration) -> Result<Option<Stri
 
 /// Where HEAD sits relative to its upstream.
 ///
-/// **An enum over what is KNOWABLE, not over which fact wins.** `Verdict`
-/// below ranks six conditions and returns one, so `ahead` — parsed, used
-/// once, and discarded — never reaches the wire, and a repo with three
-/// unpushed commits reports `Current`. Here `Detached` and `NoUpstream` are
-/// not competing with "behind"; they are states in which "behind" has no
+/// **An enum over what is KNOWABLE, not over which fact wins.** A single
+/// collapsed verdict ranking six conditions down to one would parse `ahead`,
+/// use it once, and discard it, so a repo with three unpushed commits would
+/// report as merely `Current`. Here `Detached` and `NoUpstream` are not
+/// competing with "behind"; they are states in which "behind" has no
 /// meaning, which is why they are variants and `ahead`/`behind` are fields
 /// inside the one variant where they are defined.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -515,28 +487,6 @@ pub fn has_submodules(repo: &Path) -> bool {
     repo.join(".gitmodules").exists()
 }
 
-/// What a repo's local state permits.
-///
-/// Exactly one verdict per repo, and the precedence below is load-bearing
-/// because several are simultaneously true in practice.
-///
-/// **Detached → NoUpstream → Diverged → Dirty → Behind → Current.**
-///
-/// `Detached` first because there is no branch to reason about at all.
-/// `NoUpstream` next because nothing downstream is computable without one.
-/// `Diverged` above `Dirty` because divergence is a durable fact about history
-/// that survives cleaning the working tree — reporting "dirty" for a repo that
-/// is also diverged sends the reader to fix the thing that was not the problem.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict {
-    Current,
-    Behind { commits: u32 },
-    Diverged,
-    Dirty,
-    NoUpstream,
-    Detached,
-}
-
 /// `git fetch --prune`.
 ///
 /// Touches no working tree and no branch, which is why the sweep runs it
@@ -586,56 +536,6 @@ fn require_ok(out: GitOutput, cmd: &str) -> Result<(), GitError> {
     }))
 }
 
-/// Classify the repo against its upstream, using only local refs.
-///
-/// Deliberately does NOT fetch. The caller decides whether the refs it reads
-/// are fresh — `POST /sync` fetches first, `GET /sync` does not and says so.
-pub async fn verdict(repo: &Path, timeout: Duration) -> Result<Verdict, GitError> {
-    if branch(repo, timeout).await?.is_none() {
-        return Ok(Verdict::Detached);
-    }
-    if upstream(repo, timeout).await?.is_none() {
-        return Ok(Verdict::NoUpstream);
-    }
-
-    // `HEAD...@{u}` with --left-right --count prints "<ahead>\t<behind>":
-    // left side is commits in HEAD and not upstream, right side the reverse.
-    let out = run_git(
-        repo,
-        &["rev-list", "--left-right", "--count", "HEAD...@{u}"],
-        timeout,
-    )
-    .await?;
-    if !out.ok() {
-        return Err(GitError::Failed(out.stderr));
-    }
-    // Unparseable output is an error, not a zero. Defaulting to 0/0 would
-    // report `Current` — "nothing to do, all good" — from a function whose
-    // answer gates whether a fast-forward is safe. A silent wrong-and-
-    // reassuring reading is the exact failure this feature's report exists to
-    // prevent, so it must not appear in the machinery underneath it.
-    let mut parts = out.stdout.split_whitespace();
-    let ahead = parts.next().and_then(|s| s.parse::<u32>().ok());
-    let behind = parts.next().and_then(|s| s.parse::<u32>().ok());
-    let (Some(ahead), Some(behind)) = (ahead, behind) else {
-        return Err(GitError::Failed(format!(
-            "could not parse `rev-list --left-right --count` output: {:?}",
-            out.stdout
-        )));
-    };
-
-    if ahead > 0 && behind > 0 {
-        return Ok(Verdict::Diverged);
-    }
-    if is_dirty(repo, timeout).await? {
-        return Ok(Verdict::Dirty);
-    }
-    if behind > 0 {
-        return Ok(Verdict::Behind { commits: behind });
-    }
-    Ok(Verdict::Current)
-}
-
 /// `git merge --ff-only @{u}`.
 ///
 /// The whole safety argument of this feature is this one flag. The merge
@@ -643,9 +543,11 @@ pub async fn verdict(repo: &Path, timeout: Duration) -> Result<Verdict, GitError
 /// conflict is structurally impossible rather than handled, no merge commit is
 /// ever created, and a diverged branch is refused with HEAD unmoved.
 ///
-/// Callers must only reach this for `Verdict::Behind`. It is safe if they do
-/// not — git refuses — but the report would then carry a failure the sweep
-/// could have predicted.
+/// Callers must only reach this once they have independently established the
+/// branch is behind and not dirty (`routes::repos::pull`'s explicit
+/// `is_dirty` check, or `repos::read_one`'s `Position::Tracking { behind, .. }`
+/// reading). It is safe if they do not — git refuses — but the response would
+/// then carry a failure the caller could have predicted.
 pub async fn pull_ff(repo: &Path, timeout: Duration) -> Result<(), GitError> {
     require_ok(
         run_git(repo, &["merge", "--ff-only", "@{u}"], timeout).await?,
@@ -821,42 +723,6 @@ mod tests {
     // handling in a crate that has neither, to guard one setting.)
 
     #[tokio::test]
-    async fn branch_reads_the_current_branch() {
-        let (_remote, clone) = remote_and_clone();
-        assert_eq!(
-            branch(&clone, DEFAULT_TIMEOUT).await.unwrap(),
-            Some("main".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn branch_is_none_when_head_is_detached() {
-        let (_remote, clone) = remote_and_clone();
-        let head = run_git(&clone, &["rev-parse", "HEAD"], DEFAULT_TIMEOUT)
-            .await
-            .unwrap()
-            .stdout;
-        git_sync(&clone, &["checkout", &head]);
-        assert_eq!(branch(&clone, DEFAULT_TIMEOUT).await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn upstream_reads_the_tracking_branch() {
-        let (_remote, clone) = remote_and_clone();
-        assert_eq!(
-            upstream(&clone, DEFAULT_TIMEOUT).await.unwrap(),
-            Some("origin/main".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn upstream_is_none_on_a_branch_that_tracks_nothing() {
-        let (_remote, clone) = remote_and_clone();
-        git_sync(&clone, &["checkout", "-b", "feat/local-only"]);
-        assert_eq!(upstream(&clone, DEFAULT_TIMEOUT).await.unwrap(), None);
-    }
-
-    #[tokio::test]
     async fn is_dirty_sees_an_uncommitted_change() {
         let (_remote, clone) = remote_and_clone();
         assert!(!is_dirty(&clone, DEFAULT_TIMEOUT).await.unwrap());
@@ -885,83 +751,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verdict_is_current_on_a_clone_nobody_moved() {
-        let (_remote, clone) = remote_and_clone();
-        fetch(&clone, DEFAULT_TIMEOUT).await.unwrap();
-        assert_eq!(verdict(&clone, DEFAULT_TIMEOUT).await.unwrap(), Verdict::Current);
-    }
-
-    #[tokio::test]
-    async fn verdict_is_behind_after_the_remote_moves() {
-        let (remote, clone) = remote_and_clone();
-        advance_remote(&remote);
-        fetch(&clone, DEFAULT_TIMEOUT).await.unwrap();
-        assert_eq!(
-            verdict(&clone, DEFAULT_TIMEOUT).await.unwrap(),
-            Verdict::Behind { commits: 1 }
-        );
-    }
-
-    #[tokio::test]
-    async fn verdict_is_diverged_when_both_sides_moved() {
-        let (remote, clone) = remote_and_clone();
-        advance_remote(&remote);
-        commit(&clone, "local-only.md", "mine");
-        fetch(&clone, DEFAULT_TIMEOUT).await.unwrap();
-        assert_eq!(verdict(&clone, DEFAULT_TIMEOUT).await.unwrap(), Verdict::Diverged);
-    }
-
-    #[tokio::test]
-    async fn verdict_is_dirty_and_dirty_outranks_behind() {
-        let (remote, clone) = remote_and_clone();
-        advance_remote(&remote);
-        std::fs::write(clone.join("seed.md"), "edited").unwrap();
-        fetch(&clone, DEFAULT_TIMEOUT).await.unwrap();
-        // Behind AND dirty. Dirty is the verdict, because it is the one that
-        // blocks the fast-forward.
-        assert_eq!(verdict(&clone, DEFAULT_TIMEOUT).await.unwrap(), Verdict::Dirty);
-    }
-
-    #[tokio::test]
-    async fn verdict_is_diverged_and_diverged_outranks_dirty() {
-        // Both true. Diverged wins: it is a durable fact about history that
-        // will still be there after the working tree is cleaned, so reporting
-        // "dirty" would send you to fix the wrong thing.
-        let (remote, clone) = remote_and_clone();
-        advance_remote(&remote);
-        commit(&clone, "local-only.md", "mine");
-        std::fs::write(clone.join("seed.md"), "edited").unwrap();
-        fetch(&clone, DEFAULT_TIMEOUT).await.unwrap();
-        assert_eq!(verdict(&clone, DEFAULT_TIMEOUT).await.unwrap(), Verdict::Diverged);
-    }
-
-    #[tokio::test]
-    async fn verdict_is_no_upstream_on_an_untracked_branch() {
-        let (_remote, clone) = remote_and_clone();
-        git_sync(&clone, &["checkout", "-b", "feat/local-only"]);
-        assert_eq!(verdict(&clone, DEFAULT_TIMEOUT).await.unwrap(), Verdict::NoUpstream);
-    }
-
-    #[tokio::test]
-    async fn verdict_is_detached_before_it_is_anything_else() {
-        let (_remote, clone) = remote_and_clone();
-        let head = run_git(&clone, &["rev-parse", "HEAD"], DEFAULT_TIMEOUT)
-            .await
-            .unwrap()
-            .stdout;
-        std::fs::write(clone.join("seed.md"), "edited").unwrap();
-        git_sync(&clone, &["checkout", "--detach", &head]);
-        assert_eq!(verdict(&clone, DEFAULT_TIMEOUT).await.unwrap(), Verdict::Detached);
-    }
-
-    #[tokio::test]
     async fn pull_ff_applies_the_remote_commits() {
         let (remote, clone) = remote_and_clone();
         advance_remote(&remote);
         fetch(&clone, DEFAULT_TIMEOUT).await.unwrap();
         pull_ff(&clone, DEFAULT_TIMEOUT).await.unwrap();
         assert!(clone.join("from-elsewhere.md").exists());
-        assert_eq!(verdict(&clone, DEFAULT_TIMEOUT).await.unwrap(), Verdict::Current);
+        // HEAD landed exactly on upstream, not merely somewhere past it.
+        let head = run_git(&clone, &["rev-parse", "HEAD"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap()
+            .stdout;
+        let upstream = run_git(&clone, &["rev-parse", "@{u}"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap()
+            .stdout;
+        assert_eq!(head, upstream, "a fast-forward must land HEAD on upstream");
     }
 
     #[tokio::test]

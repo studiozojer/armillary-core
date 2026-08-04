@@ -5,6 +5,5 @@ pub mod instances;
 pub mod repos;
 pub mod session_ops;
 pub mod subscribe;
-pub mod sync;
 pub mod tree;
 pub mod voicenotes;

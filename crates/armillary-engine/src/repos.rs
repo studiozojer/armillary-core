@@ -213,8 +213,8 @@ pub async fn read_one(root: &Path, module: &DeclaredModule, with_commit: bool) -
                 GitError::Failed(msg) => msg,
                 // Unreachable in practice: `status_v2` passes only literal
                 // args, never anything request-derived. Carried like `Failed`
-                // rather than panicking or dropping it, matching the
-                // treatment `sync::one_repo` gives the same variant.
+                // rather than panicking or dropping it — the same treatment
+                // every other `GitError::InvalidArg` arm in this crate gets.
                 GitError::InvalidArg(msg) => msg,
             });
             return state;
@@ -279,7 +279,7 @@ pub async fn list(root: &Path) -> Vec<RepoState> {
 ///
 /// **Never returns `Err`.** A repo that fails is a line in the result carrying
 /// its own error — twenty-three good answers and one failure is the useful
-/// outcome, matching `sync::sweep`'s contract for the same reason.
+/// outcome, and a 500 would throw all of it away for one bad repo.
 pub async fn fetch_all(root: &Path) -> Vec<RepoState> {
     let permits = Arc::new(Semaphore::new(CONCURRENCY));
     let mut handles = Vec::new();
@@ -313,15 +313,15 @@ pub async fn fetch_all(root: &Path) -> Vec<RepoState> {
     // A panicked or cancelled task must not disappear from the result: the
     // contract is that a failing repo is a ROW, and a silently absent one
     // reads as "not composed" — the exact confusion this whole design exists
-    // to prevent. Mirrors `sync::sweep`'s identical fallback.
+    // to prevent.
     //
     // Unreachable by construction today: the spawned future has no panic
     // sites (`git::fetch` and `read_one` both return values, never unwind),
     // and the semaphore is never closed, so `JoinError` cannot occur in
-    // practice. This carries NO test rather than a faked one, matching the
-    // same call `sync::sweep` makes about its own sibling fallback
-    // (`sync.rs`) — inducing a real panic here to "prove" the arm would be
-    // exactly the manufactured coverage that precedent refuses.
+    // practice. This carries NO test rather than a faked one, the same
+    // reasoning `git.rs`'s `run_git` states for `.stdin(Stdio::null())` —
+    // inducing a real panic here to "prove" the arm would be exactly the
+    // manufactured coverage that precedent refuses.
     let mut out = Vec::with_capacity(handles.len());
     for (module, handle) in labels.into_iter().zip(handles) {
         out.push(handle.await.unwrap_or_else(|_| RepoState {
@@ -569,9 +569,10 @@ mod tests {
 
     #[tokio::test]
     async fn ahead_survives_to_the_state() {
-        // THE regression test for the founding bug. Under the shipped Verdict
-        // this repo reported `current`: ahead was parsed, used once for the
-        // diverged test, and thrown away with no field to carry it.
+        // THE regression test for the founding bug. Under the shipped
+        // single-verdict design this repo reported `current`: ahead was
+        // parsed, used once for the diverged test, and thrown away with no
+        // field to carry it.
         let (root, _remote) = live_workspace();
         commit(&root.join("repos/jianyi"), "mine.md", "unpushed");
 

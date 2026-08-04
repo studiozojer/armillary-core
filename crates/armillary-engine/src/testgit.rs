@@ -1,4 +1,4 @@
-//! Real-git fixtures, shared by `git.rs`'s and `sync.rs`'s test modules.
+//! Real-git fixtures, shared by `git.rs`'s and `repos.rs`'s test modules.
 //!
 //! `#[cfg(test)]`-gated at the module declaration in `lib.rs`, so none of this
 //! is compiled into a release binary.

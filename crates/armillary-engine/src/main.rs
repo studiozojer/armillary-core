@@ -231,15 +231,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => eprintln!("boot: no [router] boot declared — sessions start with no system prompt"),
     }
 
-    // Announced for the same reason `boot:` is: the gate lives in
-    // `Router.extra`, which C-5 forbids validating, so a misspelled `snyc`
-    // disables the feature with no error anywhere. One line at startup is what
-    // turns a silent typo into a visible one.
-    if armillary_engine::repos::gate_enabled(&root) {
-        eprintln!("sync: enabled by [router] sync — POST /sync will fetch and fast-forward");
+    // Announced for the same reason `boot:` is: each gate lives in
+    // `Router.extra`, which C-5 forbids validating, so a misspelled `snyc` or
+    // `psuh` disables the grant with no error anywhere. Both are named, not
+    // just `sync` — `push` is a second, independently misspellable key (D7:
+    // it lets the host publish under its own credential, a strictly bigger
+    // authority than fetch/fast-forward), and a typo there would be exactly
+    // as silent if it went unannounced.
+    let sync_on = armillary_engine::repos::gate_enabled(&root);
+    let push_on = armillary_engine::repos::push_enabled(&root);
+    if sync_on {
+        eprintln!(
+            "sync: enabled by [router] sync — /repos/{{name}}/fetch and /repos/{{name}}/pull will act"
+        );
     } else {
         eprintln!(
-            "sync: not declared — POST /sync will refuse (add `sync = true` under [router] in modules.local.toml); GET /sync still reads status"
+            "sync: not declared — /repos/{{name}}/fetch and /repos/{{name}}/pull will refuse (add `sync = true` under [router] in modules.local.toml); GET /repos still reads status"
+        );
+    }
+    if push_on {
+        eprintln!("push: enabled by [router] push — /repos/{{name}}/push will act");
+    } else {
+        eprintln!(
+            "push: not declared — /repos/{{name}}/push will refuse (add `push = true` under [router] in modules.local.toml)"
         );
     }
 

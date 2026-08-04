@@ -22,7 +22,6 @@ pub mod routes;
 mod search;
 pub mod sessions;
 pub mod state;
-pub mod sync;
 #[cfg(test)]
 pub mod testgit;
 pub mod tools;
@@ -49,7 +48,6 @@ pub fn app(state: AppState) -> Router {
         .route("/instances/{id}/interrupt", post(routes::session_ops::interrupt))
         .route("/instances/{id}/evict", post(routes::session_ops::evict))
         .route("/streams/{stream}/events", get(routes::subscribe::subscribe))
-        .route("/sync", get(routes::sync::status).post(routes::sync::sweep))
         // `/repos/fetch` (static) and `/repos/{name}` (dynamic) occupy the
         // same two-segment shape. Verified live 2026-08-04 (see
         // `every_verb_is_403_when_nothing_is_granted`, and a since-reverted
