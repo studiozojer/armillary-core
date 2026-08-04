@@ -255,6 +255,60 @@ fn parse_ab(value: &str) -> Option<(u32, u32)> {
     Some((ahead, behind))
 }
 
+/// When this repo last successfully reached its remote, ISO 8601.
+///
+/// The mtime of `.git/FETCH_HEAD`. Git writes that file on a fetch that
+/// contacted the remote and does NOT write it on one that failed, so the
+/// mtime means *last successful contact* — the honest thing for a row to
+/// show beside counts computed from whatever refs happen to be on disk.
+///
+/// A filesystem stat, not a subprocess, deliberately: this runs for every
+/// composed repo on every list read, and one `git` fork per repo is exactly
+/// the cost the porcelain-v2 collapse (`parse_status_v2`) was paid to avoid.
+///
+/// Formatted with `humantime::format_rfc3339_seconds`, not `chrono` — chrono
+/// is not a dependency of this crate, and `humantime` already is (see
+/// `sessions.rs`'s event timestamps for the same idiom at millis
+/// resolution). Seconds here, not millis: a fetch time is read by a human as
+/// "22 minutes ago," and sub-second precision is noise nobody asked for.
+///
+/// **Consequence, stated rather than left for a reader to trip over:** this
+/// makes `last_fetch` UTC with a `Z` suffix, while `newest_commit` above
+/// keeps git's own `%cI` — local time with a numeric offset. Both are valid
+/// ISO 8601, and both parse with `Date.parse` on the client; the divergence
+/// is deliberate, not drift — one timestamp comes from git's formatter, the
+/// other from ours, and neither has a reason to imitate the other's zone.
+///
+/// `None` when the file is absent (never fetched — note that a fresh CLONE
+/// has no `FETCH_HEAD`, because cloning is not fetching) or its mtime is
+/// unreadable.
+pub fn last_fetch(repo: &Path) -> Option<String> {
+    let meta = std::fs::metadata(repo.join(".git").join("FETCH_HEAD")).ok()?;
+    let modified = meta.modified().ok()?;
+    Some(humantime::format_rfc3339_seconds(modified).to_string())
+}
+
+/// Linked working trees sharing this repo's `.git`.
+///
+/// A `read_dir` of `.git/worktrees/`, which `git worktree add` populates with
+/// one directory per linked tree. Counts linked trees ONLY — the checkout
+/// being read is not among them, which is why an ordinary repo answers 0 and
+/// `git worktree list` prints one line more than this number.
+///
+/// Counted, never enumerated or actioned, in v1 (design D9).
+pub fn worktree_count(repo: &Path) -> u32 {
+    std::fs::read_dir(repo.join(".git").join("worktrees"))
+        .map(|entries| entries.flatten().count() as u32)
+        .unwrap_or(0)
+}
+
+/// Whether the repo declares submodules. They are fetched, never updated —
+/// a fast-forward moves the POINTER and leaves the submodule checkout where
+/// it was, and a limit nobody can see reads as a bug.
+pub fn has_submodules(repo: &Path) -> bool {
+    repo.join(".gitmodules").exists()
+}
+
 /// What a repo's local state permits.
 ///
 /// Exactly one verdict per repo, and the precedence below is load-bearing
@@ -697,5 +751,38 @@ mod tests {
     fn a_header_only_output_from_a_clean_repo_is_not_dirty() {
         let out = "# branch.oid abc123\n# branch.head main\n# branch.ab +0 -0\n";
         assert_eq!(parse_status_v2(out).dirty_files, 0);
+    }
+
+    #[test]
+    fn last_fetch_reads_fetch_head_and_returns_none_without_one() {
+        let (_remote, clone) = remote_and_clone();
+        // A fresh clone has no FETCH_HEAD — cloning is not fetching.
+        std::fs::remove_file(clone.join(".git/FETCH_HEAD")).ok();
+        assert_eq!(last_fetch(&clone), None);
+
+        std::fs::write(clone.join(".git/FETCH_HEAD"), "").unwrap();
+        let ts = last_fetch(&clone).expect("FETCH_HEAD exists");
+        assert!(ts.contains('T'), "expected ISO 8601, got {ts:?}");
+        assert!(ts.len() >= 20, "expected ISO 8601, got {ts:?}");
+    }
+
+    #[test]
+    fn worktree_count_counts_linked_trees_only() {
+        let (_remote, clone) = remote_and_clone();
+        assert_eq!(worktree_count(&clone), 0, "a plain checkout has no linked trees");
+
+        let wt = clone.join(".worktrees/topic");
+        git_sync(&clone, &["worktree", "add", wt.to_str().unwrap(), "-b", "topic"]);
+        // The main checkout is NOT counted — .git/worktrees/ holds linked trees
+        // only, which is why this is 1 and `git worktree list` prints 2 lines.
+        assert_eq!(worktree_count(&clone), 1);
+    }
+
+    #[test]
+    fn has_submodules_is_a_stat_on_gitmodules() {
+        let (_remote, clone) = remote_and_clone();
+        assert!(!has_submodules(&clone));
+        std::fs::write(clone.join(".gitmodules"), "[submodule \"x\"]\n").unwrap();
+        assert!(has_submodules(&clone));
     }
 }
