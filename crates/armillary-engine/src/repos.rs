@@ -20,6 +20,16 @@
 //! `git.rs`, and `sync.rs`'s `sweep` is what calls them before asking here.
 
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+
+/// How many repos are in flight at once.
+///
+/// Twenty-four serial fetches over a sleeping tailnet is a minute of spinner,
+/// and one unreachable remote must not hold up the other twenty-three. Bounded
+/// rather than unbounded because two dozen simultaneous SSH handshakes is a
+/// different kind of rude.
+pub(crate) const CONCURRENCY: usize = 8;
 
 /// A module the manifest declares AND that exists on disk as a git checkout.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,6 +229,107 @@ pub async fn read_one(root: &Path, module: &DeclaredModule, with_commit: bool) -
     state
 }
 
+/// A manifest name to the module it names.
+///
+/// **The only resolver, and the reason no path from a request ever reaches
+/// the filesystem.** `declared_modules` already enumerates exactly what may
+/// be acted on; a name is a KEY into that set, so `../../../etc` is not
+/// sanitised — it simply is not a key, and the miss happens before any path
+/// is constructed.
+///
+/// This is strictly stronger than cleaning a string, and it is why the routes
+/// take a name rather than a path. `guard.rs`'s header records what the other
+/// approach costs to get right: it once validated the string the client sent
+/// and then opened whatever that resolved to, producing two independent
+/// one-request bypasses.
+pub fn resolve(root: &Path, name: &str) -> Option<DeclaredModule> {
+    declared_modules(root).into_iter().find(|m| m.name == name)
+}
+
+/// Whether this workspace has granted the engine authority to PUBLISH.
+///
+/// Separate from `gate_enabled` (`sync`) on purpose (D7): pull lets an
+/// enrolled device make a host fetch; push lets it make a host publish, under
+/// the host user's own credential, with no undo. Same fail-closed posture —
+/// absent, misspelled, non-boolean or unparseable all mean disabled.
+pub fn push_enabled(root: &Path) -> bool {
+    armillary_composition::parse_workspace(root)
+        .ok()
+        .and_then(|c| c.router.extra.get("push").and_then(|v| v.as_bool()))
+        .unwrap_or(false)
+}
+
+/// Every composed repo's state, manifest order, no network call.
+pub async fn list(root: &Path) -> Vec<RepoState> {
+    let mut out = Vec::new();
+    for module in declared_modules(root) {
+        out.push(read_one(root, &module, false).await);
+    }
+    out
+}
+
+/// Fetch every composed repo, bounded at CONCURRENCY, then read each state.
+///
+/// Group FETCH only. Group pull and group push are deliberately absent (design
+/// §5, David 2026-08-04): fetch touches no working tree and no branch, so
+/// widening it across twenty-four repos carries no risk, and it is what makes
+/// the list's counts true rather than a reading of whatever the last fetch
+/// left behind. The multi-verb form waits for the per-repo verbs to prove
+/// themselves.
+///
+/// **Never returns `Err`.** A repo that fails is a line in the result carrying
+/// its own error — twenty-three good answers and one failure is the useful
+/// outcome, matching `sync::sweep`'s contract for the same reason.
+pub async fn fetch_all(root: &Path) -> Vec<RepoState> {
+    let permits = Arc::new(Semaphore::new(CONCURRENCY));
+    let mut handles = Vec::new();
+    let mut labels = Vec::new();
+
+    for module in declared_modules(root) {
+        labels.push(module.clone());
+        let permits = permits.clone();
+        let root = root.to_path_buf();
+        handles.push(tokio::spawn(async move {
+            // The semaphore is never closed, so acquire cannot fail.
+            let _permit = permits.acquire().await.expect("semaphore is open");
+            let abs = root.join(&module.path);
+            let fetch_error = git::fetch(&abs, git::DEFAULT_TIMEOUT)
+                .await
+                .err()
+                .map(|e| match e {
+                    GitError::Timeout => "timed out".to_string(),
+                    GitError::Failed(msg) => msg,
+                    // Unreachable in practice: no request value reaches
+                    // `fetch`. Carried like `Failed` rather than panicking or
+                    // dropping it.
+                    GitError::InvalidArg(msg) => msg,
+                });
+            let mut state = read_one(&root, &module, false).await;
+            state.fetch_error = fetch_error;
+            state
+        }));
+    }
+
+    let mut out = Vec::with_capacity(handles.len());
+    for (module, handle) in labels.into_iter().zip(handles) {
+        out.push(handle.await.unwrap_or_else(|_| RepoState {
+            name: module.name,
+            path: module.path,
+            head: None,
+            branch: None,
+            position: Position::Detached,
+            dirty_files: 0,
+            last_fetch: None,
+            newest_commit: None,
+            worktrees: 0,
+            submodules: false,
+            fetch_error: None,
+            read_error: Some("task-failed".to_string()),
+        }));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +479,51 @@ mod tests {
         let root = workspace();
         fs::write(root.join("modules.local.toml"), "[router\nsync = ").unwrap();
         assert!(!gate_enabled(&root));
+    }
+
+    #[test]
+    fn resolve_finds_a_declared_module_by_name() {
+        let root = workspace();
+        assert_eq!(resolve(&root, "tycho").unwrap().path, "operators/tycho");
+        assert_eq!(resolve(&root, "armillary").unwrap().path, ".");
+    }
+
+    #[test]
+    fn resolve_refuses_a_traversal_without_constructing_a_path() {
+        // D3: the name is a KEY into the manifest, never a path fragment. These
+        // are not sanitised — they simply are not in the map, which is why no
+        // `..`-stripping exists anywhere in this module.
+        let root = workspace();
+        for name in ["../../../etc", "..", "/etc/passwd", "operators/tycho", "nope"] {
+            assert!(resolve(&root, name).is_none(), "{name:?} must not resolve");
+        }
+    }
+
+    #[test]
+    fn resolve_is_case_sensitive_and_exact() {
+        let root = workspace();
+        assert!(resolve(&root, "Tycho").is_none());
+        assert!(resolve(&root, "tycho ").is_none());
+    }
+
+    #[test]
+    fn push_and_sync_are_independent_gates() {
+        let root = workspace();
+        std::fs::write(root.join("modules.local.toml"), "[router]\nsync = true\n").unwrap();
+        assert!(gate_enabled(&root));
+        assert!(!push_enabled(&root), "sync must not grant push");
+
+        std::fs::write(root.join("modules.local.toml"), "[router]\npush = true\n").unwrap();
+        assert!(push_enabled(&root));
+    }
+
+    #[test]
+    fn push_gate_fails_closed_on_every_malformed_value() {
+        let root = workspace();
+        for body in ["[router]\npsuh = true\n", "[router]\npush = \"yes\"\n", "[router\npush = "] {
+            std::fs::write(root.join("modules.local.toml"), body).unwrap();
+            assert!(!push_enabled(&root), "must fail closed on {body:?}");
+        }
     }
 
     use crate::testgit::{commit, git_sync, remote_and_clone};

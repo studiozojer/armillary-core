@@ -10,18 +10,10 @@
 use std::path::Path;
 
 use crate::git::{self, GitError, Verdict};
-use crate::repos::{declared_modules, gate_enabled, undeclared_checkouts, DeclaredModule};
+use crate::repos::{declared_modules, gate_enabled, undeclared_checkouts, DeclaredModule, CONCURRENCY};
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-
-/// How many repos are in flight at once.
-///
-/// Twenty-four serial fetches over a sleeping tailnet is a minute of spinner,
-/// and one unreachable remote must not hold up the other twenty-three. Bounded
-/// rather than unbounded because two dozen simultaneous SSH handshakes is a
-/// different kind of rude.
-const CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RepoReport {
