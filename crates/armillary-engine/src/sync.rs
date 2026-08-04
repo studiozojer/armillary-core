@@ -276,6 +276,9 @@ async fn one_repo(abs: &Path, module: DeclaredModule, perform: bool) -> RepoRepo
             fetch_error = Some(match e {
                 GitError::Timeout => "timed out".to_string(),
                 GitError::Failed(msg) => msg,
+                // Unreachable in practice: no request value reaches `fetch`.
+                // Carried like `Failed` rather than panicking or dropping it.
+                GitError::InvalidArg(msg) => msg,
             });
         }
     }
@@ -302,6 +305,9 @@ async fn one_repo(abs: &Path, module: DeclaredModule, perform: bool) -> RepoRepo
             return report;
         }
         Err(GitError::Failed(_)) => return report,
+        // Unreachable in practice: no request value reaches `verdict`.
+        // Treated like `Failed`.
+        Err(GitError::InvalidArg(_)) => return report,
     };
 
     match verdict {
