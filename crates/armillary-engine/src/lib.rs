@@ -50,5 +50,9 @@ pub fn app(state: AppState) -> Router {
         .route("/instances/{id}/evict", post(routes::session_ops::evict))
         .route("/streams/{stream}/events", get(routes::subscribe::subscribe))
         .route("/sync", get(routes::sync::status).post(routes::sync::sweep))
+        .route("/repos", get(routes::repos::list))
+        .route("/repos/{name}", get(routes::repos::one))
+        .route("/repos/{name}/log", get(routes::repos::log))
+        .route("/repos/{name}/changes", get(routes::repos::changes))
         .with_state(shared)
 }

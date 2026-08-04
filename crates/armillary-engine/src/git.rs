@@ -186,6 +186,24 @@ pub enum Position {
     Detached,
 }
 
+/// One changed path from `git status --porcelain=v2`.
+///
+/// `change` collapses git's much finer-grained XY vocabulary (M/A/D/R/C/T/U
+/// in either the staged or unstaged slot) down to the five buckets a client
+/// actually renders differently: `modified` / `added` / `deleted` /
+/// `renamed` / `untracked`. Anything not distinctly added, deleted, or
+/// renamed reads as `modified` — including a bare type-change (`T`), for
+/// which no caller has yet asked for a sixth bucket.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ChangedFile {
+    pub path: String,
+    pub change: &'static str,
+    /// Whether the change is staged (present in the index) — the first XY
+    /// character is not `.`. An untracked file is never staged by
+    /// definition, so this is always `false` for that kind.
+    pub staged: bool,
+}
+
 /// Everything one `git status --porcelain=v2 --branch` yields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusV2 {
@@ -193,6 +211,11 @@ pub struct StatusV2 {
     pub branch: Option<String>,
     pub position: Position,
     pub dirty_files: u32,
+    /// Every changed path, parsed once from the SAME output `dirty_files`
+    /// counts — `routes::repos::changes` reads this rather than forking a
+    /// second `git status`. Order is git's own (unspecified, effectively
+    /// alphabetical within each section); no caller has needed to reorder it.
+    pub files: Vec<ChangedFile>,
 }
 
 /// Parse `--porcelain=v2 --branch` output.
@@ -213,11 +236,20 @@ pub fn parse_status_v2(stdout: &str) -> StatusV2 {
     let mut upstream: Option<String> = None;
     let mut ab: Option<(u32, u32)> = None;
     let mut dirty_files = 0u32;
+    let mut files = Vec::new();
 
     for line in stdout.lines() {
         let Some(header) = line.strip_prefix("# ") else {
             if !line.trim().is_empty() {
                 dirty_files += 1;
+                // Kept separate from `dirty_files` above deliberately: a line
+                // this parser fails to recognize (a future porcelain kind, an
+                // `!` ignored entry) still counts toward the total rather than
+                // vanishing, but it is simply absent from `files` rather than
+                // panicking or forcing a placeholder entry with no real path.
+                if let Some(entry) = parse_changed_line(line) {
+                    files.push(entry);
+                }
             }
             continue;
         };
@@ -253,7 +285,7 @@ pub fn parse_status_v2(stdout: &str) -> StatusV2 {
         }
     };
 
-    StatusV2 { head, branch, position, dirty_files }
+    StatusV2 { head, branch, position, dirty_files, files }
 }
 
 /// `+3 -1` -> `(3, 1)`. `None` on anything else.
@@ -262,6 +294,98 @@ fn parse_ab(value: &str) -> Option<(u32, u32)> {
     let ahead = parts.next()?.strip_prefix('+')?.parse().ok()?;
     let behind = parts.next()?.strip_prefix('-')?.parse().ok()?;
     Some((ahead, behind))
+}
+
+/// Parse one non-header porcelain v2 line into a `ChangedFile`.
+///
+/// Porcelain v2 line kinds, and the fixed field count before the path that
+/// each one carries (see `git-status(1)`'s PORCELAIN V2 section):
+///
+/// - `1 XY sub mH mI mW hH hI path` — ordinary change, 8 fields before path.
+/// - `2 XY sub mH mI mW hH hI Xscore path<TAB>origPath` — rename/copy, 9
+///   fields before the path pair; the path and its origin are TAB-separated
+///   in what would otherwise be a single space-delimited field, which is why
+///   this is its own line kind rather than a variant of `1`.
+/// - `u XY sub m1 m2 m3 mW h1 h2 h3 path` — unmerged, 10 fields before path.
+/// - `? path` — untracked, 1 field before path.
+///
+/// `None` for anything else (a bare `!` ignored-entry line, or a line this
+/// parser does not recognize) — the caller still counts it toward
+/// `dirty_files` from the raw line count, so nothing is silently dropped
+/// from the total, only from this finer-grained list.
+fn parse_changed_line(line: &str) -> Option<ChangedFile> {
+    match line.as_bytes().first()? {
+        b'1' => {
+            let parts: Vec<&str> = line.splitn(9, ' ').collect();
+            let xy = parts.get(1)?;
+            Some(ChangedFile {
+                path: (*parts.get(8)?).to_string(),
+                change: classify_xy(xy),
+                staged: staged_xy(xy),
+            })
+        }
+        b'2' => {
+            let parts: Vec<&str> = line.splitn(10, ' ').collect();
+            let xy = parts.get(1)?;
+            // The 10th field is "path<TAB>origPath" — the destination path is
+            // what a client renders as THE path; the origin is not surfaced
+            // (no caller has asked to show "renamed from X" yet).
+            let path = parts.get(9)?.split('\t').next()?.to_string();
+            Some(ChangedFile { path, change: classify_xy(xy), staged: staged_xy(xy) })
+        }
+        b'u' => {
+            let parts: Vec<&str> = line.splitn(11, ' ').collect();
+            let xy = parts.get(1)?;
+            // Always "modified", never derived from XY: an unmerged entry's
+            // XY letters (AA, UU, DD, AU, UD, ...) describe a MERGE CONFLICT,
+            // not an add or delete in the ordinary sense, and forcing that
+            // vocabulary onto this line kind would misname a state none of
+            // the other four buckets actually describes.
+            Some(ChangedFile {
+                path: (*parts.get(10)?).to_string(),
+                change: "modified",
+                staged: staged_xy(xy),
+            })
+        }
+        b'?' => {
+            let parts: Vec<&str> = line.splitn(2, ' ').collect();
+            Some(ChangedFile {
+                path: (*parts.get(1)?).to_string(),
+                change: "untracked",
+                // Untracked by definition has nothing in the index.
+                staged: false,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Collapse an XY status pair to one of the four non-untracked buckets.
+///
+/// Checked in this order — rename/copy, then added, then deleted, falling
+/// through to modified — because a real git XY never sets more than one of
+/// these at once for kinds `1`/`2`/`u`, so the order only matters for the
+/// fallback case (a letter this function does not otherwise recognize, e.g.
+/// `T` for a type-change) that always lands on `modified`.
+fn classify_xy(xy: &str) -> &'static str {
+    let mut chars = xy.chars();
+    let x = chars.next().unwrap_or('.');
+    let y = chars.next().unwrap_or('.');
+    if x == 'R' || y == 'R' || x == 'C' || y == 'C' {
+        "renamed"
+    } else if x == 'A' || y == 'A' {
+        "added"
+    } else if x == 'D' || y == 'D' {
+        "deleted"
+    } else {
+        "modified"
+    }
+}
+
+/// Whether the INDEX half of an XY pair is set — the first character is
+/// anything other than `.`.
+fn staged_xy(xy: &str) -> bool {
+    xy.chars().next().is_some_and(|x| x != '.')
 }
 
 /// One `git status --porcelain=v2 --branch` — branch, upstream, ahead,
@@ -559,6 +683,78 @@ pub async fn push(repo: &Path, timeout: Duration) -> Result<(), GitError> {
     require_ok(run_git(repo, &["push"], timeout).await?, "git push")
 }
 
+/// One entry from `git log`, before anything knows about upstream state.
+///
+/// Deliberately carries no `unpushed` field: that fact is computed by the
+/// caller (`routes::repos::log`) from `Position::Tracking { ahead, .. }`,
+/// which this module has no reason to fetch a second time.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LogEntry {
+    pub sha: String,
+    pub subject: String,
+    pub author: String,
+    pub date: String,
+}
+
+/// The most recent `limit` commits reachable from HEAD, newest first.
+///
+/// One invocation, `%x00`-separated fields — a NUL cannot appear in a sha, an
+/// author name, or an ISO date, so splitting on it is unambiguous in a way no
+/// printable delimiter (`|`, `\t`) could promise, since any of those CAN
+/// appear in a commit's metadata.
+///
+/// **The subject is the field to think about, and `%s` already settles it**:
+/// git's own `%s` placeholder is the commit message's FIRST LINE — a commit
+/// authored across multiple paragraphs still renders as one line under `%s`,
+/// with the paragraph break simply not included (it is not joined with a
+/// space; it is truncated at the first blank line). So a raw newline inside
+/// one entry's fields cannot occur, and splitting entries on `\n` needs no
+/// separate escaping scheme for the subject.
+///
+/// `limit` is always a `u32` rendered as a plain decimal by the caller — it
+/// can never begin with `-` and be read as a flag, so no `validate_arg` call
+/// is needed here.
+pub async fn log(repo: &Path, limit: u32, timeout: Duration) -> Result<Vec<LogEntry>, GitError> {
+    let n = limit.to_string();
+    let out = run_git(
+        repo,
+        &["log", "--format=%H%x00%s%x00%an%x00%cI", "-n", &n],
+        timeout,
+    )
+    .await?;
+    if !out.ok() {
+        // The one way `git log` fails here without a request-derived cause is
+        // an unborn branch — a fresh `git init` with no commits yet — which
+        // exits nonzero with "does not have any commits yet". Answered as an
+        // empty list rather than an `Err`, matching `newest_commit`'s
+        // treatment of the identical condition (`Ok(None)`): "no commits yet"
+        // is a fact about the repo's history, not a malfunction of the read.
+        return Ok(Vec::new());
+    }
+    Ok(parse_log(&out.stdout))
+}
+
+/// Split `run_git`'s trimmed stdout into `LogEntry` rows.
+///
+/// `run_git` already trims the WHOLE string, not per line, so only the
+/// outermost blank lines are affected; an empty `stdout` (no commits matched)
+/// yields `lines()` producing nothing, which is the correct empty list.
+fn parse_log(stdout: &str) -> Vec<LogEntry> {
+    stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let mut parts = line.splitn(4, '\u{0}');
+            Some(LogEntry {
+                sha: parts.next()?.to_string(),
+                subject: parts.next()?.to_string(),
+                author: parts.next()?.to_string(),
+                date: parts.next()?.to_string(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,6 +1029,53 @@ mod tests {
         assert!(fetch(&solo, DEFAULT_TIMEOUT).await.is_err());
     }
 
+    #[tokio::test]
+    async fn log_lists_commits_newest_first_with_every_field() {
+        let (_remote, clone) = remote_and_clone();
+        commit(&clone, "second.md", "two");
+        let entries = log(&clone, 10, DEFAULT_TIMEOUT).await.unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].subject, "second.md");
+        assert_eq!(entries[1].subject, "seed.md");
+        assert_eq!(entries[0].sha.len(), 40, "a full sha, not an abbreviation");
+        assert_eq!(entries[0].author, "test");
+        assert!(entries[0].date.contains('T'), "expected an ISO date, got {:?}", entries[0].date);
+    }
+
+    #[tokio::test]
+    async fn log_is_capped_at_the_caller_supplied_limit() {
+        let (_remote, clone) = remote_and_clone();
+        commit(&clone, "second.md", "two");
+        commit(&clone, "third.md", "three");
+        let entries = log(&clone, 1, DEFAULT_TIMEOUT).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].subject, "third.md", "the newest, not the oldest");
+    }
+
+    #[tokio::test]
+    async fn log_on_an_unborn_branch_is_an_empty_list_not_an_error() {
+        // A fresh `git init` with zero commits: `git log` exits nonzero here,
+        // and that is answered the same way `newest_commit` answers it — as
+        // "nothing yet", not a malfunction of the read.
+        let empty = tempfile::tempdir().unwrap().keep();
+        git_sync(&empty, &["init", "--initial-branch=main", "."]);
+        assert_eq!(log(&empty, 10, DEFAULT_TIMEOUT).await.unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn parse_log_splits_nul_separated_fields_across_multiple_entries() {
+        let out = "aaa\u{0}first subject\u{0}Ada\u{0}2026-08-04T00:00:00-07:00\n\
+                    bbb\u{0}second subject\u{0}Grace\u{0}2026-08-03T00:00:00-07:00";
+        let entries = parse_log(out);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sha, "aaa");
+        assert_eq!(entries[0].subject, "first subject");
+        assert_eq!(entries[0].author, "Ada");
+        assert_eq!(entries[0].date, "2026-08-04T00:00:00-07:00");
+        assert_eq!(entries[1].sha, "bbb");
+    }
+
     #[test]
     fn parses_a_tracking_branch_with_both_counts() {
         let out = "# branch.oid 00f45bf037e0b34f312360d54a6e778107da42f7\n\
@@ -894,6 +1137,43 @@ mod tests {
                    u UU N... 100644 100644 100644 100644 eee fff ggg conflict.rs\n\
                    ? untracked.md\n";
         assert_eq!(parse_status_v2(out).dirty_files, 4);
+    }
+
+    #[test]
+    fn changed_files_are_parsed_with_the_right_kind_and_staged_flag() {
+        let out = "# branch.oid abc123\n\
+                   # branch.head main\n\
+                   1 .M N... 100644 100644 100644 aaa bbb src/lib.rs\n\
+                   2 R. N... 100644 100644 100644 ccc ddd R100 new.rs\told.rs\n\
+                   u UU N... 100644 100644 100644 100644 eee fff ggg conflict.rs\n\
+                   ? untracked.md\n";
+        let files = parse_status_v2(out).files;
+        assert_eq!(
+            files,
+            vec![
+                ChangedFile { path: "src/lib.rs".into(), change: "modified", staged: false },
+                // The rename's DESTINATION path, not its origin — `new.rs`,
+                // the half of "new.rs\told.rs" a client renders as THE path.
+                ChangedFile { path: "new.rs".into(), change: "renamed", staged: true },
+                // Unmerged is always "modified", never derived from XY: "UU"
+                // describes a conflict, not an add or a delete.
+                ChangedFile { path: "conflict.rs".into(), change: "modified", staged: true },
+                ChangedFile { path: "untracked.md".into(), change: "untracked", staged: false },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_added_and_a_deleted_file_are_told_apart_from_a_plain_modification() {
+        let out = "# branch.oid abc123\n\
+                   # branch.head main\n\
+                   1 A. N... 000000 100644 100644 000 aaa new-file.md\n\
+                   1 .D N... 100644 100644 000000 bbb 000 gone.md\n";
+        let files = parse_status_v2(out).files;
+        assert_eq!(files[0].change, "added");
+        assert!(files[0].staged);
+        assert_eq!(files[1].change, "deleted");
+        assert!(!files[1].staged);
     }
 
     #[test]
