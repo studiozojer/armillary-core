@@ -310,6 +310,18 @@ pub async fn fetch_all(root: &Path) -> Vec<RepoState> {
         }));
     }
 
+    // A panicked or cancelled task must not disappear from the result: the
+    // contract is that a failing repo is a ROW, and a silently absent one
+    // reads as "not composed" — the exact confusion this whole design exists
+    // to prevent. Mirrors `sync::sweep`'s identical fallback.
+    //
+    // Unreachable by construction today: the spawned future has no panic
+    // sites (`git::fetch` and `read_one` both return values, never unwind),
+    // and the semaphore is never closed, so `JoinError` cannot occur in
+    // practice. This carries NO test rather than a faked one, matching the
+    // same call `sync::sweep` makes about its own sibling fallback
+    // (`sync.rs`) — inducing a real panic here to "prove" the arm would be
+    // exactly the manufactured coverage that precedent refuses.
     let mut out = Vec::with_capacity(handles.len());
     for (module, handle) in labels.into_iter().zip(handles) {
         out.push(handle.await.unwrap_or_else(|_| RepoState {
@@ -605,5 +617,97 @@ mod tests {
         assert!(s.read_error.is_some(), "a non-repo must not read as clean");
         assert_eq!(s.dirty_files, 0);
         assert_eq!(s.branch, None);
+    }
+
+    #[tokio::test]
+    async fn fetch_all_preserves_manifest_order_not_completion_order() {
+        // "gamma" is declared FIRST but has no remote at all, so its fetch
+        // fails and returns near-instantly — the fastest possible completion
+        // of the three. "alpha" and "beta" are ordinary clones with real
+        // remotes and sort alphabetically BEFORE "gamma", so neither
+        // "fastest first" nor "alphabetical" matches the declared order —
+        // only manifest order does, and the implementation awaits each
+        // spawned handle in the order it was labeled, never by whichever
+        // finishes first.
+        let root = tempfile::tempdir().unwrap().keep();
+        git_sync(&root, &["init", "--initial-branch=main", "."]);
+        fs::create_dir_all(root.join("repos")).unwrap();
+
+        git_sync(
+            &root,
+            &["init", "--initial-branch=main", root.join("repos/gamma").to_str().unwrap()],
+        );
+
+        let (remote_a, _seed_a) = remote_and_clone();
+        git_sync(
+            &root,
+            &["clone", remote_a.to_str().unwrap(), root.join("repos/alpha").to_str().unwrap()],
+        );
+
+        let (remote_b, _seed_b) = remote_and_clone();
+        git_sync(
+            &root,
+            &["clone", remote_b.to_str().unwrap(), root.join("repos/beta").to_str().unwrap()],
+        );
+
+        fs::write(
+            root.join("modules.local.toml"),
+            "[router]\nsync = true\n\n\
+             [[repos]]\nname = \"gamma\"\npath = \"repos/gamma\"\n\n\
+             [[repos]]\nname = \"alpha\"\npath = \"repos/alpha\"\n\n\
+             [[repos]]\nname = \"beta\"\npath = \"repos/beta\"\n",
+        )
+        .unwrap();
+
+        let out = fetch_all(&root).await;
+        let names: Vec<&str> = out.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["armillary", "gamma", "alpha", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn fetch_all_propagates_a_fetch_failure_into_the_row() {
+        let (root, _remote) = live_workspace();
+        // Strip the remote entirely so `git::fetch` fails rather than
+        // succeeding against nothing.
+        git_sync(&root.join("repos/jianyi"), &["remote", "remove", "origin"]);
+
+        let out = fetch_all(&root).await;
+        let jianyi = out.iter().find(|s| s.path == "repos/jianyi").unwrap();
+        assert!(
+            jianyi.fetch_error.is_some(),
+            "a repo with no remote must carry its fetch error, not drop it"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_all_reports_every_repo_even_when_all_fetches_fail() {
+        // The "twenty-three good answers and one failure" contract, pushed to
+        // its edge: zero good answers must still be a full-length `Vec`, not
+        // a shortened one and not a panic.
+        let (root, _remote) = live_workspace();
+        // `live_workspace`'s router root (from its own bare `git init`) has no
+        // remote either, so both declared checkouts fail their fetch once
+        // jianyi's remote is stripped too.
+        git_sync(&root.join("repos/jianyi"), &["remote", "remove", "origin"]);
+        let declared = declared_modules(&root);
+
+        let out = fetch_all(&root).await;
+        assert_eq!(out.len(), declared.len(), "a failing fetch must not shrink the result");
+        assert!(
+            out.iter().all(|s| s.fetch_error.is_some()),
+            "every row must carry its own error rather than vanish"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_never_pays_the_newest_commit_fork() {
+        // D5: the list route must not carry `newest_commit` — the guarantee
+        // `with_commit: false` makes to every caller of `read_one` beneath it.
+        let (root, _remote) = live_workspace();
+        let out = list(&root).await;
+        assert!(
+            out.iter().all(|s| s.newest_commit.is_none()),
+            "list must never pay the second fork per repo"
+        );
     }
 }
