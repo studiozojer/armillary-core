@@ -379,10 +379,20 @@ pub async fn status_v2(repo: &Path, timeout: Duration) -> Result<StatusV2, GitEr
 
 /// When this repo last successfully reached its remote, ISO 8601.
 ///
-/// The mtime of `.git/FETCH_HEAD`. Git writes that file on a fetch that
-/// contacted the remote and does NOT write it on one that failed, so the
-/// mtime means *last successful contact* — the honest thing for a row to
-/// show beside counts computed from whatever refs happen to be on disk.
+/// The mtime of `.git/FETCH_HEAD` — but git does NOT reserve that write for a
+/// fetch that reached the remote. **Verified live 2026-08-04 against git
+/// 2.50.1: a fetch that FAILS to contact its remote TRUNCATES `FETCH_HEAD` to
+/// zero bytes and bumps its mtime doing so** — a successful fetch against a
+/// bare remote wrote 174 bytes; pointing the same repo's origin at a
+/// nonexistent path and fetching again left a byte-identical-in-emptiness,
+/// freshly-stamped `FETCH_HEAD`. Read naively, that made a fetch that never
+/// reached the network report as "just now" — a repo going from "never
+/// fetched" to "fetched just now" by way of a fetch that failed. A
+/// **non-empty** file, not merely a present one, is what means "last
+/// successful contact"; an empty one is answered as `None`, the same as no
+/// file at all. A successful fetch that finds nothing new still writes a
+/// non-empty `FETCH_HEAD` (it records the remote ref list, not a diff), so
+/// this creates no false negative for the ordinary "nothing new" case.
 ///
 /// A filesystem stat, not a subprocess, deliberately: this runs for every
 /// composed repo on every list read, and one `git` fork per repo is exactly
@@ -402,10 +412,16 @@ pub async fn status_v2(repo: &Path, timeout: Duration) -> Result<StatusV2, GitEr
 /// other from ours, and neither has a reason to imitate the other's zone.
 ///
 /// `None` when the file is absent (never fetched — note that a fresh CLONE
-/// has no `FETCH_HEAD`, because cloning is not fetching) or its mtime is
-/// unreadable.
+/// has no `FETCH_HEAD`, because cloning is not fetching), empty (the last
+/// fetch failed to reach the remote), or its mtime is unreadable.
 pub fn last_fetch(repo: &Path) -> Option<String> {
     let meta = std::fs::metadata(repo.join(".git").join("FETCH_HEAD")).ok()?;
+    // A failed fetch truncates this file to zero bytes rather than leaving it
+    // absent — see this function's doc comment. Only a non-empty file is
+    // evidence the remote was actually reached.
+    if meta.len() == 0 {
+        return None;
+    }
     let modified = meta.modified().ok()?;
     Some(humantime::format_rfc3339_seconds(modified).to_string())
 }
@@ -999,10 +1015,39 @@ mod tests {
         std::fs::remove_file(clone.join(".git/FETCH_HEAD")).ok();
         assert_eq!(last_fetch(&clone), None);
 
-        std::fs::write(clone.join(".git/FETCH_HEAD"), "").unwrap();
-        let ts = last_fetch(&clone).expect("FETCH_HEAD exists");
+        // Non-empty, as a real successful fetch leaves it — an empty file is
+        // the failed-fetch shape covered by the test below.
+        std::fs::write(clone.join(".git/FETCH_HEAD"), "abc123\t\tbranch 'main' of foo\n").unwrap();
+        let ts = last_fetch(&clone).expect("FETCH_HEAD exists and is non-empty");
         assert!(ts.contains('T'), "expected ISO 8601, got {ts:?}");
         assert!(ts.len() >= 20, "expected ISO 8601, got {ts:?}");
+    }
+
+    #[tokio::test]
+    async fn last_fetch_is_none_after_a_fetch_that_never_reached_the_remote() {
+        // THE CRITICAL finding: git TRUNCATES FETCH_HEAD to zero bytes on a
+        // fetch that fails to contact its remote, and bumps its mtime doing
+        // so. Read naively (any non-empty-or-absent file means "fetched"),
+        // this reports a fetch that touched nothing as "just now" — a repo
+        // going from "never fetched" to "fetched just now" by way of a fetch
+        // that failed. Verified live 2026-08-04 against git 2.50.1.
+        let (_remote, clone) = remote_and_clone();
+        // A real successful fetch first, so FETCH_HEAD exists and is non-empty.
+        fetch(&clone, DEFAULT_TIMEOUT).await.unwrap();
+        assert!(last_fetch(&clone).is_some(), "a successful fetch must be visible");
+
+        // Point origin at an unreachable path and fetch again — this must
+        // fail, and per the verified behaviour above, truncate FETCH_HEAD.
+        run_git(&clone, &["remote", "set-url", "origin", "/nonexistent/does-not-exist.git"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(fetch(&clone, DEFAULT_TIMEOUT).await.is_err(), "fetch against a bad path must fail");
+
+        assert_eq!(
+            last_fetch(&clone),
+            None,
+            "a fetch that failed to reach the remote must not report as a successful contact"
+        );
     }
 
     #[test]
