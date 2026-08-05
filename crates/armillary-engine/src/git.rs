@@ -543,11 +543,13 @@ fn require_ok(out: GitOutput, cmd: &str) -> Result<(), GitError> {
 /// conflict is structurally impossible rather than handled, no merge commit is
 /// ever created, and a diverged branch is refused with HEAD unmoved.
 ///
-/// Callers must only reach this once they have independently established the
-/// branch is behind and not dirty (`routes::repos::pull`'s explicit
-/// `is_dirty` check, or `repos::read_one`'s `Position::Tracking { behind, .. }`
-/// reading). It is safe if they do not — git refuses — but the response would
-/// then carry a failure the caller could have predicted.
+/// The one production caller, `routes::repos::pull`, first checks `is_dirty`
+/// and refuses before ever reaching here — so the working tree is already
+/// known clean by the time this runs. Whether the branch is actually behind
+/// is NOT independently established beforehand; that is left to git's own
+/// `--ff-only` refusal. Either gate missing is still safe — git refuses on a
+/// diverged or non-fast-forwardable branch regardless — but the response
+/// would then carry a failure the caller could have predicted.
 pub async fn pull_ff(repo: &Path, timeout: Duration) -> Result<(), GitError> {
     require_ok(
         run_git(repo, &["merge", "--ff-only", "@{u}"], timeout).await?,

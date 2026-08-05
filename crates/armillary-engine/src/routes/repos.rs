@@ -315,8 +315,7 @@ pub async fn fetch_one(
 /// bare `--ff-only` call, silently carrying someone's in-progress edit
 /// forward under a commit that never saw it. The explicit `is_dirty` check
 /// closes that gap by refusing on ANY uncommitted change, not just a
-/// conflicting one — dirty blocks a fast-forward outright, full stop, the
-/// same precedence this workspace has always given it.
+/// conflicting one.
 pub async fn pull(
     State(state): State<SharedState>,
     Path(name): Path<String>,
