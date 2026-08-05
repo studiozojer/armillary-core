@@ -158,10 +158,14 @@ use crate::git::{self, GitError, Position};
 /// a small closed vocabulary a client switches on directly: `"dirty"` (a
 /// policy refusal — the gate allowed the verb, the working tree did not),
 /// `"not-fast-forwardable"` (git refused the merge or push on its own
-/// terms — diverged history, no upstream, a non-fast-forward push), `
-/// "transport"` (the remote could not be reached), `"timeout"` (the
-/// invocation exceeded its cap). `message` is the human-readable detail for
-/// display; `kind` is what code branches on.
+/// terms — diverged history, no upstream, a non-fast-forward push),
+/// `"refused-by-remote"` (the remote deliberately declined a push — a
+/// protected branch, a pre-receive hook — distinct from both neighbors: the
+/// remote WAS reached, so it isn't `"transport"`, and pulling first will not
+/// help, so it isn't `"not-fast-forwardable"`; see
+/// `routes::repos::push_action_error`), `"transport"` (the remote could not
+/// be reached), `"timeout"` (the invocation exceeded its cap). `message` is
+/// the human-readable detail for display; `kind` is what code branches on.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ActionError {
     pub kind: &'static str,

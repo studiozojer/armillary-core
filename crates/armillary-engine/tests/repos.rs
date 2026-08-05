@@ -398,6 +398,38 @@ async fn push_on_a_diverged_branch_reports_the_error_and_does_not_land() {
     assert!(!verify.join("mine.md").exists(), "a refused push must not land on the remote");
 }
 
+/// Install a `pre-receive` hook in a bare remote that unconditionally
+/// declines. The one-line reproduction for N2: a hosted remote's protected
+/// branch, or any policy gate, refuses a push through exactly this
+/// mechanism, and git prints a DIFFERENT literal (`"! [remote rejected]"`)
+/// for it than for an ordinary non-fast-forward (`"! [rejected]"`).
+fn install_declining_pre_receive_hook(remote: &Path) {
+    let hooks = remote.join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("pre-receive");
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&hook).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&hook, perms).unwrap();
+}
+
+#[tokio::test]
+async fn push_declined_by_a_pre_receive_hook_is_refused_by_remote_not_transport() {
+    // N2: a protected-branch or policy refusal must not read as "the remote
+    // could not be reached" — that is the false story `action_error` exists
+    // to end, on the branch that grants push authority. The remote WAS
+    // reached; it deliberately declined.
+    let (root, remote) = live_workspace_with_sync();
+    grant_push(&root);
+    install_declining_pre_receive_hook(&remote);
+    commit(&root.join("repos/jianyi"), "mine.md", "local work");
+
+    let body = post_json(&root, "/repos/jianyi/push").await;
+    assert!(body["action_error"]["message"].is_string(), "the error must be on the wire");
+    assert_eq!(body["action_error"]["kind"], "refused-by-remote");
+}
+
 #[tokio::test]
 async fn every_verb_is_403_when_nothing_is_granted() {
     let (root, _remote) = live_workspace(); // no gates at all

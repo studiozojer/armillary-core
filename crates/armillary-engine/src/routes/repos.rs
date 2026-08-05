@@ -102,22 +102,51 @@ fn dirty_check_action_error(e: GitError) -> repos::ActionError {
 /// `RepoState::action_error`.
 ///
 /// Unlike `pull_ff`, `push` genuinely talks to the network, so a non-timeout
-/// failure has two real causes that do NOT share a shape: a non-fast-forward
-/// rejection (the remote has commits this push does not) and a transport
-/// failure (the remote could not be reached at all). Verified live
-/// 2026-08-04: git's own push-rejection output always contains the literal
-/// marker `"! [rejected]"` regardless of the specific reason git prints next
-/// to it (`(non-fast-forward)`, `(fetch first)`, …), while a transport
-/// failure (a bad path, a dead host) never does. Matching on that fixed,
-/// git-authored marker is not the caller-side string-matching this design
-/// exists to end — that was about a CLIENT having to parse prose to learn
-/// what kind of failure occurred; this is the server doing the equivalent
-/// classification once, so the client never has to.
+/// failure has THREE real causes that do NOT share a shape:
+///
+/// - a non-fast-forward rejection (the remote has commits this push does
+///   not) — git's own marker is `"! [rejected]"`, verified live 2026-08-04;
+/// - a **policy refusal by the remote** (a protected branch, a pre-receive
+///   hook that declines) — a DIFFERENT literal, `"! [remote rejected]"`,
+///   verified live 2026-08-05 against a bare remote's `pre-receive` hook
+///   exiting 1;
+/// - a transport failure (the remote could not be reached at all) — neither
+///   marker present.
+///
+/// The middle case is neither of the other two, and folding it into either
+/// tells the user something that cannot work: it is not `"transport"` (the
+/// remote was reached fine) and it is not `"not-fast-forwardable"` (pulling
+/// first will not help — the remote declined on policy, not on history), so
+/// it gets its own kind, `"refused-by-remote"`.
+///
+/// `"! [remote rejected]"` is checked FIRST, before `"! [rejected]"`. Checked
+/// directly: `"! [remote rejected] main -> main (pre-receive hook
+/// declined)"` does NOT contain `"[rejected]"` as a substring — `remote`
+/// sits between the brackets and the word, so the two markers are already
+/// mutually exclusive on git's current wording, and today's ordering does
+/// not change which branch either message takes. The more specific marker is
+/// still checked first, on the same reasoning `require_ok` states elsewhere
+/// in this codebase for not inlining a shared block twice: matching the
+/// broader pattern first is the version of this code that silently breaks
+/// the day git's wording narrows the gap between the two, and nothing here
+/// would announce that it broke.
+///
+/// Matching on these fixed, git-authored markers is not the caller-side
+/// string-matching this design exists to end — that was about a CLIENT
+/// having to parse prose to learn what kind of failure occurred; this is the
+/// server doing the equivalent classification once, so the client never has
+/// to.
 fn push_action_error(e: GitError) -> repos::ActionError {
     match e {
         GitError::Timeout => repos::ActionError { kind: "timeout", message: "timed out".to_string() },
         GitError::Failed(msg) => {
-            let kind = if msg.contains("[rejected]") { "not-fast-forwardable" } else { "transport" };
+            let kind = if msg.contains("[remote rejected]") {
+                "refused-by-remote"
+            } else if msg.contains("[rejected]") {
+                "not-fast-forwardable"
+            } else {
+                "transport"
+            };
             repos::ActionError { kind, message: msg }
         }
         // Unreachable in practice: no argument reaching `git::push` is
