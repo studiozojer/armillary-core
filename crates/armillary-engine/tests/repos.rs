@@ -328,6 +328,25 @@ async fn every_verb_is_403_when_nothing_is_granted() {
 }
 
 #[tokio::test]
+async fn ahead_survives_to_the_wire() {
+    // THE regression test for the founding bug, taken all the way to the
+    // SERDE layer rather than stopping at the Rust struct (repos.rs's OWN
+    // `ahead_survives_to_the_state` asserts on `Position` directly, which a
+    // `#[serde(rename)]` or `skip_serializing_if` on `Tracking`'s `ahead`
+    // could defeat while leaving every existing test green). A repo with N
+    // unpushed commits and nothing incoming must serialize `ahead: N` on the
+    // actual HTTP response body.
+    let (root, _remote) = live_workspace_with_sync();
+    let repo = root.join("repos/jianyi");
+    for i in 0..3 {
+        commit(&repo, &format!("unpushed{i}.md"), "x");
+    }
+    let body = get_json(&root, "/repos/jianyi").await;
+    assert_eq!(body["position"]["kind"], "tracking", "expected a Tracking position");
+    assert_eq!(body["position"]["ahead"], 3, "ahead must reach the wire, not merely the struct");
+}
+
+#[tokio::test]
 async fn a_corrupt_repo_502s_the_log_route_rather_than_reading_as_no_commits() {
     // The whole-branch review's second-worst finding: a repo with a corrupt
     // loose object exits 128 from `git log`, and the SAME shape (empty
