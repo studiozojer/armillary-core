@@ -91,6 +91,32 @@ pub fn remote_and_clone() -> (PathBuf, PathBuf) {
     (remote, clone)
 }
 
+/// Corrupt the loose object HEAD currently points to, in place.
+///
+/// Used to prove a genuine read failure (a damaged object) is told apart
+/// from an unborn branch (no commits yet) — both make `git log` exit
+/// nonzero with empty stdout, so a caller that folds every nonzero exit to
+/// "no commits" cannot distinguish a repo with unreadable history from one
+/// with none. Objects are written read-only by git, so the mode is loosened
+/// before overwriting.
+pub fn corrupt_head_object(repo: &Path) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git must be on PATH for these tests");
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(sha.len(), 40, "expected a full sha from rev-parse HEAD, got {sha:?}");
+
+    let path = repo.join(".git/objects").join(&sha[..2]).join(&sha[2..]);
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&path, perms).unwrap();
+    std::fs::write(&path, b"not a valid zlib stream").unwrap();
+}
+
 /// Push a new commit into `remote` from a third clone, so an existing clone
 /// becomes genuinely behind rather than being told it is.
 pub fn advance_remote(remote: &Path) {

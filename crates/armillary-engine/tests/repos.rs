@@ -51,6 +51,28 @@ fn commit(repo: &Path, name: &str, body: &str) {
     git_sync(repo, &["commit", "-m", name]);
 }
 
+/// Corrupt the loose object HEAD currently points to, in place. Mirrors
+/// `armillary_engine::testgit::corrupt_head_object`, unreachable from here
+/// (see this file's header) — used to prove a genuine read failure 502s
+/// rather than reading as "no commits yet".
+fn corrupt_head_object(repo: &Path) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git must be on PATH for these tests");
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(sha.len(), 40, "expected a full sha from rev-parse HEAD, got {sha:?}");
+
+    let path = repo.join(".git/objects").join(&sha[..2]).join(&sha[2..]);
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&path, perms).unwrap();
+    std::fs::write(&path, b"not a valid zlib stream").unwrap();
+}
+
 /// A bare remote with one commit, plus a clone of it: `(remote, clone)`.
 fn remote_and_clone() -> (PathBuf, PathBuf) {
     let remote = tempfile::tempdir().unwrap().keep();
@@ -303,6 +325,23 @@ async fn every_verb_is_403_when_nothing_is_granted() {
     for path in ["/repos/jianyi/fetch", "/repos/jianyi/pull", "/repos/jianyi/push", "/repos/fetch"] {
         assert_eq!(post_status(&root, path).await, 403, "{path} must refuse");
     }
+}
+
+#[tokio::test]
+async fn a_corrupt_repo_502s_the_log_route_rather_than_reading_as_no_commits() {
+    // The whole-branch review's second-worst finding: a repo with a corrupt
+    // loose object exits 128 from `git log`, and the SAME shape (empty
+    // stdout, nonzero exit) an unborn branch produces. Read naively, that
+    // reads a genuine read failure as "no commits yet" — `200 []` from
+    // `/log`, alongside `read_error` from `/repos/{name}` and `502` from
+    // `/changes` on the identical repo.
+    let (root, _remote) = live_workspace_with_sync();
+    corrupt_head_object(&root.join("repos/jianyi"));
+    assert_eq!(
+        get_status(&root, "/repos/jianyi/log?limit=10").await,
+        StatusCode::BAD_GATEWAY.as_u16(),
+        "a corrupt repo must not report as having no commits"
+    );
 }
 
 #[tokio::test]

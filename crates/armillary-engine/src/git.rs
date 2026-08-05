@@ -646,13 +646,38 @@ pub async fn log(repo: &Path, limit: u32, timeout: Duration) -> Result<Vec<LogEn
     )
     .await?;
     if !out.ok() {
-        // The one way `git log` fails here without a request-derived cause is
-        // an unborn branch — a fresh `git init` with no commits yet — which
-        // exits nonzero with "does not have any commits yet". Answered as an
-        // empty list rather than an `Err`, matching `newest_commit`'s
-        // treatment of the identical condition (`Ok(None)`): "no commits yet"
-        // is a fact about the repo's history, not a malfunction of the read.
-        return Ok(Vec::new());
+        // A nonzero exit here has two real causes that read as OPPOSITE
+        // facts: an unborn branch (`git init` with no commits yet — a fact
+        // about the repo's history, not a malfunction) and a genuine read
+        // failure (a corrupt loose object, a damaged pack). Verified live
+        // 2026-08-04: BOTH produce the identical shape from this
+        // invocation — exit 128, empty stdout, a message on stderr — so exit
+        // code and stdout emptiness alone cannot tell them apart. Folding
+        // every nonzero exit to `Ok(vec![])` (the previous behaviour here,
+        // and what `newest_commit` above still does) launders a corrupt-repo
+        // read failure the same way it launders an unborn branch: a repo
+        // whose history cannot be read answers identically to one that has
+        // none.
+        //
+        // `git rev-parse --verify --quiet HEAD` is a true structural test
+        // for "no commits yet" rather than a string match on git's
+        // (locale-dependent) error text: it fails cleanly — nonzero exit,
+        // NOTHING on stdout or stderr — exactly when there is no commit for
+        // HEAD to name, and it succeeds (printing the sha) the moment one
+        // commit exists, even when some OTHER object further back the
+        // history is unreadable. Paid only on this already-failed path, not
+        // on every call.
+        let head_exists = run_git(repo, &["rev-parse", "--verify", "--quiet", "HEAD"], timeout)
+            .await?
+            .ok();
+        if !head_exists {
+            return Ok(Vec::new());
+        }
+        return Err(GitError::Failed(if out.stderr.is_empty() {
+            format!("git log exited {}", out.code)
+        } else {
+            out.stderr
+        }));
     }
     Ok(parse_log(&out.stdout))
 }
@@ -681,7 +706,7 @@ fn parse_log(stdout: &str) -> Vec<LogEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testgit::{advance_remote, commit, git_sync, remote_and_clone};
+    use crate::testgit::{advance_remote, commit, corrupt_head_object, git_sync, remote_and_clone};
 
     #[tokio::test]
     async fn run_git_reports_stdout_and_a_zero_code() {
@@ -882,11 +907,29 @@ mod tests {
     #[tokio::test]
     async fn log_on_an_unborn_branch_is_an_empty_list_not_an_error() {
         // A fresh `git init` with zero commits: `git log` exits nonzero here,
-        // and that is answered the same way `newest_commit` answers it — as
-        // "nothing yet", not a malfunction of the read.
+        // and that is answered as "nothing yet", not a malfunction of the
+        // read — distinguished from a genuine read failure (see the next
+        // test) by `git rev-parse --verify --quiet HEAD` also failing, since
+        // there is truly no commit for HEAD to name.
         let empty = tempfile::tempdir().unwrap().keep();
         git_sync(&empty, &["init", "--initial-branch=main", "."]);
         assert_eq!(log(&empty, 10, DEFAULT_TIMEOUT).await.unwrap(), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn log_on_a_repo_with_a_corrupt_object_is_an_error_not_an_empty_list() {
+        // THE regression this closes: a repo WITH history, one of whose
+        // objects cannot be read, must not report "no commits yet" — that
+        // reads identically to a real unborn branch, and the whole-branch
+        // review found it live (a corrupt repo yielding `200 []` from
+        // `/log`). `git log` exits 128 with empty stdout here — the SAME
+        // shape an unborn branch produces — so what tells them apart is
+        // `rev-parse --verify --quiet HEAD`, which still succeeds: the ref
+        // names a real commit, even though that commit's object is damaged.
+        let (_remote, clone) = remote_and_clone();
+        corrupt_head_object(&clone);
+        let err = log(&clone, 10, DEFAULT_TIMEOUT).await.unwrap_err();
+        assert!(matches!(err, GitError::Failed(_)), "expected Failed, got {err:?}");
     }
 
     #[test]
