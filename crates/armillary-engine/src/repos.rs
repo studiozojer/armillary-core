@@ -148,6 +148,26 @@ pub fn gate_enabled(root: &Path) -> bool {
 
 use crate::git::{self, GitError, Position};
 
+/// A verb's failure, typed rather than a bare string.
+///
+/// Replaces `fetch_error: Option<String>` (D-whole-branch-review): a
+/// dirty-tree refusal and an unreachable host used to land in the same
+/// untyped field, distinguishable only by string-matching the message —
+/// exactly the thing Task 3 split `GitError::InvalidArg` out of `Failed` to
+/// avoid doing at the `GitError` layer, reintroduced one layer up. `kind` is
+/// a small closed vocabulary a client switches on directly: `"dirty"` (a
+/// policy refusal — the gate allowed the verb, the working tree did not),
+/// `"not-fast-forwardable"` (git refused the merge or push on its own
+/// terms — diverged history, no upstream, a non-fast-forward push), `
+/// "transport"` (the remote could not be reached), `"timeout"` (the
+/// invocation exceeded its cap). `message` is the human-readable detail for
+/// display; `kind` is what code branches on.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ActionError {
+    pub kind: &'static str,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RepoState {
     pub name: String,
@@ -166,9 +186,16 @@ pub struct RepoState {
     pub worktrees: u32,
     pub submodules: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub fetch_error: Option<String>,
-    /// When set, every field above is a type default rather than a
-    /// measurement, and the client MUST branch on this before rendering.
+    pub action_error: Option<ActionError>,
+    /// Set when `git status --porcelain=v2` itself failed to run. **Not**
+    /// "every field above is a default" — `last_fetch`, `worktrees`, and
+    /// `submodules` are all filesystem reads that happen BEFORE `status_v2`
+    /// in `read_one`, so they are real measurements even on this path. Only
+    /// `head`, `branch`, `position` (stuck at its `Detached` default), and
+    /// `dirty_files` (stuck at `0`) are type defaults when this is set —
+    /// `status_v2` is the only source for those four. `newest_commit` is
+    /// also absent here, but that is `with_commit`'s ordinary meaning (never
+    /// attempted), not this field's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_error: Option<String>,
 }
@@ -196,7 +223,7 @@ pub async fn read_one(root: &Path, module: &DeclaredModule, with_commit: bool) -
         newest_commit: None,
         worktrees: git::worktree_count(&abs),
         submodules: git::has_submodules(&abs),
-        fetch_error: None,
+        action_error: None,
         read_error: None,
     };
 
@@ -271,6 +298,26 @@ pub async fn list(root: &Path) -> Vec<RepoState> {
     out
 }
 
+/// A `GitError` from `git::fetch`, folded to the typed `ActionError` this
+/// design's `RepoState::action_error` carries. Shared by the group fetch
+/// below and the single-repo fetch route (`routes::repos::fetch_one`) so the
+/// two verbs classify identically.
+///
+/// `fetch` always talks to a remote — its only failure modes are "could not
+/// reach it" and "took too long trying" — so every non-timeout failure is
+/// `"transport"`, never `"not-fast-forwardable"` or `"dirty"` (those belong
+/// to `pull`/`push`, which act on the working tree or a ref this repo owns
+/// rather than merely asking a remote what it has).
+pub fn fetch_action_error(e: GitError) -> ActionError {
+    match e {
+        GitError::Timeout => ActionError { kind: "timeout", message: "timed out".to_string() },
+        GitError::Failed(msg) => ActionError { kind: "transport", message: msg },
+        // Unreachable in practice: no request value reaches `fetch`. Carried
+        // like `Failed` rather than panicking or dropping it.
+        GitError::InvalidArg(msg) => ActionError { kind: "transport", message: msg },
+    }
+}
+
 /// Fetch every composed repo, bounded at CONCURRENCY, then read each state.
 ///
 /// Group FETCH only. Group pull and group push are deliberately absent (design
@@ -296,19 +343,10 @@ pub async fn fetch_all(root: &Path) -> Vec<RepoState> {
             // The semaphore is never closed, so acquire cannot fail.
             let _permit = permits.acquire().await.expect("semaphore is open");
             let abs = root.join(&module.path);
-            let fetch_error = git::fetch(&abs, git::DEFAULT_TIMEOUT)
-                .await
-                .err()
-                .map(|e| match e {
-                    GitError::Timeout => "timed out".to_string(),
-                    GitError::Failed(msg) => msg,
-                    // Unreachable in practice: no request value reaches
-                    // `fetch`. Carried like `Failed` rather than panicking or
-                    // dropping it.
-                    GitError::InvalidArg(msg) => msg,
-                });
+            let action_error =
+                git::fetch(&abs, git::DEFAULT_TIMEOUT).await.err().map(fetch_action_error);
             let mut state = read_one(&root, &module, false).await;
-            state.fetch_error = fetch_error;
+            state.action_error = action_error;
             state
         }));
     }
@@ -338,7 +376,7 @@ pub async fn fetch_all(root: &Path) -> Vec<RepoState> {
             newest_commit: None,
             worktrees: 0,
             submodules: false,
-            fetch_error: None,
+            action_error: None,
             read_error: Some("task-failed".to_string()),
         }));
     }
@@ -677,10 +715,8 @@ mod tests {
 
         let out = fetch_all(&root).await;
         let jianyi = out.iter().find(|s| s.path == "repos/jianyi").unwrap();
-        assert!(
-            jianyi.fetch_error.is_some(),
-            "a repo with no remote must carry its fetch error, not drop it"
-        );
+        let err = jianyi.action_error.as_ref().expect("a repo with no remote must carry its fetch error");
+        assert_eq!(err.kind, "transport", "fetch's own failures are always transport, never dirty");
     }
 
     #[tokio::test]
@@ -698,7 +734,7 @@ mod tests {
         let out = fetch_all(&root).await;
         assert_eq!(out.len(), declared.len(), "a failing fetch must not shrink the result");
         assert!(
-            out.iter().all(|s| s.fetch_error.is_some()),
+            out.iter().all(|s| s.action_error.is_some()),
             "every row must carry its own error rather than vanish"
         );
     }

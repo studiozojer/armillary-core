@@ -307,10 +307,25 @@ async fn pull_refuses_a_dirty_repo_and_leaves_the_working_tree_alone() {
     let seed = root.join("repos/jianyi/seed.md");
     std::fs::write(&seed, "my uncommitted edit").unwrap();
     post_json(&root, "/repos/jianyi/fetch").await;
-    post_json(&root, "/repos/jianyi/pull").await;
+    let body = post_json(&root, "/repos/jianyi/pull").await;
 
     assert_eq!(std::fs::read_to_string(&seed).unwrap(), "my uncommitted edit");
     assert!(!root.join("repos/jianyi/from-elsewhere.md").exists());
+    // A dirty-tree refusal is a typed POLICY error, told apart from a
+    // transport or fast-forward failure without string-matching the message.
+    assert_eq!(body["action_error"]["kind"], "dirty");
+}
+
+#[tokio::test]
+async fn pull_on_a_diverged_branch_reports_not_fast_forwardable() {
+    // pull_ff never touches the network — a diverged branch is a git-side
+    // fast-forward refusal, not a transport failure, and the kind must say so.
+    let (root, remote) = live_workspace_with_sync();
+    advance_remote(&remote);
+    commit(&root.join("repos/jianyi"), "local-only.md", "mine");
+    post_json(&root, "/repos/jianyi/fetch").await;
+    let body = post_json(&root, "/repos/jianyi/pull").await;
+    assert_eq!(body["action_error"]["kind"], "not-fast-forwardable");
 }
 
 #[tokio::test]
@@ -376,5 +391,6 @@ async fn a_total_fetch_failure_does_not_read_as_success() {
         .iter()
         .find(|r| r["name"] == "jianyi")
         .unwrap();
-    assert!(jianyi["fetch_error"].is_string(), "a failed fetch must be on the wire");
+    assert!(jianyi["action_error"]["message"].is_string(), "a failed fetch must be on the wire");
+    assert_eq!(jianyi["action_error"]["kind"], "transport");
 }

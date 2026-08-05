@@ -23,12 +23,14 @@
 //! naming the exact table and key, worded identically across every verb this
 //! module gates), act, then `read_one(root, &module, true)` for the response
 //! — **never** the state computed before acting. A git failure during the
-//! act step does not 500; it lands in the response's `fetch_error`, because
-//! twenty-three good answers and one error is the useful outcome (repos.rs's
-//! `fetch_all` already makes this promise for the group verb; the per-repo
-//! verbs make it too, reusing the same field rather than inventing a second
-//! one RepoState would need to carry for no reader that needs to tell them
-//! apart).
+//! act step does not 500; it lands in the response's `action_error` — a
+//! typed `{kind, message}`, not a bare string, so a dirty-tree refusal and an
+//! unreachable host are told apart without string-matching the message —
+//! because twenty-three good answers and one error is the useful outcome
+//! (repos.rs's `fetch_all` already makes this promise for the group verb;
+//! the per-repo verbs make it too, reusing the same field rather than
+//! inventing a second one `RepoState` would need to carry for no reader that
+//! needs to tell them apart).
 
 use crate::git::{self, GitError};
 use crate::repos;
@@ -56,21 +58,71 @@ fn git_error_response(e: GitError) -> (StatusCode, String) {
     }
 }
 
-/// A `GitError` folded to the string that lands in `RepoState::fetch_error`.
+/// `git merge --ff-only`'s failure, folded to the typed error that lands in
+/// `RepoState::action_error`.
 ///
 /// Distinct from `git_error_response` above: that one is for a READ route,
 /// where the failure of the read itself is the response. Here the git call
 /// is the ACT step of a verb whose response is always 200 (or 403/404 from
 /// the gate/resolve steps, which never reach this far) — the failure is data
 /// riding inside an otherwise-successful `RepoState`, not a status code.
-fn verb_error_message(e: GitError) -> String {
+///
+/// `pull_ff` touches no network — it is `git merge --ff-only @{u}` against
+/// refs already on disk — so every non-timeout failure IS a fast-forward
+/// refusal (a diverged branch, a missing upstream, anything else `--ff-only`
+/// itself declines) rather than something reachability-shaped. That is a
+/// structural fact about what `pull_ff` can fail at, not a guess: there is no
+/// `"transport"` failure mode for a command that never dials out.
+fn pull_action_error(e: GitError) -> repos::ActionError {
     match e {
-        GitError::Timeout => "timed out".to_string(),
-        GitError::Failed(msg) => msg,
-        // Unreachable in practice, same as `repos::read_one`'s identical
-        // fold: no argument reaching `git::fetch`/`pull_ff`/`push` is
+        GitError::Timeout => repos::ActionError { kind: "timeout", message: "timed out".to_string() },
+        GitError::Failed(msg) => repos::ActionError { kind: "not-fast-forwardable", message: msg },
+        // Unreachable in practice: no argument reaching `git::pull_ff` is
         // request-derived. Carried like `Failed` rather than panicking.
-        GitError::InvalidArg(msg) => msg,
+        GitError::InvalidArg(msg) => repos::ActionError { kind: "not-fast-forwardable", message: msg },
+    }
+}
+
+/// `git status --porcelain`'s own failure during `pull`'s pre-flight dirty
+/// check — a different fact from a dirty-tree REFUSAL (that is
+/// `"dirty"`, built at the call site) and from a fast-forward refusal (the
+/// merge never even ran). Folded to `"transport"` as the closest fit in the
+/// closed vocabulary: the status read itself did not answer, the same
+/// judgment `git_error_response` makes of an identical `GitError` on a READ
+/// route.
+fn dirty_check_action_error(e: GitError) -> repos::ActionError {
+    match e {
+        GitError::Timeout => repos::ActionError { kind: "timeout", message: "timed out".to_string() },
+        GitError::Failed(msg) => repos::ActionError { kind: "transport", message: msg },
+        GitError::InvalidArg(msg) => repos::ActionError { kind: "transport", message: msg },
+    }
+}
+
+/// `git push`'s failure, folded to the typed error that lands in
+/// `RepoState::action_error`.
+///
+/// Unlike `pull_ff`, `push` genuinely talks to the network, so a non-timeout
+/// failure has two real causes that do NOT share a shape: a non-fast-forward
+/// rejection (the remote has commits this push does not) and a transport
+/// failure (the remote could not be reached at all). Verified live
+/// 2026-08-04: git's own push-rejection output always contains the literal
+/// marker `"! [rejected]"` regardless of the specific reason git prints next
+/// to it (`(non-fast-forward)`, `(fetch first)`, …), while a transport
+/// failure (a bad path, a dead host) never does. Matching on that fixed,
+/// git-authored marker is not the caller-side string-matching this design
+/// exists to end — that was about a CLIENT having to parse prose to learn
+/// what kind of failure occurred; this is the server doing the equivalent
+/// classification once, so the client never has to.
+fn push_action_error(e: GitError) -> repos::ActionError {
+    match e {
+        GitError::Timeout => repos::ActionError { kind: "timeout", message: "timed out".to_string() },
+        GitError::Failed(msg) => {
+            let kind = if msg.contains("[rejected]") { "not-fast-forwardable" } else { "transport" };
+            repos::ActionError { kind, message: msg }
+        }
+        // Unreachable in practice: no argument reaching `git::push` is
+        // request-derived.
+        GitError::InvalidArg(msg) => repos::ActionError { kind: "transport", message: msg },
     }
 }
 
@@ -277,8 +329,8 @@ pub async fn changes(
 
 /// `POST /repos/{name}/fetch` — `git fetch --prune` on one repo, returning
 /// its state AFTER the fetch. Gated on `sync`: fetch touches no working tree
-/// and no branch, so it carries the same authority `POST /sync` already
-/// requires for the group sweep.
+/// and no branch, so it carries the same authority `POST /repos/fetch`
+/// (the group sweep) already requires.
 pub async fn fetch_one(
     State(state): State<SharedState>,
     Path(name): Path<String>,
@@ -291,15 +343,13 @@ pub async fn fetch_one(
     }
 
     let abs = root.join(&module.path);
-    let fetch_error = git::fetch(&abs, git::DEFAULT_TIMEOUT)
-        .await
-        .err()
-        .map(verb_error_message);
+    let action_error =
+        git::fetch(&abs, git::DEFAULT_TIMEOUT).await.err().map(repos::fetch_action_error);
 
     // Read LAST, after the fetch landed (or failed to) — the caller must
     // never render a row it just acted on from state computed before acting.
     let mut new_state = repos::read_one(&root, &module, true).await;
-    new_state.fetch_error = fetch_error;
+    new_state.action_error = action_error;
     Ok(Json(new_state))
 }
 
@@ -329,18 +379,16 @@ pub async fn pull(
 
     let abs = root.join(&module.path);
     let pull_error = match git::is_dirty(&abs, git::DEFAULT_TIMEOUT).await {
-        Ok(true) => Some(
-            "refusing to pull: the working tree has uncommitted changes".to_string(),
-        ),
-        Ok(false) => git::pull_ff(&abs, git::DEFAULT_TIMEOUT)
-            .await
-            .err()
-            .map(verb_error_message),
-        Err(e) => Some(verb_error_message(e)),
+        Ok(true) => Some(repos::ActionError {
+            kind: "dirty",
+            message: "refusing to pull: the working tree has uncommitted changes".to_string(),
+        }),
+        Ok(false) => git::pull_ff(&abs, git::DEFAULT_TIMEOUT).await.err().map(pull_action_error),
+        Err(e) => Some(dirty_check_action_error(e)),
     };
 
     let mut new_state = repos::read_one(&root, &module, true).await;
-    new_state.fetch_error = pull_error;
+    new_state.action_error = pull_error;
     Ok(Json(new_state))
 }
 
@@ -360,23 +408,20 @@ pub async fn push(
     }
 
     let abs = root.join(&module.path);
-    let push_error = git::push(&abs, git::DEFAULT_TIMEOUT)
-        .await
-        .err()
-        .map(verb_error_message);
+    let push_error = git::push(&abs, git::DEFAULT_TIMEOUT).await.err().map(push_action_error);
 
     let mut new_state = repos::read_one(&root, &module, true).await;
-    new_state.fetch_error = push_error;
+    new_state.action_error = push_error;
     Ok(Json(new_state))
 }
 
 /// `POST /repos/fetch` — fetch EVERY composed repo, bounded concurrency
-/// (`repos::CONCURRENCY`). Gated on `sync`, same as the single-repo fetch and
-/// `POST /sync` — a group fetch touches no working tree and no branch, so it
-/// carries no more authority than the sweep this whole feature set sits
-/// beside. `repos::fetch_all` is where "twenty-three good answers and one
-/// failure" is actually implemented (each repo's own `fetch_error`); this
-/// handler is just the gate in front of it.
+/// (`repos::CONCURRENCY`). Gated on `sync`, same as the single-repo fetch —
+/// a group fetch touches no working tree and no branch, so it carries no
+/// more authority than fetching one repo at a time would. `repos::fetch_all`
+/// is where "twenty-three good answers and one failure" is actually
+/// implemented (each repo's own `action_error`); this handler is just the
+/// gate in front of it.
 pub async fn fetch_all(
     State(state): State<SharedState>,
 ) -> Result<Json<Vec<repos::RepoState>>, (StatusCode, String)> {
