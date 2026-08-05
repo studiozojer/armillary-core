@@ -17,11 +17,11 @@ pub mod loop_;
 pub mod log;
 pub mod projection;
 pub mod provider;
+pub mod repos;
 pub mod routes;
 mod search;
 pub mod sessions;
 pub mod state;
-pub mod sync;
 #[cfg(test)]
 pub mod testgit;
 pub mod tools;
@@ -48,6 +48,22 @@ pub fn app(state: AppState) -> Router {
         .route("/instances/{id}/interrupt", post(routes::session_ops::interrupt))
         .route("/instances/{id}/evict", post(routes::session_ops::evict))
         .route("/streams/{stream}/events", get(routes::subscribe::subscribe))
-        .route("/sync", get(routes::sync::status).post(routes::sync::sweep))
+        // `/repos/fetch` (static) and `/repos/{name}` (dynamic) occupy the
+        // same two-segment shape. Verified live 2026-08-04 (see
+        // `every_verb_is_403_when_nothing_is_granted`, and a since-reverted
+        // experiment that registered `/repos/{name}` FIRST): axum 0.8's
+        // `matchit` router resolves the static segment ahead of the dynamic
+        // one regardless of registration order, and does not panic on the
+        // overlap at startup either. Kept static-first anyway, for a human
+        // reader scanning this list top to bottom — the ordering is
+        // documentation now, not load-bearing.
+        .route("/repos", get(routes::repos::list))
+        .route("/repos/fetch", post(routes::repos::fetch_all))
+        .route("/repos/{name}", get(routes::repos::one))
+        .route("/repos/{name}/fetch", post(routes::repos::fetch_one))
+        .route("/repos/{name}/pull", post(routes::repos::pull))
+        .route("/repos/{name}/push", post(routes::repos::push))
+        .route("/repos/{name}/log", get(routes::repos::log))
+        .route("/repos/{name}/changes", get(routes::repos::changes))
         .with_state(shared)
 }

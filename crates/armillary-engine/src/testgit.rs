@@ -1,4 +1,4 @@
-//! Real-git fixtures, shared by `git.rs`'s and `sync.rs`'s test modules.
+//! Real-git fixtures, shared by `git.rs`'s and `repos.rs`'s test modules.
 //!
 //! `#[cfg(test)]`-gated at the module declaration in `lib.rs`, so none of this
 //! is compiled into a release binary.
@@ -52,13 +52,12 @@ pub fn commit(repo: &Path, name: &str, body: &str) {
 /// collide with a test run's wall clock, which a future one eventually could.
 ///
 /// Amended 2026-07-31: `%cI` has ONE-SECOND resolution, and the whole fixture
-/// completes inside a single second, so the local and remote commits printed
-/// byte-identical timestamps and
-/// `the_newest_commit_timestamp_is_read_after_the_fast_forward` could not
-/// discriminate — the third test in this plan to have that defect, and the one
-/// guarding the feature's keystone ordering. Rejected alternative: sleeping past
-/// a second boundary, which costs real time on every run and is only
-/// probabilistically distinct.
+/// completes inside a single second, so without this a test asserting one
+/// commit landed strictly before or after another by committer date would
+/// see byte-identical timestamps and could not discriminate — a defect this
+/// plan hit three times before landing on a fixed date as the fix. Rejected
+/// alternative: sleeping past a second boundary, which costs real time on
+/// every run and is only probabilistically distinct.
 pub const REMOTE_COMMIT_DATE: &str = "1999-12-31T23:59:59+00:00";
 
 /// `commit`, with an explicit committer date so `%cI` is deterministic.
@@ -89,6 +88,50 @@ pub fn remote_and_clone() -> (PathBuf, PathBuf) {
         &["clone", remote.to_str().unwrap(), clone.to_str().unwrap()],
     );
     (remote, clone)
+}
+
+/// Corrupt the loose object HEAD currently points to, in place.
+///
+/// Used to prove a genuine read failure (a damaged object) is told apart
+/// from an unborn branch (no commits yet) — both make `git log` exit
+/// nonzero with empty stdout, so a caller that folds every nonzero exit to
+/// "no commits" cannot distinguish a repo with unreadable history from one
+/// with none. Objects are written read-only by git, so the mode is loosened
+/// before overwriting.
+pub fn corrupt_head_object(repo: &Path) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git must be on PATH for these tests");
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(sha.len(), 40, "expected a full sha from rev-parse HEAD, got {sha:?}");
+
+    let path = repo.join(".git/objects").join(&sha[..2]).join(&sha[2..]);
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&path, perms).unwrap();
+    std::fs::write(&path, b"not a valid zlib stream").unwrap();
+}
+
+/// Create a linked worktree off `repo`, then delete its gitdir under
+/// `.git/worktrees/` so the checkout is left pointing at nothing. Returns the
+/// path to the now-orphaned worktree.
+///
+/// The representative "git cannot open this repo" fixture for this
+/// workspace, which runs linked worktrees routinely: `git -C <orphan> log`
+/// (and every other read) exits 128 with `fatal: not a git repository` on
+/// stderr — the SAME exit/empty-stdout shape an unborn branch or a corrupt
+/// object produce, but WITH stderr populated, which is exactly what tells it
+/// apart from both. Verified live 2026-08-05.
+pub fn stale_linked_worktree(repo: &Path) -> PathBuf {
+    let wt = repo.join(".worktrees").join("stale");
+    git_sync(repo, &["worktree", "add", wt.to_str().unwrap(), "-b", "stale-topic"]);
+    let name = wt.file_name().unwrap().to_str().unwrap();
+    std::fs::remove_dir_all(repo.join(".git/worktrees").join(name)).unwrap();
+    wt
 }
 
 /// Push a new commit into `remote` from a third clone, so an existing clone
