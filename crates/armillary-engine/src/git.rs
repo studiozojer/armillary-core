@@ -659,15 +659,18 @@ pub async fn log(repo: &Path, limit: u32, timeout: Duration) -> Result<Vec<LogEn
         // A nonzero exit here has two real causes that read as OPPOSITE
         // facts: an unborn branch (`git init` with no commits yet — a fact
         // about the repo's history, not a malfunction) and a genuine read
-        // failure (a corrupt loose object, a damaged pack). Verified live
-        // 2026-08-04: BOTH produce the identical shape from this
-        // invocation — exit 128, empty stdout, a message on stderr — so exit
-        // code and stdout emptiness alone cannot tell them apart. Folding
-        // every nonzero exit to `Ok(vec![])` (the previous behaviour here,
-        // and what `newest_commit` above still does) launders a corrupt-repo
-        // read failure the same way it launders an unborn branch: a repo
-        // whose history cannot be read answers identically to one that has
-        // none.
+        // failure (a corrupt loose object, a damaged pack, or a repo git
+        // cannot even open — deleted `objects/`, a garbage `HEAD`, a stale
+        // linked worktree whose gitdir was removed out from under it).
+        // Verified live 2026-08-04/05: an unborn branch and a corrupt-object
+        // repo produce the identical shape from this invocation — exit 128,
+        // empty stdout, a message on stderr — so exit code and stdout
+        // emptiness alone cannot tell them apart. A repo git cannot open
+        // ALSO exits 128 with a `fatal: not a git repository` message on
+        // stderr, so it needs the same discriminator, not a special case.
+        // Folding every nonzero exit to `Ok(vec![])` launders a genuine read
+        // failure the same way it launders an unborn branch: a repo whose
+        // history cannot be read answers identically to one that has none.
         //
         // `git rev-parse --verify --quiet HEAD` is a true structural test
         // for "no commits yet" rather than a string match on git's
@@ -677,10 +680,18 @@ pub async fn log(repo: &Path, limit: u32, timeout: Duration) -> Result<Vec<LogEn
         // commit exists, even when some OTHER object further back the
         // history is unreadable. Paid only on this already-failed path, not
         // on every call.
-        let head_exists = run_git(repo, &["rev-parse", "--verify", "--quiet", "HEAD"], timeout)
-            .await?
-            .ok();
-        if !head_exists {
+        //
+        // The predicate checks stderr too, not merely the exit code: a repo
+        // git cannot open exits 128 from this rev-parse just as an unborn
+        // branch does, but WITH `fatal: not a git repository` on stderr —
+        // verified live against a deleted `.git/objects/`, a garbage
+        // `.git/HEAD`, and a stale linked worktree (gitfile pointing at a
+        // gitdir removed from `.git/worktrees/`). Only a truly silent
+        // failure — nothing on stdout, nothing on stderr — is "no commits
+        // yet"; anything else is a read failure and falls through to `Err`
+        // below.
+        let head = run_git(repo, &["rev-parse", "--verify", "--quiet", "HEAD"], timeout).await?;
+        if !head.ok() && head.stdout.is_empty() && head.stderr.is_empty() {
             return Ok(Vec::new());
         }
         return Err(GitError::Failed(if out.stderr.is_empty() {
@@ -716,7 +727,10 @@ fn parse_log(stdout: &str) -> Vec<LogEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testgit::{advance_remote, commit, corrupt_head_object, git_sync, remote_and_clone};
+    use crate::testgit::{
+        advance_remote, commit, corrupt_head_object, git_sync, remote_and_clone,
+        stale_linked_worktree,
+    };
 
     #[tokio::test]
     async fn run_git_reports_stdout_and_a_zero_code() {
@@ -939,6 +953,22 @@ mod tests {
         let (_remote, clone) = remote_and_clone();
         corrupt_head_object(&clone);
         let err = log(&clone, 10, DEFAULT_TIMEOUT).await.unwrap_err();
+        assert!(matches!(err, GitError::Failed(_)), "expected Failed, got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn log_on_a_repo_git_cannot_open_is_an_error_not_an_empty_list() {
+        // N1: a repo git cannot OPEN at all — a stale linked worktree whose
+        // gitdir was removed out from under it — is a different trigger from
+        // the corrupt-object case above, but the same defect: `git log`
+        // exits 128 with empty stdout, the identical shape an unborn branch
+        // produces, so the fix must not fold it to "no commits yet" either.
+        // Unlike the corrupt-object case, `rev-parse --verify --quiet HEAD`
+        // ALSO fails here — but with `fatal: not a git repository` on
+        // stderr, not silently, which is what the predicate must check for.
+        let (_remote, clone) = remote_and_clone();
+        let orphan = stale_linked_worktree(&clone);
+        let err = log(&orphan, 10, DEFAULT_TIMEOUT).await.unwrap_err();
         assert!(matches!(err, GitError::Failed(_)), "expected Failed, got {err:?}");
     }
 

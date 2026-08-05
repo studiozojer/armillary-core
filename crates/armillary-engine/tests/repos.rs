@@ -132,6 +132,21 @@ fn live_workspace() -> (PathBuf, PathBuf) {
     (root, remote)
 }
 
+/// Create a linked worktree off `repo`, then delete its gitdir under
+/// `.git/worktrees/` so the checkout is left pointing at nothing. Returns the
+/// path to the now-orphaned worktree. Mirrors
+/// `armillary_engine::testgit::stale_linked_worktree`, unreachable from here
+/// (see this file's header) — used to prove a repo git cannot OPEN at all
+/// (not merely one with a corrupt object) still 502s the log route rather
+/// than reading as "no commits yet".
+fn stale_linked_worktree(repo: &Path) -> PathBuf {
+    let wt = repo.join(".worktrees").join("stale");
+    git_sync(repo, &["worktree", "add", wt.to_str().unwrap(), "-b", "stale-topic"]);
+    let name = wt.file_name().unwrap().to_str().unwrap();
+    std::fs::remove_dir_all(repo.join(".git/worktrees").join(name)).unwrap();
+    wt
+}
+
 /// Push a new commit into `remote` from a third clone, so an existing clone
 /// becomes genuinely behind rather than being told it is. Mirrors
 /// `armillary_engine::testgit::advance_remote`, unreachable from here (see
@@ -424,6 +439,35 @@ async fn a_corrupt_repo_502s_the_log_route_rather_than_reading_as_no_commits() {
         get_status(&root, "/repos/jianyi/log?limit=10").await,
         StatusCode::BAD_GATEWAY.as_u16(),
         "a corrupt repo must not report as having no commits"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_linked_worktree_502s_the_log_route_rather_than_reading_as_no_commits() {
+    // N1: a repo git cannot OPEN at all — not merely one with a corrupt
+    // object — is a different trigger for the same defect. This workspace
+    // runs linked worktrees routinely, and `declared_modules` admits a
+    // gitfile, so a stale linked worktree (its gitdir removed out from under
+    // it) is not exotic here. `git log` exits 128 with empty stdout, the
+    // same shape an unborn branch produces, so this must not read as "no
+    // commits yet" either.
+    let (root, _remote) = live_workspace_with_sync();
+    let orphan = stale_linked_worktree(&root.join("repos/jianyi"));
+    let rel = orphan.strip_prefix(&root).unwrap().to_str().unwrap().replace('\\', "/");
+    std::fs::write(
+        root.join("modules.local.toml"),
+        format!(
+            "[router]\nsync = true\n\n\
+             [[repos]]\nname = \"jianyi\"\npath = \"repos/jianyi\"\n\n\
+             [[repos]]\nname = \"stale\"\npath = \"{rel}\"\n"
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        get_status(&root, "/repos/stale/log?limit=10").await,
+        StatusCode::BAD_GATEWAY.as_u16(),
+        "a repo git cannot open must not report as having no commits"
     );
 }
 

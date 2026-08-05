@@ -116,6 +116,24 @@ pub fn corrupt_head_object(repo: &Path) {
     std::fs::write(&path, b"not a valid zlib stream").unwrap();
 }
 
+/// Create a linked worktree off `repo`, then delete its gitdir under
+/// `.git/worktrees/` so the checkout is left pointing at nothing. Returns the
+/// path to the now-orphaned worktree.
+///
+/// The representative "git cannot open this repo" fixture for this
+/// workspace, which runs linked worktrees routinely: `git -C <orphan> log`
+/// (and every other read) exits 128 with `fatal: not a git repository` on
+/// stderr — the SAME exit/empty-stdout shape an unborn branch or a corrupt
+/// object produce, but WITH stderr populated, which is exactly what tells it
+/// apart from both. Verified live 2026-08-05.
+pub fn stale_linked_worktree(repo: &Path) -> PathBuf {
+    let wt = repo.join(".worktrees").join("stale");
+    git_sync(repo, &["worktree", "add", wt.to_str().unwrap(), "-b", "stale-topic"]);
+    let name = wt.file_name().unwrap().to_str().unwrap();
+    std::fs::remove_dir_all(repo.join(".git/worktrees").join(name)).unwrap();
+    wt
+}
+
 /// Push a new commit into `remote` from a third clone, so an existing clone
 /// becomes genuinely behind rather than being told it is.
 pub fn advance_remote(remote: &Path) {
