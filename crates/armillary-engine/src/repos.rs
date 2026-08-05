@@ -245,10 +245,11 @@ pub async fn read_one(root: &Path, module: &DeclaredModule, with_commit: bool) -
                 // Unreachable in practice: `status_v2` passes only literal
                 // args, never anything request-derived. Carried like `Failed`
                 // rather than panicking or dropping it — the same fold
-                // `routes::repos::verb_error_message` applies to the
-                // identical variant (distinct from that module's
-                // `git_error_response`, which maps `InvalidArg` to 400 for a
-                // READ route's own failure, not an ACT step's incidental one).
+                // `fetch_action_error` below (and each verb's own
+                // `routes::repos::*_action_error`) applies to the identical
+                // variant (distinct from that module's `git_error_response`,
+                // which maps `InvalidArg` to 400 for a READ route's own
+                // failure, not an ACT step's incidental one).
                 GitError::InvalidArg(msg) => msg,
             });
             return state;
