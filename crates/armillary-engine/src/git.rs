@@ -227,7 +227,17 @@ pub fn parse_status_v2(stdout: &str) -> StatusV2 {
         };
         let mut parts = header.splitn(2, ' ');
         match (parts.next(), parts.next()) {
-            (Some("branch.oid"), Some(v)) => head = Some(v.trim().to_string()),
+            (Some("branch.oid"), Some(v)) => {
+                let v = v.trim();
+                // git prints this literal, rather than an oid, for a repo
+                // with no commits yet (`git init` with nothing committed) —
+                // verified live 2026-08-04. There is no HEAD to name, so the
+                // design's contract for that case (`head: None`) applies the
+                // same way it already does for a detached-HEAD branch name.
+                if v != "(initial)" {
+                    head = Some(v.to_string());
+                }
+            }
             (Some("branch.head"), Some(v)) => {
                 let v = v.trim();
                 // git prints this literal for a detached HEAD, but a branch
@@ -993,6 +1003,19 @@ mod tests {
         assert_eq!(s.branch, None);
         // The oid is still wanted — it is the only thing identifying where HEAD is.
         assert!(s.head.is_some());
+    }
+
+    #[test]
+    fn a_repo_with_no_commits_yet_has_no_head_not_the_literal_marker() {
+        // Verified live 2026-08-04: `git status --porcelain=v2 --branch` on a
+        // fresh `git init` with nothing committed prints the literal
+        // `(initial)` in place of an oid — there is no commit for `head` to
+        // name, and the design's contract for that is `None`, the same
+        // treatment `(detached)` already gets for `branch`.
+        let out = "# branch.oid (initial)\n# branch.head main\n";
+        let s = parse_status_v2(out);
+        assert_eq!(s.head, None);
+        assert_eq!(s.branch.as_deref(), Some("main"));
     }
 
     #[test]

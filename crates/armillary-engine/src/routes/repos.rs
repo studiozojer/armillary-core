@@ -175,23 +175,24 @@ pub struct ReposResponse {
 
 /// `GET /repos` — every composed repo's local state, one status fork per
 /// repo, no network call.
+///
+/// `repos::list` does the actual per-repo work (`with_commit: false` — see
+/// this module's own header; twenty-four repos times a second fork each is
+/// the exact cost this design exists to avoid paying on the list read). This
+/// handler enumerates `declared_modules` a second time only for
+/// `not_composed`, which needs the SAME declared set `undeclared_checkouts`
+/// diffs against but that `repos::list` does not itself return — a TOML
+/// parse and two `read_dir`s, not a git subprocess, so paying it twice costs
+/// nothing near what a second `status_v2` fork per repo would.
 pub async fn list(State(state): State<SharedState>) -> Json<ReposResponse> {
     let root = state.root.clone();
     let declared = repos::declared_modules(&root);
     let not_composed = repos::undeclared_checkouts(&root, &declared);
 
-    let mut out = Vec::with_capacity(declared.len());
-    for module in &declared {
-        // `with_commit: false` — see this module's own header. Twenty-four
-        // repos times a second fork each is the exact cost this design
-        // exists to avoid paying on the list read.
-        out.push(repos::read_one(&root, module, false).await);
-    }
-
     Json(ReposResponse {
         enabled: repos::gate_enabled(&root),
         push_enabled: repos::push_enabled(&root),
-        repos: out,
+        repos: repos::list(&root).await,
         not_composed,
     })
 }

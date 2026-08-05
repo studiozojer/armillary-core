@@ -52,13 +52,12 @@ pub fn commit(repo: &Path, name: &str, body: &str) {
 /// collide with a test run's wall clock, which a future one eventually could.
 ///
 /// Amended 2026-07-31: `%cI` has ONE-SECOND resolution, and the whole fixture
-/// completes inside a single second, so the local and remote commits printed
-/// byte-identical timestamps and
-/// `the_newest_commit_timestamp_is_read_after_the_fast_forward` could not
-/// discriminate — the third test in this plan to have that defect, and the one
-/// guarding the feature's keystone ordering. Rejected alternative: sleeping past
-/// a second boundary, which costs real time on every run and is only
-/// probabilistically distinct.
+/// completes inside a single second, so without this a test asserting one
+/// commit landed strictly before or after another by committer date would
+/// see byte-identical timestamps and could not discriminate — a defect this
+/// plan hit three times before landing on a fixed date as the fix. Rejected
+/// alternative: sleeping past a second boundary, which costs real time on
+/// every run and is only probabilistically distinct.
 pub const REMOTE_COMMIT_DATE: &str = "1999-12-31T23:59:59+00:00";
 
 /// `commit`, with an explicit committer date so `%cI` is deterministic.
