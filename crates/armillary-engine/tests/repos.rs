@@ -334,6 +334,55 @@ async fn push_is_403_when_only_sync_is_granted() {
     assert_eq!(post_status(&root, "/repos/jianyi/push").await, 403);
 }
 
+/// Grant `push = true` on top of `live_workspace_with_sync`'s fixture.
+fn grant_push(root: &Path) {
+    std::fs::write(
+        root.join("modules.local.toml"),
+        "[router]\nsync = true\npush = true\n\n\
+         [[repos]]\nname = \"jianyi\"\npath = \"repos/jianyi\"\n",
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn push_sends_the_local_commit_to_the_remote() {
+    // THE founding-bug shape, on this branch's widest authority: a handler
+    // that resolved, passed the gate, and returned read_one(..., true)
+    // WITHOUT ever calling git::push would pass every other test in this
+    // suite — a well-formed RepoState with ahead still on it, the client
+    // showing the push as done, and the commit sitting local. Verified from
+    // a THIRD clone of the remote, never from the pusher's own refs (those
+    // move locally whether or not the remote accepted anything).
+    let (root, remote) = live_workspace_with_sync();
+    grant_push(&root);
+    commit(&root.join("repos/jianyi"), "mine.md", "local work");
+
+    let body = post_json(&root, "/repos/jianyi/push").await;
+    assert!(body["action_error"].is_null(), "a clean push must not carry an error");
+
+    let verify = tempfile::tempdir().unwrap().keep();
+    git_sync(&verify, &["clone", remote.to_str().unwrap(), verify.to_str().unwrap()]);
+    assert!(verify.join("mine.md").exists(), "the remote never received the pushed commit");
+}
+
+#[tokio::test]
+async fn push_on_a_diverged_branch_reports_the_error_and_does_not_land() {
+    let (root, remote) = live_workspace_with_sync();
+    grant_push(&root);
+    advance_remote(&remote);
+    commit(&root.join("repos/jianyi"), "mine.md", "local work");
+    // Deliberately no fetch first — pushing straight into a remote that has
+    // moved is exactly the diverged case `push` must refuse, not force.
+
+    let body = post_json(&root, "/repos/jianyi/push").await;
+    assert!(body["action_error"]["message"].is_string(), "the error must be on the wire");
+    assert_eq!(body["action_error"]["kind"], "not-fast-forwardable");
+
+    let verify = tempfile::tempdir().unwrap().keep();
+    git_sync(&verify, &["clone", remote.to_str().unwrap(), verify.to_str().unwrap()]);
+    assert!(!verify.join("mine.md").exists(), "a refused push must not land on the remote");
+}
+
 #[tokio::test]
 async fn every_verb_is_403_when_nothing_is_granted() {
     let (root, _remote) = live_workspace(); // no gates at all
