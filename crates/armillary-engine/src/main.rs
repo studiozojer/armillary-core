@@ -2,6 +2,7 @@ use armillary_engine::{
     app,
     log::store::LogStore,
     provider::{AnthropicProvider, KeylessProvider, ModelProvider},
+    provider_openai::OpenAiCompatProvider,
     sessions::Sessions,
     state::{AppState, ModelConfig},
 };
@@ -36,10 +37,11 @@ struct Args {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    /// Which model pilots sessions. No provider call exists yet (Task 10) —
-    /// this just rides in `AppState` until one does. The credential is never
-    /// a flag (`ANTHROPIC_API_KEY` only, below) so it never lands in shell
-    /// history or `ps`.
+    /// Which model pilots sessions. A `zen/<slug>` value routes to the
+    /// OpenAI-compat provider against OpenCode Zen (key: `OPENCODE_ZEN_API_KEY`
+    /// or `~/.config/armillary/zen-key`); anything else is an Anthropic model
+    /// name. The credential is never a flag (env or key file only, below) so
+    /// it never lands in shell history or `ps`.
     #[arg(long, default_value = "claude-sonnet-5")]
     model: String,
 }
@@ -201,6 +203,29 @@ fn default_key_file() -> PathBuf {
         .join(".config/armillary/anthropic-key")
 }
 
+/// The zen key's home, beside `anthropic-key` — per-provider key files, one
+/// ritual (the board's ratified shape, 2026-08-07).
+fn default_zen_key_file() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+        .join(".config/armillary/zen-key")
+}
+
+/// Which provider a model string selects, and with what residue. Pure so the
+/// selection rule is testable without booting a server.
+enum ProviderChoice {
+    Anthropic,
+    Zen { slug: String },
+}
+
+fn choose_provider(model: &str) -> ProviderChoice {
+    match model.strip_prefix("zen/") {
+        Some(slug) => ProviderChoice::Zen {
+            slug: slug.to_string(),
+        },
+        None => ProviderChoice::Anthropic,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -270,12 +295,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sessions = Arc::new(Sessions::new(store));
 
     // Never a flag, never logged — see the struct doc on `ModelConfig` and
-    // `resolve_api_key`'s doc for the env-then-file priority.
-    let env_val = std::env::var("ANTHROPIC_API_KEY").ok();
-    let key_file = default_key_file();
+    // `resolve_api_key`'s doc for the env-then-file priority. Which provider
+    // the model string selects is `choose_provider`'s rule: a `zen/` prefix
+    // routes to the OpenAI-compat client; anything else is Anthropic.
+    let (env_name, key_file) = match choose_provider(&args.model) {
+        ProviderChoice::Anthropic => ("ANTHROPIC_API_KEY", default_key_file()),
+        ProviderChoice::Zen { .. } => ("OPENCODE_ZEN_API_KEY", default_zen_key_file()),
+    };
+    let env_val = std::env::var(env_name).ok();
     let env_present = env_val.as_deref().is_some_and(|v| !v.is_empty());
     let api_key = resolve_api_key(env_val, &key_file);
 
+    // `model` keeps the full spelling (`zen/<slug>` included) — it is what
+    // the log's `model` field records, and the prefix is honest provenance.
     let model = ModelConfig {
         model: args.model.clone(),
         api_key,
@@ -285,25 +317,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is wired in: `KeylessProvider` fails every turn with a named error
     // (`no_api_key`) rather than refusing to start. Which provider is active,
     // and where its key came from, is announced — without ever printing the
-    // key itself — see `ModelConfig`'s and `AnthropicProvider`'s redacting
-    // `Debug` impls, and `resolve_api_key`'s doc for why only the source
+    // key itself — see the redacting `Debug` impls on `ModelConfig` and both
+    // providers, and `resolve_api_key`'s doc for why only the source
     // (env vs. file), never the value, is nameable here.
-    let provider: Arc<dyn ModelProvider> = match &model.api_key {
-        Some(api_key) => {
+    let provider: Arc<dyn ModelProvider> = match (&model.api_key, choose_provider(&args.model)) {
+        (Some(api_key), choice) => {
             let source = if env_present {
                 "key from env".to_string()
             } else {
                 format!("key from {}", key_file.display())
             };
-            eprintln!("provider: anthropic (model {}, {source})", model.model);
-            Arc::new(AnthropicProvider {
-                model: model.model.clone(),
-                api_key: api_key.clone(),
-            })
+            match choice {
+                ProviderChoice::Anthropic => {
+                    eprintln!("provider: anthropic (model {}, {source})", model.model);
+                    Arc::new(AnthropicProvider {
+                        model: model.model.clone(),
+                        api_key: api_key.clone(),
+                    })
+                }
+                ProviderChoice::Zen { slug } => {
+                    eprintln!("provider: opencode-zen (model {slug}, {source})");
+                    Arc::new(OpenAiCompatProvider {
+                        base_url: "https://opencode.ai/zen/v1".to_string(),
+                        // The bare slug crosses the wire; the prefixed
+                        // spelling stays in `ModelConfig` for the log.
+                        model: slug,
+                        api_key: api_key.clone(),
+                    })
+                }
+            }
         }
-        None => {
+        (None, _) => {
             eprintln!(
-                "provider: keyless — no ANTHROPIC_API_KEY set and no usable key at {}; \
+                "provider: keyless — no {env_name} set and no usable key at {}; \
                  the Explorer works, but every send will fail with no_api_key",
                 key_file.display()
             );
@@ -338,6 +384,24 @@ mod tests {
     use super::*;
     use std::net::Ipv6Addr;
     use std::str::FromStr;
+
+    #[test]
+    fn a_zen_prefix_selects_the_compat_provider_and_bare_names_do_not() {
+        assert!(matches!(
+            choose_provider("zen/kimi-k3"),
+            ProviderChoice::Zen { slug } if slug == "kimi-k3"
+        ));
+        assert!(matches!(
+            choose_provider("claude-sonnet-5"),
+            ProviderChoice::Anthropic
+        ));
+        // A slug containing further slashes passes through whole — Zen's
+        // catalog naming is not ours to constrain.
+        assert!(matches!(
+            choose_provider("zen/deepseek/v4-flash"),
+            ProviderChoice::Zen { slug } if slug == "deepseek/v4-flash"
+        ));
+    }
 
     #[test]
     fn loopback_is_permitted() {

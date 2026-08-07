@@ -365,7 +365,7 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
         let req = crate::provider::TurnRequest {
             turn,
             tools: offered,
-            tool_choice: force_text.then(|| serde_json::json!({ "type": "none" })),
+            tool_choice: force_text.then_some(crate::provider::ToolChoice::ForceText),
         };
 
         // A fresh channel per round, and the relay prefixes what earlier rounds
