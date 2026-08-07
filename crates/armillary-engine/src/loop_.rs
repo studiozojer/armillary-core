@@ -1556,8 +1556,9 @@ mod tests {
         assert_eq!(last.data["error"], "no_api_key");
         assert_eq!(last.data["generation"], generation);
         // The failure shape must carry `model` just like the success shape
-        // does — the configured model string, since a failure path never
-        // gets a `TurnOutcome::model` to report.
+        // does — the RESOLVED model (`model_for`, falling back to
+        // `state.model.model`), not a raw config string, since a failure
+        // path never gets a `TurnOutcome::model` to report.
         assert_eq!(last.data["model"], "claude-sonnet-5");
         assert_eq!(last.actor.instance.as_deref(), Some("tycho"));
     }

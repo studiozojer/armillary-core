@@ -3,8 +3,10 @@ use crate::sessions::Sessions;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// The engine's configured model — the instance's default until Task 3 gives
-/// each instance its own recorded model precedence over this. No credential
+/// The engine's configured model — resolved once at boot, and the fallback
+/// for any instance whose own log names none (`loop_::run_turn`; an
+/// instance's own recorded model, when present, takes precedence over this).
+/// No credential
 /// here: `KeyedProviders` (`provider.rs`) resolves keys per provider now,
 /// not per model, so a copy living here too would be a second thing to leak
 /// (see `provider.rs`'s `KeyedProviders` doc and the commit that deleted

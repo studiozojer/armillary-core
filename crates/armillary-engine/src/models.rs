@@ -7,10 +7,20 @@
 //! depends on (`~/.config/armillary/{anthropic-key,zen-key}`), one ritual,
 //! and the standard stays out of it.
 //!
-//! Read on demand, never cached at boot: per request for `GET /models` and
-//! per turn when resolving a default, so editing the file takes effect
-//! everywhere it is consulted at once and the endpoint can never report a
-//! default the resolver disagrees with.
+//! The *list* is read on demand, never cached: per request for `GET /models`
+//! and per turn when resolving a model absent from an instance's own log
+//! (`loop_::model_for`'s fallback), so editing the file's entries takes
+//! effect everywhere they're consulted without a restart.
+//!
+//! The *default*, though, is resolved once — at boot, into
+//! `AppState.model.model` (`main.rs`'s precedence chain: `--model`, then
+//! this file's `default`, then a literal fallback) — because that resolved
+//! value is also what `loop_::run_turn` falls back to for every instance
+//! that names no model of its own. `GET /models` reports that SAME
+//! boot-resolved value, not a fresh re-read of this file's `default` line,
+//! so the two can never disagree: editing `models.toml`'s `default` after
+//! boot changes what a future restart will resolve to, not what this run is
+//! piloting with, and the endpoint says so honestly.
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -53,9 +63,20 @@ pub fn load(path: &Path) -> Catalog {
     }
 }
 
-/// The catalog's `default`, for `main`'s precedence chain.
+/// The catalog's `default`, for `main`'s precedence chain. `default = ""` in
+/// `models.toml` filters to `None` here — the same guard the two read paths
+/// in `routes/instances.rs` apply — so an empty declaration falls through to
+/// the literal fallback instead of becoming the process default and handing
+/// `AnthropicProvider` an empty model string (a 400 on every null-model turn).
 pub fn declared_default() -> Option<String> {
-    load(&default_path()).default
+    declared_default_at(&default_path())
+}
+
+/// `declared_default`'s body, over an explicit path — split out so the
+/// filter can be exercised against a real temp file instead of the
+/// hard-coded `$HOME` location `declared_default` itself is pinned to.
+fn declared_default_at(path: &Path) -> Option<String> {
+    load(path).default.filter(|s| !s.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -115,5 +136,29 @@ label = "DeepSeek Flash (free)"
         let catalog = load(&path);
         assert_eq!(catalog.models.len(), 1);
         assert_eq!(catalog.models[0].label, None);
+    }
+
+    #[test]
+    fn a_blank_declared_default_filters_to_none_rather_than_piloting_with_an_empty_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.toml");
+        std::fs::write(&path, "default = \"\"\n").unwrap();
+        assert_eq!(declared_default_at(&path), None);
+    }
+
+    #[test]
+    fn a_whitespace_only_declared_default_also_filters_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.toml");
+        std::fs::write(&path, "default = \"   \"\n").unwrap();
+        assert_eq!(declared_default_at(&path), None);
+    }
+
+    #[test]
+    fn a_real_declared_default_survives_the_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.toml");
+        std::fs::write(&path, "default = \"claude-sonnet-5\"\n").unwrap();
+        assert_eq!(declared_default_at(&path).as_deref(), Some("claude-sonnet-5"));
     }
 }

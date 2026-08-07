@@ -391,7 +391,13 @@ pub async fn create(
     // the name again afterwards to resolve that operator's declared boot.
     let operator_name = operator.clone();
     let may_write_composition = body.may_write_composition;
-    let model = body.model;
+    // Empty or whitespace-only becomes `None` HERE, on the write path — not
+    // only on the two read paths (`instance_from_first_event`'s and
+    // `models::declared_default`'s `.filter(|s| !s.is_empty())`). Without
+    // this, `{"model": ""}` logs `"model": ""` verbatim in `instance_created`
+    // while every read of that same event reports `null` — the log and the
+    // API would disagree about what this instance was created with.
+    let model = body.model.filter(|s| !s.trim().is_empty());
     let id = uuid::Uuid::new_v4().to_string();
     let started_at = humantime::format_rfc3339_millis(SystemTime::now()).to_string();
 

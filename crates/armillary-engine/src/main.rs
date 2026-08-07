@@ -37,9 +37,11 @@ struct Args {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    /// Which model pilots sessions. A `zen/<slug>` value routes to the
-    /// OpenAI-compat provider against OpenCode Zen (key: `OPENCODE_ZEN_API_KEY`
-    /// or `~/.config/armillary/zen-key`); anything else is an Anthropic model
+    /// The process-wide default model — the fallback for any instance whose
+    /// own log names none; an instance's own recorded model wins over this
+    /// (`loop_::run_turn`). A `zen/<slug>` value routes to the OpenAI-compat
+    /// provider against OpenCode Zen (key: `OPENCODE_ZEN_API_KEY` or
+    /// `~/.config/armillary/zen-key`); anything else is an Anthropic model
     /// name. The credential is never a flag (env or key file only, below) so
     /// it never lands in shell history or `ps`.
     ///

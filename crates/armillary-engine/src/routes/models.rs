@@ -47,5 +47,11 @@ pub async fn models(State(state): State<SharedState>) -> Json<ModelsResponse> {
             }
         })
         .collect();
-    Json(ModelsResponse { default: catalog.default, models: entries })
+    // The engine's EFFECTIVE default — `state.model.model`, resolved once at
+    // boot (`main.rs`'s precedence chain) — not a fresh re-read of the
+    // catalog's `default` line. The resolver (`loop_::run_turn`) falls back
+    // to `state.model.model` too, so reporting anything else here would let
+    // an edit to `models.toml` after boot make this endpoint lie about what
+    // the engine will actually pilot with.
+    Json(ModelsResponse { default: Some(state.model.model.clone()), models: entries })
 }
