@@ -99,10 +99,11 @@ pub enum ProviderError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnRequest {
     pub turn: ModelTurn,
-    /// Sent only when non-empty. Tool definitions render at the very front of
-    /// the prompt, so a set that changes between requests invalidates the whole
-    /// cached prefix — keep the order fixed.
-    pub tools: Vec<serde_json::Value>,
+    /// Sent only when non-empty, and dialect-neutral: each provider projects
+    /// these to its own wire shape in its request builder. Tool definitions
+    /// render at the very front of the prompt, so a set that changes between
+    /// requests invalidates the whole cached prefix — keep the order fixed.
+    pub tools: Vec<crate::tools::ToolDef>,
     /// `{"type":"none"}` at a bound to force text; `{"type":"tool","name":…}` to
     /// compel a specific call. Measured: both are accepted on `claude-sonnet-5`
     /// with adaptive thinking on, which is this engine's default.
@@ -434,7 +435,9 @@ fn build_request_body(model: &str, req: &TurnRequest) -> serde_json::Value {
     // pin — the claim is about the flattening, not about the engine never
     // offering tools.
     if !req.tools.is_empty() {
-        body["tools"] = serde_json::json!(req.tools);
+        let tools: Vec<serde_json::Value> =
+            req.tools.iter().map(|d| d.anthropic_definition()).collect();
+        body["tools"] = serde_json::json!(tools);
     }
     if let Some(choice) = &req.tool_choice {
         body["tool_choice"] = choice.clone();
@@ -1425,6 +1428,35 @@ mod tests {
                 "stream": true,
                 "messages": [{ "role": "user", "content": "hi" }],
             })
+        );
+    }
+
+    #[test]
+    fn a_request_with_tools_carries_the_anthropic_dialect() {
+        // TurnRequest is dialect-neutral; THIS provider chooses the Anthropic
+        // projection at the boundary. The text-only goldens above are untouched
+        // by construction: empty tools still omits the key entirely.
+        let def = crate::tools::ToolDef {
+            name: "specimen",
+            description: "d".to_string(),
+            schema: serde_json::json!({ "type": "object", "properties": {}, "required": [] }),
+        };
+        let turn = ModelTurn {
+            system: None,
+            messages: vec![text_msg(ProviderRole::User, "hi")],
+        };
+        let body = build_request_body(
+            "m",
+            &TurnRequest { turn, tools: vec![def], tool_choice: None },
+        );
+
+        assert_eq!(
+            body["tools"],
+            serde_json::json!([{
+                "name": "specimen",
+                "description": "d",
+                "input_schema": { "type": "object", "properties": {}, "required": [] },
+            }])
         );
     }
 
