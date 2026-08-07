@@ -1,0 +1,142 @@
+[
+  {
+    "description": "Return what this workspace is composed of: the operators, the commons, the repos, and the protocols declared in its manifests, along with which protocol sources are actually present on disk. Call this to find out what exists before reasoning about it — the answer is derived from the manifest files, not from memory.",
+    "input_schema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "get_composition"
+  },
+  {
+    "description": "List the entries of one directory in the workspace. Directories are marked with a trailing slash. Paths are relative to the workspace root; pass an empty string for the root itself. Credentials and build output are never listed. Use this to find out what is there before reading a file.",
+    "input_schema": {
+      "properties": {
+        "path": {
+          "description": "Directory path relative to the workspace root; \"\" for the root.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "list_directory"
+  },
+  {
+    "description": "Read a page of one text file in the workspace, with line numbers so you can cite what you read. Paths are relative to the workspace root. Reads are paginated: if the page ends before the file does, the result says so and gives the offset to continue from. No file is too large to read — it is only too large to read at once.",
+    "input_schema": {
+      "properties": {
+        "limit": {
+          "description": "How many lines to read. Defaults to 500, capped at 2000.",
+          "type": "integer"
+        },
+        "offset": {
+          "description": "1-based line number to start at. Defaults to 1.",
+          "type": "integer"
+        },
+        "path": {
+          "description": "File path relative to the workspace root.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "read_file"
+  },
+  {
+    "description": "Find files by a glob pattern over their path, e.g. \"**/2026-07-30-*\" or \"operators/**/*.md\". Lists files of any type, including ones `search` cannot read. Covers the modules this workspace declares: content the manifest does not declare (reference clones under repos/external/, for one) is not covered unless you name it with `path`. Credentials, build and dependency trees (node_modules, target, .build), git worktrees and the engine's own .armillary are never listed, at any path — naming one is refused rather than widening the search. Use this when you know roughly what a file is called and not where it is.",
+    "input_schema": {
+      "properties": {
+        "path": {
+          "description": "Optional. Restrict the search to this directory, which may be outside the composed modules.",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "A glob matched against the workspace-relative path.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern"
+      ],
+      "type": "object"
+    },
+    "name": "find_files"
+  },
+  {
+    "description": "Search the contents of this workspace's files for a regular expression, returning each matching line with its path and line number. A plain string is a valid regex. Searches the modules this workspace declares: content the manifest does not declare (reference clones under repos/external/, for one) is not searched unless you name it with `path`. Credentials, build and dependency trees (node_modules, target, .build), git worktrees and the engine's own .armillary are never searched, at any path — naming one is refused rather than widening the search. Only text file types are read; `find_files` will still list the rest. Long lines are windowed around the match. Use this to find out where something is said before reading the file that says it.",
+    "input_schema": {
+      "properties": {
+        "case_sensitive": {
+          "description": "Optional. Defaults to false.",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "Optional. Restrict the search to this directory, which may be outside the composed modules.",
+          "type": "string"
+        },
+        "query": {
+          "description": "A regular expression. A literal string works.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "name": "search"
+  },
+  {
+    "description": "Create a file, or replace an existing file's contents entirely. The path is relative to the workspace root, and missing parent directories are created and named in the result. Writes land on real files in the real checkout, immediately. ALWAYS prefer editing an existing file with `edit_file` over rewriting it with this — a full rewrite of a file you only meant to change part of is the most expensive mistake this tool can make. `read_file` cuts any line over 4000 bytes and marks it `…[line truncated]`: NEVER write back content carrying that marker, it is display text and the cut bytes are gone.",
+    "input_schema": {
+      "properties": {
+        "content": {
+          "description": "The file's complete new contents.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Workspace-relative path.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ],
+      "type": "object"
+    },
+    "name": "write_file"
+  },
+  {
+    "description": "Replace an exact string in an existing file. `old_string` must appear EXACTLY ONCE — include surrounding lines until it is unique. Whitespace and indentation are significant. Read the file first, and send the file's own text WITHOUT read_file's line-number prefixes: the \"   12\\t\" at the start of each line is display formatting, not file content, and it is the most common reason an edit finds nothing. This never creates a file — use `write_file` for that. ALWAYS prefer this over rewriting a whole file.",
+    "input_schema": {
+      "properties": {
+        "new_string": {
+          "description": "Text to put in its place.",
+          "type": "string"
+        },
+        "old_string": {
+          "description": "Exact text to replace. Must appear exactly once in the file.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Workspace-relative path to an existing file.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "old_string",
+        "new_string"
+      ],
+      "type": "object"
+    },
+    "name": "edit_file"
+  }
+]
