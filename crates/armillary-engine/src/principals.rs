@@ -166,6 +166,70 @@ impl Registry {
     }
 }
 
+/// `$HOME/.config/armillary/devices` — beside `anthropic-key` and `zen-key`.
+///
+/// Built from `HOME` directly, matching `default_key_file`'s posture in
+/// `main.rs`: no path-lookup crate, and the same directory the studio
+/// already uses for machine-local secrets.
+pub fn default_registry_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+        .join(".config/armillary/devices")
+}
+
+/// `$HOME/.config/armillary/host-token`.
+pub fn default_host_token_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+        .join(".config/armillary/host-token")
+}
+
+/// Write one principal to `<dir>/<name>.toml`, creating `dir` if needed.
+pub fn write_principal(dir: &Path, p: &Principal) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let text = toml::to_string(p)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    std::fs::write(dir.join(format!("{}.toml", p.name)), text)
+}
+
+/// Mint the `host` principal if none exists.
+///
+/// Returns the token when it minted one, `None` when a `host` principal was
+/// already there — a re-mint on every start would invalidate the token a
+/// local caller already holds, and this engine is a launchd service, so
+/// restarts are routine rather than notable.
+///
+/// **`full ∧ manifest ≡ manifest`.** The host is minted with BOTH grants, so
+/// the effective authority of a loopback caller is exactly what the manifest
+/// already said — which is why this change is a no-op for host behavior on
+/// the day it lands. `a_full_host_grant_changes_nothing_the_manifest_allowed`
+/// in `routes/repos.rs` pins that.
+pub fn ensure_host(dir: &Path, host_token_path: &Path) -> std::io::Result<Option<String>> {
+    if Registry::load(dir).names().iter().any(|p| p.name == "host") {
+        return Ok(None);
+    }
+
+    let token = mint_token();
+    write_principal(
+        dir,
+        &Principal {
+            name: "host".to_string(),
+            token_hash: hash_token(&token),
+            grants: vec![Grant::Sync, Grant::Push],
+            minted: humantime::format_rfc3339_millis(std::time::SystemTime::now()).to_string(),
+        },
+    )?;
+
+    if let Some(parent) = host_token_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(host_token_path, &token)?;
+    // Written AFTER the file exists rather than via `OpenOptions::mode`, so
+    // the narrowing applies whether or not the file was already there.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(host_token_path, std::fs::Permissions::from_mode(0o600))?;
+
+    Ok(Some(token))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +423,57 @@ mod tests {
 
         let reg = Registry::load(dir.path());
         assert!(reg.authenticate("").is_none(), "empty credential must not authenticate, even against hash of empty token");
+    }
+
+    #[test]
+    fn first_run_mints_a_host_principal_with_full_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg_dir = dir.path().join("devices");
+        let token_path = dir.path().join("host-token");
+
+        let minted = ensure_host(&reg_dir, &token_path).unwrap();
+        assert!(minted.is_some(), "first run must mint");
+
+        let reg = Registry::load(&reg_dir);
+        let host = reg.names().into_iter().find(|p| p.name == "host").unwrap();
+        assert!(host.holds(Grant::Sync));
+        assert!(host.holds(Grant::Push));
+
+        // The token is on disk where a local caller can read it, and it is
+        // the one that authenticates.
+        let on_disk = fs::read_to_string(&token_path).unwrap().trim().to_string();
+        assert_eq!(on_disk, minted.unwrap());
+        assert_eq!(reg.authenticate(&on_disk).unwrap().name, "host");
+    }
+
+    #[test]
+    fn the_host_token_file_is_not_group_or_world_readable() {
+        // The whole argument for a token on disk is that its protection is
+        // the SAME filesystem boundary already guarding the SSH key this
+        // grant ultimately spends. Mode 0600 is that argument; asserted
+        // rather than assumed, because a default-permissioned write would
+        // quietly make it weaker than the credential it guards.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("host-token");
+        ensure_host(&dir.path().join("devices"), &token_path).unwrap();
+
+        let mode = fs::metadata(&token_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "no group or world bits");
+    }
+
+    #[test]
+    fn a_second_run_does_not_re_mint() {
+        // Re-minting on every start would invalidate the token a local
+        // caller is already holding, on every restart — and the engine is a
+        // launchd service now, so restarts are routine.
+        let dir = tempfile::tempdir().unwrap();
+        let reg_dir = dir.path().join("devices");
+        let token_path = dir.path().join("host-token");
+
+        let first = ensure_host(&reg_dir, &token_path).unwrap().unwrap();
+        let second = ensure_host(&reg_dir, &token_path).unwrap();
+        assert!(second.is_none(), "an existing host principal is left alone");
+        assert_eq!(Registry::load(&reg_dir).authenticate(&first).unwrap().name, "host");
     }
 }
