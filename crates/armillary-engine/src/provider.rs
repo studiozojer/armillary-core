@@ -366,9 +366,18 @@ fn role_str(role: ProviderRole) -> &'static str {
 /// never gain a `status` key — measured, that is a 400 ("Extra inputs are not
 /// permitted"). See `projection::ContentBlock`'s doc for where the typed status
 /// actually lives.
-fn block_json(block: &ContentBlock) -> serde_json::Value {
+pub(crate) fn block_json(block: &ContentBlock) -> serde_json::Value {
     match block {
         ContentBlock::Text(text) => serde_json::json!({ "type": "text", "text": text }),
+        ContentBlock::Thinking { thinking, signature } => serde_json::json!({
+            "type": "thinking",
+            "thinking": thinking,
+            "signature": signature,
+        }),
+        ContentBlock::RedactedThinking { data } => serde_json::json!({
+            "type": "redacted_thinking",
+            "data": data,
+        }),
         ContentBlock::ToolUse { id, name, input } => serde_json::json!({
             "type": "tool_use",
             "id": id,
@@ -1467,6 +1476,27 @@ mod tests {
             role,
             content: vec![ContentBlock::Text(s.to_string())],
         }
+    }
+
+    #[test]
+    fn thinking_blocks_encode_in_their_exact_wire_shapes() {
+        // Opaque capture-and-echo: the engine never interprets these fields, so
+        // the encoding must be exactly what the stream delivered.
+        assert_eq!(
+            block_json(&ContentBlock::Thinking {
+                thinking: "let me check".to_string(),
+                signature: "sig-abc".to_string(),
+            }),
+            serde_json::json!({
+                "type": "thinking",
+                "thinking": "let me check",
+                "signature": "sig-abc",
+            })
+        );
+        assert_eq!(
+            block_json(&ContentBlock::RedactedThinking { data: "opaque-bytes".to_string() }),
+            serde_json::json!({ "type": "redacted_thinking", "data": "opaque-bytes" })
+        );
     }
 
     #[test]

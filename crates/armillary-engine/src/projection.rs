@@ -56,7 +56,7 @@ pub struct ProviderMessage {
     pub content: Vec<ContentBlock>,
 }
 
-/// A single content block, mirroring the three Anthropic shapes this engine
+/// A single content block, mirroring the Anthropic shapes this engine
 /// can produce. Materialized to JSON by `provider::build_request_body` — this
 /// type is deliberately wire-*shaped* but not wire-*encoded*, so the encoding
 /// lives at one edge (P-4's separate flattening stage).
@@ -78,6 +78,19 @@ pub enum ContentBlock {
         tool_use_id: String,
         content: String,
         is_error: bool,
+    },
+    /// Opaque: captured from the stream, persisted, echoed verbatim. The
+    /// engine never reads `thinking` or `signature` — the documented replay
+    /// contract is "unchanged", and absence is the only alternative the API
+    /// cannot distinguish from a turn that never thought.
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    /// Encrypted thinking the API returns pre-opaque. Same rule, no fields
+    /// the engine can even pretend to read.
+    RedactedThinking {
+        data: String,
     },
 }
 
