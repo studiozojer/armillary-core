@@ -215,15 +215,26 @@ pub struct ReposResponse {
 /// nothing near what a second `status_v2` fork per repo would.
 pub async fn list(State(state): State<SharedState>) -> Json<ReposResponse> {
     let root = state.root.clone();
-    let declared = repos::declared_modules(&root);
+    let snap = snapshot_or_default(&root);
+    let declared = repos::declared_modules(&root, &snap.composition);
     let not_composed = repos::undeclared_checkouts(&root, &declared);
 
     Json(ReposResponse {
-        enabled: repos::gate_enabled(&root),
-        push_enabled: repos::push_enabled(&root),
-        repos: repos::list(&root).await,
+        enabled: repos::gate_enabled(&snap.composition),
+        push_enabled: repos::push_enabled(&snap.composition),
+        repos: repos::list(&root, &snap.composition).await,
         not_composed,
     })
+}
+
+/// The one manifest read a request performs. On an unloadable manifest the
+/// default (nothing composed) reproduces each consumer's standing posture —
+/// gates read false, module resolution 404s, the listing sweeps the root only
+/// (design decision 5). Every answer a handler derives from the returned
+/// snapshot agrees with every other, which is the point: gate-check and act
+/// can no longer see different manifests within one request.
+fn snapshot_or_default(root: &std::path::Path) -> crate::snapshot::WorkspaceSnapshot {
+    crate::snapshot::WorkspaceSnapshot::load(root).unwrap_or_default()
 }
 
 /// `GET /repos/{name}` — one repo's full state, including `newest_commit`
@@ -233,7 +244,8 @@ pub async fn one(
     Path(name): Path<String>,
 ) -> Result<Json<repos::RepoState>, (StatusCode, String)> {
     let root = state.root.clone();
-    let module = repos::resolve(&root, &name)
+    let snap = snapshot_or_default(&root);
+    let module = repos::resolve(&root, &snap.composition, &name)
         .ok_or((StatusCode::NOT_FOUND, "unknown_repo".to_string()))?;
     Ok(Json(repos::read_one(&root, &module, true).await))
 }
@@ -304,7 +316,8 @@ pub async fn log(
     Query(q): Query<LogQuery>,
 ) -> Result<Json<Vec<Commit>>, (StatusCode, String)> {
     let root = state.root.clone();
-    let module = repos::resolve(&root, &name)
+    let snap = snapshot_or_default(&root);
+    let module = repos::resolve(&root, &snap.composition, &name)
         .ok_or((StatusCode::NOT_FOUND, "unknown_repo".to_string()))?;
     let limit = clamp_limit(q.limit.as_deref());
     let abs = root.join(&module.path);
@@ -346,7 +359,8 @@ pub async fn changes(
     Path(name): Path<String>,
 ) -> Result<Json<Vec<git::ChangedFile>>, (StatusCode, String)> {
     let root = state.root.clone();
-    let module = repos::resolve(&root, &name)
+    let snap = snapshot_or_default(&root);
+    let module = repos::resolve(&root, &snap.composition, &name)
         .ok_or((StatusCode::NOT_FOUND, "unknown_repo".to_string()))?;
     let abs = root.join(&module.path);
 
@@ -366,9 +380,10 @@ pub async fn fetch_one(
     Path(name): Path<String>,
 ) -> Result<Json<repos::RepoState>, (StatusCode, String)> {
     let root = state.root.clone();
-    let module = repos::resolve(&root, &name)
+    let snap = snapshot_or_default(&root);
+    let module = repos::resolve(&root, &snap.composition, &name)
         .ok_or((StatusCode::NOT_FOUND, "unknown_repo".to_string()))?;
-    if !repos::gate_enabled(&root) {
+    if !repos::gate_enabled(&snap.composition) {
         return Err(sync_gate_denied());
     }
 
@@ -401,9 +416,10 @@ pub async fn pull(
     Path(name): Path<String>,
 ) -> Result<Json<repos::RepoState>, (StatusCode, String)> {
     let root = state.root.clone();
-    let module = repos::resolve(&root, &name)
+    let snap = snapshot_or_default(&root);
+    let module = repos::resolve(&root, &snap.composition, &name)
         .ok_or((StatusCode::NOT_FOUND, "unknown_repo".to_string()))?;
-    if !repos::gate_enabled(&root) {
+    if !repos::gate_enabled(&snap.composition) {
         return Err(sync_gate_denied());
     }
 
@@ -444,9 +460,10 @@ pub async fn push(
     Path(name): Path<String>,
 ) -> Result<Json<repos::RepoState>, (StatusCode, String)> {
     let root = state.root.clone();
-    let module = repos::resolve(&root, &name)
+    let snap = snapshot_or_default(&root);
+    let module = repos::resolve(&root, &snap.composition, &name)
         .ok_or((StatusCode::NOT_FOUND, "unknown_repo".to_string()))?;
-    if !repos::push_enabled(&root) {
+    if !repos::push_enabled(&snap.composition) {
         return Err(push_gate_denied());
     }
 
@@ -469,15 +486,38 @@ pub async fn fetch_all(
     State(state): State<SharedState>,
 ) -> Result<Json<Vec<repos::RepoState>>, (StatusCode, String)> {
     let root = state.root.clone();
-    if !repos::gate_enabled(&root) {
+    let snap = snapshot_or_default(&root);
+    if !repos::gate_enabled(&snap.composition) {
         return Err(sync_gate_denied());
     }
-    Ok(Json(repos::fetch_all(&root).await))
+    Ok(Json(repos::fetch_all(&root, &snap.composition).await))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mid_request_manifest_write_cannot_split_gate_from_act() {
+        // The incoherence this whole task exists to kill: gate-check and act
+        // reading different manifests within one request. The snapshot is
+        // loaded, the manifest is then gutted on disk, and every answer
+        // derived from the held snapshot must still agree with what was
+        // loaded.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("repos/a/.git")).unwrap();
+        std::fs::write(
+            dir.path().join("modules.toml"),
+            "[router]\nsync = true\n[[repos]]\nname = \"a\"\npath = \"repos/a\"\n",
+        )
+        .unwrap();
+
+        let snap = snapshot_or_default(dir.path());
+        std::fs::write(dir.path().join("modules.toml"), "").unwrap();
+
+        assert!(crate::repos::gate_enabled(&snap.composition));
+        assert!(crate::repos::resolve(dir.path(), &snap.composition, "a").is_some());
+    }
 
     #[tokio::test]
     async fn the_pull_path_waits_on_a_held_write_lock() {
