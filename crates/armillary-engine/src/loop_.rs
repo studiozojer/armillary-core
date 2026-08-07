@@ -115,6 +115,23 @@ pub fn may_write_composition(events: &[EventEnvelope]) -> bool {
         .unwrap_or(false)
 }
 
+/// Which model pilots this instance, as recorded at its creation. `None`
+/// when the field is absent — an instance created before per-instance
+/// models existed must keep piloting, so the caller falls back to the
+/// engine's default rather than this returning a placeholder. Same shape
+/// and same defaulting discipline as `may_write_composition` above, for
+/// the same reason: the registry is log-derived, so the first event is the
+/// only place either answer lives.
+pub fn model_for(events: &[EventEnvelope]) -> Option<String> {
+    events
+        .iter()
+        .find(|e| e.event_type == "instance_created")
+        .and_then(|e| e.data.get("model"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 fn assistant_actor(operator: &str) -> Actor {
     Actor {
         role: Role::Operator,
@@ -858,6 +875,28 @@ mod tests {
 
         assert!(may_write_composition(&granted));
         assert!(!may_write_composition(&plain));
+    }
+
+    #[test]
+    fn the_model_is_read_from_instance_created_and_absent_when_unrecorded() {
+        let with = vec![bare_event(
+            1,
+            "i1",
+            "instance_created",
+            serde_json::json!({ "operator": "tycho", "model": "zen/deepseek-v4-flash" }),
+        )];
+        assert_eq!(model_for(&with).as_deref(), Some("zen/deepseek-v4-flash"));
+
+        // An instance created before this field existed. It must resolve to
+        // None so the caller falls back to the engine default — never fail,
+        // never a bare empty string.
+        let without = vec![bare_event(
+            1,
+            "i1",
+            "instance_created",
+            serde_json::json!({ "operator": "tycho" }),
+        )];
+        assert_eq!(model_for(&without), None);
     }
 
     fn model_config() -> ModelConfig {

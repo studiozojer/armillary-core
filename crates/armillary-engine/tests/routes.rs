@@ -887,3 +887,25 @@ async fn an_instance_records_whether_it_may_write_the_composition() {
     let plain_events = store.read_from(&plain_id, 0).unwrap();
     assert!(!armillary_engine::loop_::may_write_composition(&plain_events));
 }
+
+#[tokio::test]
+async fn create_records_the_requested_model_and_returns_it() {
+    let router = app_over(|_| {});
+    let (status, created) = post_json(
+        router,
+        "/instances",
+        serde_json::json!({ "operator": "tycho", "model": "zen/deepseek-v4-flash" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["model"], "zen/deepseek-v4-flash");
+}
+
+#[tokio::test]
+async fn create_without_a_model_is_accepted_and_reports_none() {
+    let router = app_over(|_| {});
+    let (status, created) =
+        post_json(router, "/instances", serde_json::json!({ "operator": "tycho" })).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(created["model"].is_null());
+}

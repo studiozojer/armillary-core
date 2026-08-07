@@ -35,6 +35,18 @@ pub struct CreateRequest {
     /// move and the shape to grow into is `patterns: ["modules*.toml"]`.
     #[serde(default)]
     pub may_write_composition: bool,
+
+    /// Which model pilots this instance, pinned at creation and immutable
+    /// for its life (design decision 1). **Never validated here** — not the
+    /// slug, not the provider's key presence (decision 3): an instance
+    /// pinned to a model this host cannot pilot is created successfully and
+    /// fails its first turn with `no_api_key`, on an event that names the
+    /// model. That keeps the refusal durable in the instance's own log
+    /// rather than evaporating in an HTTP response, and it preserves
+    /// core#19 decision 1's pass-through freedom — a slug this engine has
+    /// never heard of is catalog news, not a request to reject.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Serialize, Debug, PartialEq)]
@@ -46,6 +58,7 @@ pub struct Instance {
     pub started_at: String,
     pub last_seq: u64,
     pub may_write_composition: bool,
+    pub model: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -82,6 +95,16 @@ fn instance_from_first_event(stream: &str, first: &EventEnvelope, head_seq: u64)
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Defaulted like the grant above, and for the same reason: an instance
+    // created before this field existed must list and attach, not fail to
+    // parse.
+    let model = first
+        .data
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
     Some(Instance {
         id: stream.to_string(),
         operator,
@@ -89,6 +112,7 @@ fn instance_from_first_event(stream: &str, first: &EventEnvelope, head_seq: u64)
         started_at,
         last_seq: head_seq,
         may_write_composition,
+        model,
     })
 }
 
@@ -367,6 +391,7 @@ pub async fn create(
     // the name again afterwards to resolve that operator's declared boot.
     let operator_name = operator.clone();
     let may_write_composition = body.may_write_composition;
+    let model = body.model;
     let id = uuid::Uuid::new_v4().to_string();
     let started_at = humantime::format_rfc3339_millis(SystemTime::now()).to_string();
 
@@ -385,6 +410,7 @@ pub async fn create(
                         "operator": operator,
                         "startedAt": started_at,
                         "mayWriteComposition": may_write_composition,
+                        "model": model,
                     }),
                 },
             )
