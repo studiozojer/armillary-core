@@ -55,6 +55,29 @@ impl Grant {
     }
 }
 
+/// A fresh 256-bit token, lowercase hex.
+///
+/// `OsRng` is the operating system's CSPRNG, not a userspace generator that
+/// could be seeded reproducibly. That distinction is the whole security of
+/// this scheme: everything else here assumes the token is unguessable.
+pub fn mint_token() -> String {
+    use rand::{rngs::OsRng, RngCore};
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `"sha256:<hex>"` — what the registry stores in place of a token.
+///
+/// **SHA-256 and deliberately not a password KDF.** argon2 and bcrypt exist
+/// to make LOW-ENTROPY secrets expensive to guess; there is nothing to guess
+/// in 256 bits of CSPRNG output, so a work factor here would buy latency and
+/// no security. Reaching for one anyway is cargo-cult, and this comment is
+/// here so the next reader does not "fix" it.
+pub fn hash_token(token: &str) -> String {
+    format!("sha256:{}", crate::hash::sha256_hex(token.as_bytes()))
+}
+
 /// One enrolled device (or the host itself).
 ///
 /// `token_hash` is the SHA-256 of the token, prefixed `sha256:`. The token
@@ -120,6 +143,26 @@ impl Registry {
 
     pub fn names(&self) -> Vec<&Principal> {
         self.principals.iter().collect()
+    }
+
+    /// The principal this token belongs to, or none.
+    ///
+    /// The presented token is HASHED and the hashes compared — the registry
+    /// never holds anything that could be replayed, so a leaked registry
+    /// file is not a set of credentials.
+    ///
+    /// **No constant-time comparison, on purpose.** A timing oracle on this
+    /// comparison would leak how many leading hex digits of a *hash* match,
+    /// and turning that into a valid token is a preimage attack on SHA-256,
+    /// not an iteration. Constant-time comparison matters where an attacker
+    /// can walk a secret byte by byte; here the walk terminates at a problem
+    /// nobody has solved.
+    pub fn authenticate(&self, token: &str) -> Option<&Principal> {
+        if token.is_empty() {
+            return None;
+        }
+        let presented = hash_token(token);
+        self.principals.iter().find(|p| p.token_hash == presented)
     }
 }
 
@@ -202,5 +245,51 @@ mod tests {
         // fails closed downstream: no principal holds any grant.
         let reg = Registry::load(Path::new("/nonexistent/definitely/not/here"));
         assert!(reg.names().is_empty());
+    }
+
+    #[test]
+    fn a_minted_token_is_256_bits_of_hex() {
+        let t = mint_token();
+        assert_eq!(t.len(), 64, "32 bytes, lowercase hex");
+        assert!(t.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn two_minted_tokens_differ() {
+        // Guards the one mistake that would silently destroy the whole
+        // scheme: a seeded or constant RNG. Not a probabilistic test — a
+        // collision here means the source is not the OS CSPRNG.
+        assert_ne!(mint_token(), mint_token());
+    }
+
+    #[test]
+    fn a_token_authenticates_as_its_own_principal() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = mint_token();
+        std::fs::write(
+            dir.path().join("iphone.toml"),
+            format!(
+                "name = \"iphone\"\ntoken_hash = \"{}\"\ngrants = [\"sync\"]\nminted = \"2026-08-07T00:00:00Z\"\n",
+                hash_token(&token)
+            ),
+        )
+        .unwrap();
+
+        let reg = Registry::load(dir.path());
+        let who = reg.authenticate(&token).expect("the minted token must authenticate");
+        assert_eq!(who.name, "iphone");
+    }
+
+    #[test]
+    fn a_wrong_token_authenticates_as_nobody() {
+        let dir = farm();
+        let reg = Registry::load(dir.path());
+        assert!(reg.authenticate(&mint_token()).is_none());
+        assert!(reg.authenticate("").is_none());
+        // The stored hash spelled back at us is NOT a token. Guards an
+        // implementation that compares the presented string to `token_hash`
+        // directly instead of hashing it first — which would make the
+        // registry file itself the credential.
+        assert!(reg.authenticate("sha256:aaaa").is_none());
     }
 }
