@@ -48,7 +48,7 @@ use tokio::sync::{mpsc, watch};
 /// not a guarantee, and always-thinking families may refuse the shape). One
 /// deliberate exception: a thinking block cut before its `signature_delta` is
 /// dropped at materialization — unsigned, it is unreplayable.
-const MAX_TOKENS: u32 = 64_000;
+pub(crate) const MAX_TOKENS: u32 = 64_000;
 
 /// What one turn produced. `stopped` is true only when `cancel` fired before
 /// the model finished on its own — a normal end-of-stream (or a scripted
@@ -172,7 +172,7 @@ impl std::fmt::Debug for AnthropicProvider {
 /// Returns `None` for anything that isn't a `data:` line (an `event:` line,
 /// a blank keep-alive line, or a `[DONE]` sentinel) or whose payload isn't
 /// valid JSON.
-fn parse_sse_data_line(line: &str) -> Option<serde_json::Value> {
+pub(crate) fn parse_sse_data_line(line: &str) -> Option<serde_json::Value> {
     let payload = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:"))?;
     let payload = payload.trim();
     if payload.is_empty() || payload == "[DONE]" {
