@@ -42,11 +42,12 @@ use tokio::sync::{mpsc, watch};
 /// behaviour change for some workspaces and a no-op for others. That is a call
 /// for the workspace owner, not a fix to slip into a truncation patch.
 ///
-/// Still unhandled, and worth knowing before tools land: **thinking blocks are
-/// never captured.** The parser keeps text and tool blocks and discards the
-/// rest. That is survivable while a turn's content is a bare string, and stops
-/// being survivable when a `tool_use` block must travel back alongside the
-/// thinking blocks from the same assistant turn.
+/// **Thinking blocks are captured opaquely and replayed verbatim** — the
+/// documented contract, honored rather than leaned on (the 2026-08-07 probe
+/// measured the stripped replay *tolerated* on `claude-sonnet-5`; tolerance is
+/// not a guarantee, and always-thinking families may refuse the shape). One
+/// deliberate exception: a thinking block cut before its `signature_delta` is
+/// dropped at materialization — unsigned, it is unreplayable.
 const MAX_TOKENS: u32 = 64_000;
 
 /// What one turn produced. `stopped` is true only when `cancel` fired before
@@ -1417,6 +1418,40 @@ mod tests {
         let err = provider.run_turn(empty_turn(), tx, cancel_rx).await.unwrap_err();
 
         assert_eq!(err, ProviderError::NoApiKey);
+    }
+
+    #[test]
+    fn a_replayed_turn_carries_its_thinking_blocks_verbatim() {
+        let turn = ModelTurn {
+            system: None,
+            messages: vec![
+                text_msg(ProviderRole::User, "hi"),
+                ProviderMessage {
+                    role: ProviderRole::Assistant,
+                    content: vec![
+                        ContentBlock::Thinking {
+                            thinking: "let me look".to_string(),
+                            signature: "sig-1".to_string(),
+                        },
+                        ContentBlock::Text("checking".to_string()),
+                        ContentBlock::ToolUse {
+                            id: "tu_1".to_string(),
+                            name: "read_file".to_string(),
+                            input: serde_json::json!({"path": "a.md"}),
+                        },
+                    ],
+                },
+            ],
+        };
+
+        assert_eq!(
+            build_request_body("m", &TurnRequest::bare(turn))["messages"][1]["content"],
+            serde_json::json!([
+                {"type": "thinking", "thinking": "let me look", "signature": "sig-1"},
+                {"type": "text", "text": "checking"},
+                {"type": "tool_use", "id": "tu_1", "name": "read_file", "input": {"path": "a.md"}},
+            ])
+        );
     }
 
     // --- streaming thinking blocks ---

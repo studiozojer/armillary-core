@@ -414,6 +414,26 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
             turn_text.push_str(&outcome.text);
         }
 
+        // Wire-shaped, via the same encoder build_request_body uses — one
+        // encoding, two readers. Persisted only when the round also produced
+        // text or calls: a thinking-only cut round would replay as an
+        // assistant turn of nothing but thinking, an unmeasured wire shape
+        // with no continuation value.
+        let thinking_blocks: Vec<serde_json::Value> = outcome
+            .blocks
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b,
+                    crate::projection::ContentBlock::Thinking { .. }
+                        | crate::projection::ContentBlock::RedactedThinking { .. }
+                )
+            })
+            .map(crate::provider::block_json)
+            .collect();
+        let persist_thinking =
+            !thinking_blocks.is_empty() && (!outcome.text.is_empty() || !calls.is_empty());
+
         // Interrupted mid-generation. The `interrupt` event is recorded BEFORE
         // the partial assistant message — a pinned ordering, and the honest
         // one: the record reads "the user stopped it, and this is what had been
@@ -427,15 +447,19 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
             if let Err(e) = append_blocking(&state.sessions, &stream, ev).await {
                 eprintln!("log_write_failed appending interrupt for stream {stream:?}: {e:?}");
             }
+            let mut data = serde_json::json!({
+                "text": outcome.text,
+                "generation": generation,
+                "interrupted": true,
+                "model": outcome.model,
+            });
+            if persist_thinking {
+                data["thinking"] = serde_json::json!(thinking_blocks.clone());
+            }
             let partial = NewEvent {
                 actor: assistant_actor(&operator),
                 event_type: "assistant_message".to_string(),
-                data: serde_json::json!({
-                    "text": outcome.text,
-                    "generation": generation,
-                    "interrupted": true,
-                    "model": outcome.model,
-                }),
+                data,
             };
             match append_blocking(&state.sessions, &stream, partial).await {
                 // Any call the model had begun is answered before the turn
@@ -454,18 +478,22 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
         // id is the batch parent for this round's calls. An empty `text` is
         // honest and contributes no block to the projection; synthesizing prose
         // to fill it would put words in the operator's mouth in a durable record.
+        let mut data = serde_json::json!({
+            "text": outcome.text,
+            "generation": generation,
+            "interrupted": outcome.stopped,
+            "model": outcome.model,
+        });
+        if persist_thinking {
+            data["thinking"] = serde_json::json!(thinking_blocks);
+        }
         let assistant_id = match append_blocking(
             &state.sessions,
             &stream,
             NewEvent {
                 actor: assistant_actor(&operator),
                 event_type: "assistant_message".to_string(),
-                data: serde_json::json!({
-                    "text": outcome.text,
-                    "generation": generation,
-                    "interrupted": outcome.stopped,
-                    "model": outcome.model,
-                }),
+                data,
             },
         )
         .await
@@ -1029,6 +1057,67 @@ mod tests {
         assert_eq!(changed.actor.role, Role::Tool);
         // Durable, so it must carry a real seq (I-4: 0 is transient).
         assert!(changed.seq > 0);
+    }
+
+    #[tokio::test]
+    async fn captured_thinking_lands_on_the_assistant_message_in_wire_shape() {
+        // The round that thinks and calls carries its thinking on the
+        // assistant_message, wire-shaped; a round that captured none must not
+        // carry the key at all, so pre-thinking events stay byte-identical.
+        // The tool round's text is EMPTY on purpose — calls count as content
+        // for the persistence guard, and this is the shape the live probe
+        // elicited (thinking straight into tool_use, no prose).
+        let data_dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("modules.toml"), "[[repos]]\nname='r'\npath='p'\n")
+            .unwrap();
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance(&sessions, Some("tycho")).await;
+
+        let provider = std::sync::Arc::new(RoundScript::new(vec![
+            TurnOutcome {
+                text: String::new(),
+                blocks: vec![
+                    crate::projection::ContentBlock::Thinking {
+                        thinking: "let me look".to_string(),
+                        signature: "sig-1".to_string(),
+                    },
+                    crate::projection::ContentBlock::ToolUse {
+                        id: "toolu_th1".to_string(),
+                        name: "get_composition".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                ],
+                stop_reason: Some("tool_use".to_string()),
+                stopped: false,
+                model: "round-script".to_string(),
+            },
+            says("done"),
+        ]));
+        let state = state_with(provider, sessions.clone(), root.path()).await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+
+        let events = sessions.store().read_from(&id, 0).unwrap();
+        let with_thinking: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "assistant_message" && e.data.get("thinking").is_some())
+            .collect();
+        assert_eq!(with_thinking.len(), 1, "exactly the tool round carries thinking");
+        assert_eq!(
+            with_thinking[0].data["thinking"],
+            serde_json::json!([
+                {"type": "thinking", "thinking": "let me look", "signature": "sig-1"}
+            ])
+        );
+
+        let last = events
+            .iter()
+            .rfind(|e| e.event_type == "assistant_message")
+            .unwrap();
+        assert!(last.data.get("thinking").is_none());
     }
 
     #[tokio::test]
