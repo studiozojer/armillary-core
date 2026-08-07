@@ -200,6 +200,13 @@ enum PartialBlock {
         name: String,
         json: String,
     },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    Redacted {
+        data: String,
+    },
 }
 
 /// Folds an Anthropic SSE stream into content blocks and a stop reason.
@@ -259,10 +266,31 @@ impl StreamAccumulator {
                             },
                         );
                     }
-                    // A block kind this engine does not model (thinking,
-                    // server_tool_use, …). Deliberately not opened: an unknown
-                    // block we cannot faithfully echo back is worse than one we
-                    // never claim to have.
+                    "thinking" => {
+                        let seed = block
+                            .get("thinking")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or_default();
+                        self.open.insert(
+                            index,
+                            PartialBlock::Thinking {
+                                thinking: seed.to_string(),
+                                signature: String::new(),
+                            },
+                        );
+                    }
+                    // Arrives complete in the start frame — no deltas follow.
+                    "redacted_thinking" => {
+                        let data = block
+                            .get("data")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or_default();
+                        self.open.insert(index, PartialBlock::Redacted { data: data.to_string() });
+                    }
+                    // A block kind this engine does not model (server_tool_use,
+                    // …). Deliberately not opened: an unknown block we cannot
+                    // faithfully echo back is worse than one we never claim to
+                    // have.
                     _ => {}
                 }
             }
@@ -281,6 +309,16 @@ impl StreamAccumulator {
                     (Some(PartialBlock::ToolUse { json, .. }), "input_json_delta") => {
                         if let Some(fragment) = delta.get("partial_json").and_then(|p| p.as_str()) {
                             json.push_str(fragment);
+                        }
+                    }
+                    (Some(PartialBlock::Thinking { thinking, .. }), "thinking_delta") => {
+                        if let Some(t) = delta.get("thinking").and_then(|t| t.as_str()) {
+                            thinking.push_str(t);
+                        }
+                    }
+                    (Some(PartialBlock::Thinking { signature, .. }), "signature_delta") => {
+                        if let Some(s) = delta.get("signature").and_then(|s| s.as_str()) {
+                            signature.push_str(s);
                         }
                     }
                     _ => {}
@@ -347,6 +385,19 @@ impl StreamAccumulator {
                         name: name.clone(),
                         input,
                     })
+                }
+                PartialBlock::Thinking { thinking, signature } => {
+                    // Cut before signature_delta: unreplayable, and an
+                    // unsigned block sent back is a tamper-shaped 400 risk.
+                    // Dropped, never salvaged — same rule as the truncated
+                    // tool-call JSON above.
+                    (!signature.is_empty()).then(|| ContentBlock::Thinking {
+                        thinking: thinking.clone(),
+                        signature: signature.clone(),
+                    })
+                }
+                PartialBlock::Redacted { data } => {
+                    Some(ContentBlock::RedactedThinking { data: data.clone() })
                 }
             })
             .collect()
@@ -1366,6 +1417,82 @@ mod tests {
         let err = provider.run_turn(empty_turn(), tx, cancel_rx).await.unwrap_err();
 
         assert_eq!(err, ProviderError::NoApiKey);
+    }
+
+    // --- streaming thinking blocks ---
+
+    #[test]
+    fn thinking_deltas_accumulate_and_materialize_in_wire_order() {
+        let mut acc = StreamAccumulator::default();
+        for v in [
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "let me "}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "check"}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "signature_delta", "signature": "sig-abc"}}),
+            serde_json::json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "text", "text": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "text_delta", "text": "on it"}}),
+            serde_json::json!({"type": "content_block_start", "index": 2,
+                "content_block": {"type": "tool_use", "id": "tu_1", "name": "read_file", "input": {}}}),
+            serde_json::json!({"type": "content_block_delta", "index": 2,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"path\": \"a.md\"}"}}),
+        ] {
+            acc.observe(&v);
+        }
+
+        assert_eq!(
+            acc.blocks(),
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "let me check".to_string(),
+                    signature: "sig-abc".to_string(),
+                },
+                ContentBlock::Text("on it".to_string()),
+                ContentBlock::ToolUse {
+                    id: "tu_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "a.md"}),
+                },
+            ]
+        );
+        // Thinking never enters the visible prose.
+        assert_eq!(acc.text(), "on it");
+    }
+
+    #[test]
+    fn a_thinking_block_cut_before_its_signature_is_dropped_not_salvaged() {
+        // An unsigned thinking block on replay is a tamper-shaped 400 risk —
+        // the same rule blocks() applies to truncated tool-call JSON.
+        let mut acc = StreamAccumulator::default();
+        for v in [
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "cut mid-"}}),
+            serde_json::json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "text", "text": "still here"}}),
+        ] {
+            acc.observe(&v);
+        }
+
+        assert_eq!(acc.blocks(), vec![ContentBlock::Text("still here".to_string())]);
+    }
+
+    #[test]
+    fn redacted_thinking_arrives_whole_and_survives_whole() {
+        let mut acc = StreamAccumulator::default();
+        acc.observe(&serde_json::json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "redacted_thinking", "data": "opaque-bytes"}}));
+
+        assert_eq!(
+            acc.blocks(),
+            vec![ContentBlock::RedactedThinking { data: "opaque-bytes".to_string() }]
+        );
     }
 
     // --- the request body, pinned ---
