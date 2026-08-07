@@ -1947,6 +1947,25 @@ mod tests {
         assert!(rendered.contains("claude-3-5-sonnet-20241022"));
     }
 
+    // --- KeyedProviders ---
+
+    #[test]
+    fn keyed_providers_debug_redacts_both_keys() {
+        // KeyedProviders holds BOTH live credentials at once, unlike
+        // AnthropicProvider/OpenAiCompatProvider which each hold one. The
+        // failure mode this guards against is a Debug that redacts the
+        // field someone remembered and prints the field they added later —
+        // so both distinctive values are asserted absent, not just one.
+        let providers = KeyedProviders {
+            anthropic_key: Some("sk-ant-super-secret-do-not-print".to_string()),
+            zen_key: Some("zen-super-secret-do-not-print".to_string()),
+        };
+        let rendered = format!("{providers:?}");
+        assert!(!rendered.contains("sk-ant-super-secret-do-not-print"));
+        assert!(!rendered.contains("zen-super-secret-do-not-print"));
+        assert!(rendered.contains("<redacted>"));
+    }
+
     #[tokio::test]
     #[ignore = "hits the real Anthropic API; run by hand with ANTHROPIC_API_KEY set"]
     async fn anthropic_live_turn() {

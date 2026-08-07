@@ -303,18 +303,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // env-then-file priority. BOTH keys, not just the configured model's —
     // an Anthropic instance and a Zen instance now coexist in one engine
     // (design decision 1), so a key resolved lazily would be a key resolved
-    // never. Sources are named; values never are.
+    // never. Each line below names its env var and, when there is no usable
+    // key, the key file's PATH — an operator needs to know WHERE to drop a
+    // key on this host, which is exactly what the pre-this-task keyless
+    // message said. Sources (env vs. file, or the file's path) are named;
+    // key VALUES never are.
+    let anthropic_key_file = default_key_file();
     let anthropic_env = std::env::var("ANTHROPIC_API_KEY").ok();
-    let anthropic_key = resolve_api_key(anthropic_env, &default_key_file());
+    let anthropic_env_present = anthropic_env.as_deref().is_some_and(|v| !v.is_empty());
+    let anthropic_key = resolve_api_key(anthropic_env, &anthropic_key_file);
+
+    let zen_key_file = default_zen_key_file();
     let zen_env = std::env::var("OPENCODE_ZEN_API_KEY").ok();
-    let zen_key = resolve_api_key(zen_env, &default_zen_key_file());
+    let zen_env_present = zen_env.as_deref().is_some_and(|v| !v.is_empty());
+    let zen_key = resolve_api_key(zen_env, &zen_key_file);
+
     let anthropic_key_present = anthropic_key.is_some();
     let zen_key_present = zen_key.is_some();
 
     eprintln!(
-        "providers: anthropic {} · opencode-zen {}",
-        if anthropic_key.is_some() { "ready" } else { "no key — those instances fail with no_api_key" },
-        if zen_key.is_some() { "ready" } else { "no key — those instances fail with no_api_key" },
+        "provider: anthropic {}",
+        match (anthropic_key_present, anthropic_env_present) {
+            (true, true) => "ready (key from env)".to_string(),
+            (true, false) => format!("ready (key from {})", anthropic_key_file.display()),
+            (false, _) => format!(
+                "no ANTHROPIC_API_KEY set and no usable key at {} — those instances fail with no_api_key",
+                anthropic_key_file.display()
+            ),
+        }
+    );
+    eprintln!(
+        "provider: opencode-zen {}",
+        match (zen_key_present, zen_env_present) {
+            (true, true) => "ready (key from env)".to_string(),
+            (true, false) => format!("ready (key from {})", zen_key_file.display()),
+            (false, _) => format!(
+                "no OPENCODE_ZEN_API_KEY set and no usable key at {} — those instances fail with no_api_key",
+                zen_key_file.display()
+            ),
+        }
     );
 
     // `model` keeps the full spelling (`zen/<slug>` included) — it is what
