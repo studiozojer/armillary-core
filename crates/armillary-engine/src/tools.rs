@@ -522,7 +522,19 @@ pub const MANIFEST_FILES: [&str; 2] = ["modules.toml", "modules.local.toml"];
 ///   composition changing at all. `present` survives, because presence is the
 ///   C-4 question that actually matters.
 pub fn composition_event_data(root: &Path) -> Result<serde_json::Value, ToolError> {
-    let mut body = composition_payload(root)?;
+    let snap = crate::snapshot::WorkspaceSnapshot::load(root)
+        .map_err(|e| ToolError::new("composition_unreadable", e.to_string()))?;
+    composition_event_data_from(&snap, root)
+}
+
+/// `composition_event_data` over an already-loaded snapshot — instance
+/// creation loads ONE snapshot and feeds both this and the boot event, so
+/// the two records cannot disagree about which manifests they saw.
+pub fn composition_event_data_from(
+    snap: &crate::snapshot::WorkspaceSnapshot,
+    root: &Path,
+) -> Result<serde_json::Value, ToolError> {
+    let mut body = composition_payload_from(snap, root)?;
     let obj = body
         .as_object_mut()
         .ok_or_else(|| ToolError::new("composition_unreadable", "composition is not an object"))?;
@@ -552,20 +564,34 @@ pub fn composition_event_data(root: &Path) -> Result<serde_json::Value, ToolErro
 /// Nothing consumes them yet; they cost one hash over bytes already in memory
 /// and mean "which bytes were in that window" stays answerable.
 pub fn composition_payload(root: &Path) -> Result<serde_json::Value, ToolError> {
+    let snap = crate::snapshot::WorkspaceSnapshot::load(root)
+        .map_err(|e| ToolError::new("composition_unreadable", e.to_string()))?;
+    composition_payload_from(&snap, root)
+}
+
+/// `composition_payload` over an already-loaded snapshot.
+///
+/// The `manifests` digests are the snapshot's own — computed over the same
+/// bytes the composition was parsed from, never a second read. This is the
+/// hash-honesty half of the snapshot design: an event carrying these can
+/// truthfully claim "these bytes were in this window".
+pub fn composition_payload_from(
+    snap: &crate::snapshot::WorkspaceSnapshot,
+    root: &Path,
+) -> Result<serde_json::Value, ToolError> {
     let unreadable = |e: String| ToolError::new("composition_unreadable", e);
 
-    let composition = armillary_composition::parse_workspace(root)
-        .map_err(|e| unreadable(e.to_string()))?;
-
-    let mut manifests = Vec::new();
-    for name in MANIFEST_FILES {
-        if let Ok(bytes) = std::fs::read(root.join(name)) {
-            manifests.push(serde_json::json!({
-                "path": name,
-                "sha256": crate::hash::sha256_hex(&bytes),
-            }));
-        }
-    }
+    let composition = &snap.composition;
+    let manifests: Vec<serde_json::Value> = snap
+        .manifests
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "path": m.path,
+                "sha256": m.sha256,
+            })
+        })
+        .collect();
 
     // C-4: a protocol whose source is not present is reported absent, not an
     // error. Through the guard, not `root.join` — an absolute `source` would
@@ -589,7 +615,7 @@ pub fn composition_payload(root: &Path) -> Result<serde_json::Value, ToolError> 
         })
         .collect();
 
-    let mut body = serde_json::to_value(&composition).map_err(|e| unreadable(e.to_string()))?;
+    let mut body = serde_json::to_value(composition).map_err(|e| unreadable(e.to_string()))?;
     body["manifests"] = serde_json::json!(manifests);
     body["protocol_sources"] = serde_json::json!(protocol_sources);
     Ok(body)
@@ -1179,6 +1205,26 @@ mod tests {
             .expect("a bare clone is a working host, not a failure");
 
         assert!(!out.contains("tycho"), "{out}");
+    }
+
+    #[test]
+    fn the_composition_events_hashes_are_the_snapshots_own() {
+        // Hash honesty by construction: the digests the DD-1 event records
+        // are the snapshot's — computed over the same bytes the composition
+        // was parsed from, never a second read that could see different ones.
+        let dir = workspace();
+        let snap = crate::snapshot::WorkspaceSnapshot::load(dir.path()).unwrap();
+        let data = composition_event_data_from(&snap, dir.path()).unwrap();
+
+        let event_hashes: Vec<&str> = data["manifests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["sha256"].as_str().unwrap())
+            .collect();
+        let snap_hashes: Vec<&str> = snap.manifests.iter().map(|m| m.sha256.as_str()).collect();
+        assert!(!event_hashes.is_empty(), "the fixture writes a manifest");
+        assert_eq!(event_hashes, snap_hashes);
     }
 
     #[test]

@@ -223,26 +223,24 @@ async fn weigh_boot_file(root: &std::path::Path, rel: &str) -> Option<serde_json
 /// accept. That function is NOT a full path guard — see its own docs and
 /// `guard.rs`'s TRIPWIRE — which is why `weigh_boot_file` refuses absolute
 /// paths itself. These paths come from a manifest, never from a client.
-async fn append_boot_event(state: &SharedState, stream: &str, operator: Option<&str>) {
+async fn append_boot_event(
+    state: &SharedState,
+    stream: &str,
+    operator: Option<&str>,
+    snap: Option<&crate::snapshot::WorkspaceSnapshot>,
+) {
     let mut declared: Vec<String> = Vec::new();
     if let Some(rel) = state.boot.as_deref() {
         declared.push(rel.to_string());
     }
 
-    if let Some(name) = operator {
-        let root = state.root.clone();
-        // A second parse of the manifests, alongside the composition event's.
-        // Two small reads; sharing one parse would mean threading a
-        // `Composition` through both writers for a race the composition's own
-        // per-turn drift check already catches.
-        if let Ok(composition) =
-            tokio::task::spawn_blocking(move || armillary_composition::parse_workspace(&root)).await
-        {
-            if let Ok(op) = composition
-                .map(|c| c.operators.into_iter().find(|o| o.name == name))
-            {
-                declared.extend(op.and_then(|o| o.boot).unwrap_or_default());
-            }
+    // The same snapshot the composition event records — one read at create,
+    // so the two records cannot disagree about which manifests they saw.
+    // `None` (an unloadable manifest) skips the operator's boot list, which
+    // is what the old parse-failure path did too.
+    if let (Some(name), Some(snap)) = (operator, snap) {
+        if let Some(op) = snap.composition.operators.iter().find(|o| o.name == name) {
+            declared.extend(op.boot.clone().unwrap_or_default());
         }
     }
 
@@ -307,15 +305,33 @@ pub(crate) async fn append_composition_event(
     state: &SharedState,
     stream: &str,
 ) -> Result<(), &'static str> {
+    // A FRESH snapshot, deliberately: this signature's remaining caller is
+    // the loop's drift repair, whose whole job is recording current state.
     let root = state.root.clone();
-    let data = match tokio::task::spawn_blocking(move || crate::tools::composition_event_data(&root))
-        .await
+    let snap = match tokio::task::spawn_blocking(move || {
+        crate::snapshot::WorkspaceSnapshot::load(&root)
+    })
+    .await
     {
-        Ok(Ok(data)) => data,
+        Ok(Ok(snap)) => snap,
+        _ => return Err("composition_unreadable"),
+    };
+    append_composition_event_from(state, stream, &snap).await
+}
+
+/// `append_composition_event` over an already-loaded snapshot — the create
+/// path shares one snapshot between this and the boot event.
+pub(crate) async fn append_composition_event_from(
+    state: &SharedState,
+    stream: &str,
+    snap: &crate::snapshot::WorkspaceSnapshot,
+) -> Result<(), &'static str> {
+    let data = match crate::tools::composition_event_data_from(snap, &state.root) {
+        Ok(data) => data,
         // Presence-gated (C-4): a workspace whose manifests will not parse is a
         // misconfiguration, not a reason to refuse a session. A bare clone
         // parses to "nothing composed", which is a true and useful answer.
-        _ => return Err("composition_unreadable"),
+        Err(_) => return Err("composition_unreadable"),
     };
 
     let sessions = state.sessions.clone();
@@ -384,15 +400,31 @@ pub async fn create(
     // gated on `state.boot` alone — an operator can declare a boot where the
     // router declares none. The function itself is presence-gated and returns
     // without writing when nothing is declared either way.
-    append_boot_event(&state, &id, operator_name.as_deref()).await;
+    // ONE snapshot for both records below: the boot event's operator lookup
+    // and the composition event's digests derive from the same read, so the
+    // race the old second parse accepted is gone rather than tolerated.
+    let snap_root = state.root.clone();
+    let snap = tokio::task::spawn_blocking(move || {
+        crate::snapshot::WorkspaceSnapshot::load(&snap_root)
+    })
+    .await
+    .ok()
+    .and_then(|r| r.ok());
+
+    append_boot_event(&state, &id, operator_name.as_deref(), snap.as_ref()).await;
 
     // DD-1, and after boot for the same reason boot comes after
     // instance_created: the earlier events' seq numbers are documented and
     // referenced, and there is no reason to renumber them. Skip-never-fail —
     // a workspace whose manifests will not parse still gets a session, it just
     // gets one that has to read them with a tool.
-    if let Err(code) = append_composition_event(&state, &id).await {
-        eprintln!("warning: no composition event for {id} ({code})");
+    match &snap {
+        Some(snap) => {
+            if let Err(code) = append_composition_event_from(&state, &id, snap).await {
+                eprintln!("warning: no composition event for {id} ({code})");
+            }
+        }
+        None => eprintln!("warning: no composition event for {id} (composition_unreadable)"),
     }
 
     // last_seq stays ev.seq (1, from instance_created) even when a boot event
