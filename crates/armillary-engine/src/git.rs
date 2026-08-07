@@ -87,12 +87,7 @@ pub async fn run_git(
     args: &[&str],
     timeout: Duration,
 ) -> Result<GitOutput, GitError> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
+    let mut cmd = git_command(repo, args);
 
     match tokio::time::timeout(timeout, cmd.output()).await {
         Err(_) => Err(GitError::Timeout),
@@ -103,6 +98,25 @@ pub async fn run_git(
             stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
         }),
     }
+}
+
+/// The one place a git subprocess is assembled.
+///
+/// `LC_ALL=C` is load-bearing, not hygiene: `push_action_error`'s three-way
+/// stderr classification and the rev-parse discriminator key on git's English
+/// words, and a localized git translates them — the substring match then
+/// silently degrades every rejection to `"transport"`. The C locale pins the
+/// words the classifiers stand on. (Survey 2026-08-06, weakness #1; only the
+/// test fixture isolated env before this.)
+fn git_command(repo: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    cmd
 }
 
 /// True when the working tree has anything uncommitted, **including untracked
@@ -731,6 +745,19 @@ mod tests {
         advance_remote, commit, corrupt_head_object, git_sync, remote_and_clone,
         stale_linked_worktree,
     };
+
+    #[test]
+    fn the_command_builder_pins_the_c_locale() {
+        // push_action_error and the rev-parse discriminator read git's words;
+        // a localized git translates them and classification silently degrades
+        // to "transport". The env pin is what the classifiers stand on.
+        let cmd = git_command(Path::new("/tmp"), &["status"]);
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        assert!(
+            envs.contains(&(std::ffi::OsStr::new("LC_ALL"), Some(std::ffi::OsStr::new("C")))),
+            "{envs:?}"
+        );
+    }
 
     #[tokio::test]
     async fn run_git_reports_stdout_and_a_zero_code() {

@@ -344,6 +344,27 @@ async fn pull_on_a_diverged_branch_reports_not_fast_forwardable() {
 }
 
 #[tokio::test]
+async fn pull_under_a_gone_upstream_reports_not_fast_forwardable_naming_the_upstream() {
+    // The previously unpinned arm (survey 2026-08-06, weakness #3): the
+    // remote branch is deleted and pruned, `@{u}` no longer resolves, and the
+    // merge fails before it begins. The kind stays in the closed vocabulary —
+    // "not-fast-forwardable" is what a shipped client can already render.
+    // Measured writing this test: git's own message is the cryptic
+    // "merge: @{u} - not something we can merge" (C locale), naming nothing —
+    // so the HUMAN-readable half of the answer is the same response's
+    // read-side `position`, which discriminates upstream-gone and names the
+    // branch. The pin is the response as a whole, not the message.
+    let (root, remote) = live_workspace_with_sync();
+    git_sync(&remote, &["branch", "-m", "main", "elsewhere"]);
+    git_sync(&root.join("repos/jianyi"), &["fetch", "--prune"]);
+    let body = post_json(&root, "/repos/jianyi/pull").await;
+
+    assert_eq!(body["action_error"]["kind"], "not-fast-forwardable");
+    assert_eq!(body["position"]["kind"], "upstream-gone");
+    assert_eq!(body["position"]["upstream"], "origin/main");
+}
+
+#[tokio::test]
 async fn push_is_403_when_only_sync_is_granted() {
     let (root, _remote) = live_workspace_with_sync(); // sync = true, no push key
     assert_eq!(post_status(&root, "/repos/jianyi/push").await, 403);
