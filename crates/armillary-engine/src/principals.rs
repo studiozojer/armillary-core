@@ -256,9 +256,8 @@ mod tests {
 
     #[test]
     fn two_minted_tokens_differ() {
-        // Guards the one mistake that would silently destroy the whole
-        // scheme: a seeded or constant RNG. Not a probabilistic test — a
-        // collision here means the source is not the OS CSPRNG.
+        // Guards a fresh-per-call seeded generator mistake (e.g., rng = StdRng::seed_from_u64(x)
+        // reseeded identically each call). OsRng is confirmed by reading the code, not by this test.
         assert_ne!(mint_token(), mint_token());
     }
 
@@ -291,5 +290,74 @@ mod tests {
         // directly instead of hashing it first — which would make the
         // registry file itself the credential.
         assert!(reg.authenticate("sha256:aaaa").is_none());
+    }
+
+    #[test]
+    fn two_principals_each_token_resolves_to_its_own_name() {
+        // Closes Critical 1 and Critical 2: a_token_authenticates_as_its_own_principal
+        // is a tautology over whatever hash_token does, and all positive assertions
+        // run against a one-principal registry. This test builds two principals with
+        // two different minted tokens and asserts each token authenticates as *that*
+        // principal by name.
+        let dir = tempfile::tempdir().unwrap();
+        let token1 = mint_token();
+        let token2 = mint_token();
+
+        std::fs::write(
+            dir.path().join("iphone.toml"),
+            format!(
+                "name = \"iphone\"\ntoken_hash = \"{}\"\ngrants = [\"sync\"]\nminted = \"2026-08-07T00:00:00Z\"\n",
+                hash_token(&token1)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("ipad.toml"),
+            format!(
+                "name = \"ipad\"\ntoken_hash = \"{}\"\ngrants = [\"sync\"]\nminted = \"2026-08-07T00:00:00Z\"\n",
+                hash_token(&token2)
+            ),
+        )
+        .unwrap();
+
+        let reg = Registry::load(dir.path());
+        let iphone = reg.authenticate(&token1).expect("token1 must authenticate");
+        assert_eq!(iphone.name, "iphone", "token1 resolves to iphone");
+
+        let ipad = reg.authenticate(&token2).expect("token2 must authenticate");
+        assert_eq!(ipad.name, "ipad", "token2 resolves to ipad");
+    }
+
+    #[test]
+    fn hash_token_contract_is_enforced() {
+        // Closes Important 3: the sha256: prefix is unpinned. Asserts the contract
+        // directly, not through authenticate. The key assertion is that different
+        // inputs produce different hashes — breaking the tautology of the original test.
+        let h1 = hash_token("token1");
+        let h2 = hash_token("token2");
+
+        assert!(h1.starts_with("sha256:"), "hash must start with sha256:");
+        assert_eq!(h1.len(), 71, "7 chars (sha256:) + 64 chars hex = 71");
+        assert_ne!(h1, h2, "different inputs produce different hashes");
+    }
+
+    #[test]
+    fn empty_token_with_stored_empty_hash_rejects_empty_credential() {
+        // Closes Important 4: the empty-token guard has no test that can see it.
+        // A fixture storing hash_token("") represents a plausible enrollment bug.
+        // Without the guard, authenticate("") would authenticate as that principal.
+        let dir = tempfile::tempdir().unwrap();
+        let empty_hash = hash_token("");
+        std::fs::write(
+            dir.path().join("broken.toml"),
+            format!(
+                "name = \"broken\"\ntoken_hash = \"{}\"\ngrants = [\"sync\"]\nminted = \"2026-08-07T00:00:00Z\"\n",
+                empty_hash
+            ),
+        )
+        .unwrap();
+
+        let reg = Registry::load(dir.path());
+        assert!(reg.authenticate("").is_none(), "empty credential must not authenticate, even against hash of empty token");
     }
 }
