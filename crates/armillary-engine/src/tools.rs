@@ -90,7 +90,7 @@ impl From<crate::guard::GuardError> for ToolError {
 /// drift apart per-tool. Ratified 2026-08-07 — an OpenAI-compat provider is
 /// next on the queue, and a registry that only spoke Anthropic would have
 /// moved this seam twice.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolDef {
     pub name: &'static str,
     pub description: String,
@@ -122,207 +122,294 @@ impl ToolDef {
     }
 }
 
-/// The tool definitions sent with every request.
+/// The switch a registry entry runs. A plain fn pointer: every body is sync
+/// (dispatch already runs under `spawn_blocking`), and a non-capturing
+/// closure coerces.
+type RunFn = fn(&serde_json::Value, &ToolCtx) -> Result<ToolOutcome, ToolError>;
+
+/// One tool: its def and its switch, in one place.
 ///
-/// Order is fixed and deliberate. Tool definitions render at the front of the
-/// prompt, ahead of the system prompt and messages, so a set that reorders
-/// between requests invalidates the whole cached prefix. It costs nothing to
-/// fix that now with one tool and is awkward to retrofit later.
-pub fn definitions() -> Vec<serde_json::Value> {
-    vec![
-        serde_json::json!({
-            "name": "get_composition",
-            "description": "Return what this workspace is composed of: the operators, \
-                            the commons, the repos, and the protocols declared in its \
-                            manifests, along with which protocol sources are actually \
-                            present on disk. Call this to find out what exists before \
-                            reasoning about it — the answer is derived from the \
-                            manifest files, not from memory.",
-            "input_schema": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-        }),
-        serde_json::json!({
-            "name": "list_directory",
-            "description": "List the entries of one directory in the workspace. \
-                            Directories are marked with a trailing slash. Paths are \
-                            relative to the workspace root; pass an empty string for \
-                            the root itself. Credentials and build output are never \
-                            listed. Use this to find out what is there before reading \
-                            a file.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Directory path relative to the workspace root; \
-                                        \"\" for the root.",
-                    },
+/// This registry is the join `dispatch`'s old string-match and the
+/// `definitions()` list used to hold between them by convention. A new tool
+/// is one appended entry here — the definition, the dispatch arm, and the
+/// position in the offered set cannot disagree because they are one row.
+pub struct Tool {
+    pub def: ToolDef,
+    run: RunFn,
+}
+
+/// The tool registry, in offer order.
+///
+/// Order is fixed and deliberate. Tool definitions render at the front of
+/// the prompt, ahead of the system prompt and messages, so a set that
+/// reorders between requests invalidates the whole cached prefix.
+/// E-4: new entries APPEND — the seven below keep their positions, and the
+/// git verbs land after `edit_file`, never interleaved.
+pub fn registry() -> &'static [Tool] {
+    static REGISTRY: std::sync::OnceLock<Vec<Tool>> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        vec![
+            Tool {
+                def: ToolDef {
+                    name: "get_composition",
+                    description: "Return what this workspace is composed of: the operators, \
+                                  the commons, the repos, and the protocols declared in its \
+                                  manifests, along with which protocol sources are actually \
+                                  present on disk. Call this to find out what exists before \
+                                  reasoning about it — the answer is derived from the \
+                                  manifest files, not from memory."
+                        .to_string(),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                    }),
                 },
-                "required": ["path"],
+                run: |_input, ctx| get_composition(ctx.root.as_path()).map(ToolOutcome::text),
             },
-        }),
-        serde_json::json!({
-            "name": "read_file",
-            "description": "Read a page of one text file in the workspace, with line \
-                            numbers so you can cite what you read. Paths are relative \
-                            to the workspace root. Reads are paginated: if the page \
-                            ends before the file does, the result says so and gives \
-                            the offset to continue from. No file is too large to \
-                            read — it is only too large to read at once.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path relative to the workspace root.",
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "description": "1-based line number to start at. Defaults to 1.",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": format!(
-                            "How many lines to read. Defaults to {DEFAULT_LINES}, \
-                             capped at {MAX_LINES}."
-                        ),
-                    },
+            Tool {
+                def: ToolDef {
+                    name: "list_directory",
+                    description: "List the entries of one directory in the workspace. \
+                                  Directories are marked with a trailing slash. Paths are \
+                                  relative to the workspace root; pass an empty string for \
+                                  the root itself. Credentials and build output are never \
+                                  listed. Use this to find out what is there before reading \
+                                  a file."
+                        .to_string(),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Directory path relative to the workspace root; \
+                                                \"\" for the root.",
+                            },
+                        },
+                        "required": ["path"],
+                    }),
                 },
-                "required": ["path"],
-            },
-        }),
-        serde_json::json!({
-            "name": "find_files",
-            "description": "Find files by a glob pattern over their path, e.g. \
-                            \"**/2026-07-30-*\" or \"operators/**/*.md\". Lists files \
-                            of any type, including ones `search` cannot read. Covers \
-                            the modules this workspace declares: content the manifest \
-                            does not declare (reference clones under repos/external/, \
-                            for one) is not covered unless you name it with `path`. \
-                            Credentials, build and dependency trees (node_modules, \
-                            target, .build), git worktrees and the engine's own \
-                            .armillary are never listed, at any path — naming one is \
-                            refused rather than widening the search. Use this when you \
-                            know roughly what a file is called and not where it is.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "A glob matched against the workspace-relative path.",
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Optional. Restrict the search to this directory, \
-                                        which may be outside the composed modules.",
-                    },
+                run: |input, ctx| {
+                    list_directory(
+                        ctx.root.as_path(),
+                        required_str(input, "path", "list_directory")?,
+                    )
+                    .map(ToolOutcome::text)
                 },
-                "required": ["pattern"],
             },
-        }),
-        serde_json::json!({
-            "name": "search",
-            "description": "Search the contents of this workspace's files for a \
-                            regular expression, returning each matching line with \
-                            its path and line number. A plain string is a valid \
-                            regex. Searches the modules this workspace declares: \
-                            content the manifest does not declare (reference clones \
-                            under repos/external/, for one) is not searched unless you \
-                            name it with `path`. Credentials, build and dependency \
-                            trees (node_modules, target, .build), git worktrees and the \
-                            engine's own .armillary are never searched, at any path — \
-                            naming one is refused rather than widening the search. Only \
-                            text file types are read; `find_files` will still list the \
-                            rest. Long lines are windowed around the match. Use this to \
-                            find out where something is said before reading the file \
-                            that says it.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "A regular expression. A literal string works.",
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Optional. Restrict the search to this directory, \
-                                        which may be outside the composed modules.",
-                    },
-                    "case_sensitive": {
-                        "type": "boolean",
-                        "description": "Optional. Defaults to false.",
-                    },
+            Tool {
+                def: ToolDef {
+                    name: "read_file",
+                    description: "Read a page of one text file in the workspace, with line \
+                                  numbers so you can cite what you read. Paths are relative \
+                                  to the workspace root. Reads are paginated: if the page \
+                                  ends before the file does, the result says so and gives \
+                                  the offset to continue from. No file is too large to \
+                                  read — it is only too large to read at once."
+                        .to_string(),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "File path relative to the workspace root.",
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "description": "1-based line number to start at. Defaults to 1.",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": format!(
+                                    "How many lines to read. Defaults to {DEFAULT_LINES}, \
+                                     capped at {MAX_LINES}."
+                                ),
+                            },
+                        },
+                        "required": ["path"],
+                    }),
                 },
-                "required": ["query"],
-            },
-        }),
-        // E-4: new definitions APPEND. The five above keep their positions or
-        // the cached prompt prefix through them is invalidated — and a parallel
-        // window is adding git verbs to this same list, so whichever merges
-        // second appends after, never interleaves.
-        serde_json::json!({
-            "name": "write_file",
-            "description": format!(
-                "Create a file, or replace an existing file's contents entirely. The \
-                 path is relative to the workspace root, and missing parent \
-                 directories are created and named in the result. Writes land on real \
-                 files in the real checkout, immediately. ALWAYS prefer editing an \
-                 existing file with `edit_file` over rewriting it with this — a full \
-                 rewrite of a file you only meant to change part of is the most \
-                 expensive mistake this tool can make. `read_file` cuts any line over \
-                 {MAX_LINE_BYTES} bytes and marks it `{TRUNCATION_MARKER}`: NEVER \
-                 write back content carrying that marker, it is display text and the \
-                 cut bytes are gone."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Workspace-relative path.",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The file's complete new contents.",
-                    },
+                run: |input, ctx| {
+                    read_page(
+                        ctx.root.as_path(),
+                        required_str(input, "path", "read_file")?,
+                        optional_usize(input, "offset", 1)?,
+                        optional_usize(input, "limit", DEFAULT_LINES)?,
+                    )
+                    .map(ToolOutcome::text)
                 },
-                "required": ["path", "content"],
             },
-        }),
-        serde_json::json!({
-            "name": "edit_file",
-            "description": "Replace an exact string in an existing file. `old_string` \
-                            must appear EXACTLY ONCE — include surrounding lines until \
-                            it is unique. Whitespace and indentation are significant. \
-                            Read the file first, and send the file's own text WITHOUT \
-                            read_file's line-number prefixes: the \"   12\\t\" at the \
-                            start of each line is display formatting, not file content, \
-                            and it is the most common reason an edit finds nothing. \
-                            This never creates a file — use `write_file` for that. \
-                            ALWAYS prefer this over rewriting a whole file.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Workspace-relative path to an existing file.",
-                    },
-                    "old_string": {
-                        "type": "string",
-                        "description": "Exact text to replace. Must appear exactly once in the file.",
-                    },
-                    "new_string": {
-                        "type": "string",
-                        "description": "Text to put in its place.",
-                    },
+            Tool {
+                def: ToolDef {
+                    name: "find_files",
+                    description: "Find files by a glob pattern over their path, e.g. \
+                                  \"**/2026-07-30-*\" or \"operators/**/*.md\". Lists files \
+                                  of any type, including ones `search` cannot read. Covers \
+                                  the modules this workspace declares: content the manifest \
+                                  does not declare (reference clones under repos/external/, \
+                                  for one) is not covered unless you name it with `path`. \
+                                  Credentials, build and dependency trees (node_modules, \
+                                  target, .build), git worktrees and the engine's own \
+                                  .armillary are never listed, at any path — naming one is \
+                                  refused rather than widening the search. Use this when you \
+                                  know roughly what a file is called and not where it is."
+                        .to_string(),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "pattern": {
+                                "type": "string",
+                                "description": "A glob matched against the workspace-relative path.",
+                            },
+                            "path": {
+                                "type": "string",
+                                "description": "Optional. Restrict the search to this directory, \
+                                                which may be outside the composed modules.",
+                            },
+                        },
+                        "required": ["pattern"],
+                    }),
                 },
-                "required": ["path", "old_string", "new_string"],
+                run: |input, ctx| {
+                    crate::search::find_files(
+                        ctx.root.as_path(),
+                        required_str(input, "pattern", "find_files")?,
+                        optional_str(input, "path"),
+                    )
+                    .map(ToolOutcome::text)
+                },
             },
-        }),
-    ]
+            Tool {
+                def: ToolDef {
+                    name: "search",
+                    description: "Search the contents of this workspace's files for a \
+                                  regular expression, returning each matching line with \
+                                  its path and line number. A plain string is a valid \
+                                  regex. Searches the modules this workspace declares: \
+                                  content the manifest does not declare (reference clones \
+                                  under repos/external/, for one) is not searched unless you \
+                                  name it with `path`. Credentials, build and dependency \
+                                  trees (node_modules, target, .build), git worktrees and the \
+                                  engine's own .armillary are never searched, at any path — \
+                                  naming one is refused rather than widening the search. Only \
+                                  text file types are read; `find_files` will still list the \
+                                  rest. Long lines are windowed around the match. Use this to \
+                                  find out where something is said before reading the file \
+                                  that says it."
+                        .to_string(),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "A regular expression. A literal string works.",
+                            },
+                            "path": {
+                                "type": "string",
+                                "description": "Optional. Restrict the search to this directory, \
+                                                which may be outside the composed modules.",
+                            },
+                            "case_sensitive": {
+                                "type": "boolean",
+                                "description": "Optional. Defaults to false.",
+                            },
+                        },
+                        "required": ["query"],
+                    }),
+                },
+                run: |input, ctx| {
+                    crate::search::search(
+                        ctx.root.as_path(),
+                        required_str(input, "query", "search")?,
+                        optional_str(input, "path"),
+                        input.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false),
+                    )
+                    .map(ToolOutcome::text)
+                },
+            },
+            Tool {
+                def: ToolDef {
+                    name: "write_file",
+                    description: format!(
+                        "Create a file, or replace an existing file's contents entirely. The \
+                         path is relative to the workspace root, and missing parent \
+                         directories are created and named in the result. Writes land on real \
+                         files in the real checkout, immediately. ALWAYS prefer editing an \
+                         existing file with `edit_file` over rewriting it with this — a full \
+                         rewrite of a file you only meant to change part of is the most \
+                         expensive mistake this tool can make. `read_file` cuts any line over \
+                         {MAX_LINE_BYTES} bytes and marks it `{TRUNCATION_MARKER}`: NEVER \
+                         write back content carrying that marker, it is display text and the \
+                         cut bytes are gone."
+                    ),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Workspace-relative path.",
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "The file's complete new contents.",
+                            },
+                        },
+                        "required": ["path", "content"],
+                    }),
+                },
+                // Returns a `ToolOutcome` directly — no `.map(ToolOutcome::text)`,
+                // because a write is the one verb with effects to describe.
+                run: |input, ctx| {
+                    crate::write::write_file(
+                        ctx,
+                        required_str(input, "path", "write_file")?,
+                        required_str(input, "content", "write_file")?,
+                    )
+                },
+            },
+            Tool {
+                def: ToolDef {
+                    name: "edit_file",
+                    description: "Replace an exact string in an existing file. `old_string` \
+                                  must appear EXACTLY ONCE — include surrounding lines until \
+                                  it is unique. Whitespace and indentation are significant. \
+                                  Read the file first, and send the file's own text WITHOUT \
+                                  read_file's line-number prefixes: the \"   12\\t\" at the \
+                                  start of each line is display formatting, not file content, \
+                                  and it is the most common reason an edit finds nothing. \
+                                  This never creates a file — use `write_file` for that. \
+                                  ALWAYS prefer this over rewriting a whole file."
+                        .to_string(),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Workspace-relative path to an existing file.",
+                            },
+                            "old_string": {
+                                "type": "string",
+                                "description": "Exact text to replace. Must appear exactly once in the file.",
+                            },
+                            "new_string": {
+                                "type": "string",
+                                "description": "Text to put in its place.",
+                            },
+                        },
+                        "required": ["path", "old_string", "new_string"],
+                    }),
+                },
+                run: |input, ctx| {
+                    crate::write::edit_file(
+                        ctx,
+                        required_str(input, "path", "edit_file")?,
+                        required_str(input, "old_string", "edit_file")?,
+                        required_str(input, "new_string", "edit_file")?,
+                    )
+                },
+            },
+        ]
+    })
 }
 
 /// What a tool body is allowed to know about the session it runs in.
@@ -403,48 +490,11 @@ pub fn dispatch(
     input: &serde_json::Value,
     ctx: &ToolCtx,
 ) -> Result<ToolOutcome, ToolError> {
-    let root = ctx.root.as_path();
-    match name {
-        "get_composition" => get_composition(root).map(ToolOutcome::text),
-        "list_directory" => {
-            list_directory(root, required_str(input, "path", name)?).map(ToolOutcome::text)
-        }
-        "read_file" => read_page(
-            root,
-            required_str(input, "path", name)?,
-            optional_usize(input, "offset", 1)?,
-            optional_usize(input, "limit", DEFAULT_LINES)?,
-        )
-        .map(ToolOutcome::text),
-        "find_files" => crate::search::find_files(
-            root,
-            required_str(input, "pattern", name)?,
-            optional_str(input, "path"),
-        )
-        .map(ToolOutcome::text),
-        "search" => crate::search::search(
-            root,
-            required_str(input, "query", name)?,
-            optional_str(input, "path"),
-            input.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false),
-        )
-        .map(ToolOutcome::text),
-        // Returns a `ToolOutcome` directly — no `.map(ToolOutcome::text)`,
-        // because a write is the one verb with effects to describe.
-        "write_file" => crate::write::write_file(
-            ctx,
-            required_str(input, "path", name)?,
-            required_str(input, "content", name)?,
-        ),
-        "edit_file" => crate::write::edit_file(
-            ctx,
-            required_str(input, "path", name)?,
-            required_str(input, "old_string", name)?,
-            required_str(input, "new_string", name)?,
-        ),
-        other => Err(ToolError::new(
+    match registry().iter().find(|t| t.def.name == name) {
+        Some(tool) => (tool.run)(input, ctx),
+        None => Err(ToolError::new(
             "unknown_tool",
-            format!("no tool named {other}"),
+            format!("no tool named {name}"),
         )),
     }
 }
@@ -1144,9 +1194,8 @@ mod tests {
     }
 
     #[test]
-    fn the_definition_set_is_ordered_and_schema_shaped() {
-        let defs = definitions();
-        let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
+    fn the_registry_is_ordered_and_schema_shaped() {
+        let names: Vec<&str> = registry().iter().map(|t| t.def.name).collect();
 
         // Order is part of the cached prefix, so it is pinned rather than
         // incidental.
@@ -1157,13 +1206,29 @@ mod tests {
                 "search", "write_file", "edit_file"
             ]
         );
-        for d in &defs {
-            assert_eq!(d["input_schema"]["type"], "object");
+        for t in registry() {
+            assert_eq!(t.def.schema["type"], "object");
             assert!(
-                d["description"].as_str().unwrap().len() > 40,
-                "the description is what decides whether a model calls it: {d}"
+                t.def.description.len() > 40,
+                "the description is what decides whether a model calls it: {}",
+                t.def.name
             );
         }
+    }
+
+    #[test]
+    fn the_anthropic_projection_is_identical_to_the_pre_registry_definitions() {
+        // The golden was captured from the definitions() list BEFORE the
+        // registry existed and is never regenerated: this test proves the
+        // migration inert on the wire rather than asserting it.
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/goldens/tool_definitions_anthropic.json"))
+                .unwrap();
+        let projected = serde_json::Value::Array(
+            registry().iter().map(|t| t.def.anthropic_definition()).collect(),
+        );
+
+        assert_eq!(projected, golden);
     }
 
     // ---- list_directory ----

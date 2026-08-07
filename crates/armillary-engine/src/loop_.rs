@@ -352,17 +352,13 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
         // mid-investigation. Measured: accepted on this engine's model with
         // adaptive thinking on.
         let at_bound = round >= MAX_ROUNDS || stalled >= MAX_STALLED_ROUNDS;
-        let offered: Vec<serde_json::Value> = if at_bound {
+        let offered: Vec<crate::tools::ToolDef> = if at_bound {
             Vec::new()
         } else {
-            crate::tools::definitions()
-                .into_iter()
-                .filter(|d| {
-                    d.get("name")
-                        .and_then(|n| n.as_str())
-                        .map(|n| !failed_tools.contains(n))
-                        .unwrap_or(true)
-                })
+            crate::tools::registry()
+                .iter()
+                .filter(|t| !failed_tools.contains(t.def.name))
+                .map(|t| t.def.clone())
                 .collect()
         };
         let force_text = at_bound || offered.is_empty();
