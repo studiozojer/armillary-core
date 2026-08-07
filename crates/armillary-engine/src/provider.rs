@@ -91,6 +91,15 @@ pub enum ProviderError {
     NoApiKey,
 }
 
+/// A constraint on what the model may do this round, dialect-neutral: each
+/// provider projects it to its own wire shape. One variant today — the loop's
+/// at-bound "answer in prose" — and adding one later forces every projection
+/// to choose, which is the point of the enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolChoice {
+    ForceText,
+}
+
 /// One request to the provider: what the model sees, plus what it may do.
 ///
 /// `turn` is the projection's output and nothing else — P-4's flattened shape.
@@ -105,10 +114,11 @@ pub struct TurnRequest {
     /// render at the very front of the prompt, so a set that changes between
     /// requests invalidates the whole cached prefix — keep the order fixed.
     pub tools: Vec<crate::tools::ToolDef>,
-    /// `{"type":"none"}` at a bound to force text; `{"type":"tool","name":…}` to
-    /// compel a specific call. Measured: both are accepted on `claude-sonnet-5`
-    /// with adaptive thinking on, which is this engine's default.
-    pub tool_choice: Option<serde_json::Value>,
+    /// `ToolChoice::ForceText` at a bound to force prose. Dialect-neutral —
+    /// the Anthropic projection is `{"type":"none"}`, measured accepted on
+    /// `claude-sonnet-5` with adaptive thinking on, which is this engine's
+    /// default.
+    pub tool_choice: Option<ToolChoice>,
 }
 
 impl TurnRequest {
@@ -501,7 +511,9 @@ fn build_request_body(model: &str, req: &TurnRequest) -> serde_json::Value {
         body["tools"] = serde_json::json!(tools);
     }
     if let Some(choice) = &req.tool_choice {
-        body["tool_choice"] = choice.clone();
+        body["tool_choice"] = match choice {
+            ToolChoice::ForceText => serde_json::json!({ "type": "none" }),
+        };
     }
     body
 }
@@ -1418,6 +1430,23 @@ mod tests {
         let err = provider.run_turn(empty_turn(), tx, cancel_rx).await.unwrap_err();
 
         assert_eq!(err, ProviderError::NoApiKey);
+    }
+
+    #[test]
+    fn force_text_projects_to_the_anthropic_none_shape() {
+        // The neutral enum must land on the wire as the exact bytes the loop
+        // used to hand-build — measured accepted on claude-sonnet-5 with
+        // adaptive thinking on.
+        let turn = ModelTurn {
+            system: None,
+            messages: vec![text_msg(ProviderRole::User, "hi")],
+        };
+        let body = build_request_body(
+            "m",
+            &TurnRequest { turn, tools: Vec::new(), tool_choice: Some(ToolChoice::ForceText) },
+        );
+
+        assert_eq!(body["tool_choice"], serde_json::json!({ "type": "none" }));
     }
 
     #[test]
