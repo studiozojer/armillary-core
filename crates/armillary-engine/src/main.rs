@@ -1,6 +1,7 @@
 use armillary_engine::{
     app,
     log::store::LogStore,
+    models,
     provider::{KeyedProviders, ProviderFor},
     sessions::Sessions,
     state::{AppState, ModelConfig},
@@ -211,17 +212,6 @@ fn default_zen_key_file() -> PathBuf {
         .join(".config/armillary/zen-key")
 }
 
-/// The host model catalog's home, beside the key files. Task 4 introduces
-/// `models::load` and a real `models::default_path()` that this literal
-/// mirrors; until that module exists, `AppState.models_path` still needs a
-/// value (it is unread until Task 4 — see `state.rs`'s field doc), and
-/// duplicating the one-line path here is cheaper than blocking this task on
-/// a module Task 4 owns.
-fn default_models_file() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-        .join(".config/armillary/models.toml")
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -292,13 +282,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let sessions = Arc::new(Sessions::new(store));
 
-    // `--model` absent falls back to this literal — unchanged by Task 3,
-    // which gives the INSTANCE's own recorded model precedence over this
-    // default per turn (`loop_::run_turn`, not here). `models.toml`'s own
-    // default slots into this `.unwrap_or_else` in Task 4, once
-    // `models::declared_default` exists; until then this stays exactly what
-    // clap's `default_value` used to produce.
-    let model_str = args.model.clone().unwrap_or_else(|| "claude-sonnet-5".to_string());
+    // `--model` wins if passed; otherwise `models.toml`'s own `default`
+    // (Task 4's `models::declared_default`); otherwise this literal, exactly
+    // what clap's `default_value` used to produce. Unchanged by Task 3, which
+    // gives the INSTANCE's own recorded model precedence over this default
+    // per turn (`loop_::run_turn`, not here) — this is only the process-wide
+    // fallback for an instance that names none.
+    let model_str = args
+        .model
+        .clone()
+        .or_else(models::declared_default)
+        .unwrap_or_else(|| "claude-sonnet-5".to_string());
 
     // Never a flag, never logged — see `resolve_api_key`'s doc for the
     // env-then-file priority. BOTH keys, not just the configured model's —
@@ -356,7 +350,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // start.
     let providers: Arc<dyn ProviderFor> = Arc::new(KeyedProviders { anthropic_key, zen_key });
 
-    let models_path = default_models_file();
+    let models_path = models::default_path();
 
     let addr = SocketAddr::new(args.bind, args.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;

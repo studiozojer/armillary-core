@@ -15,6 +15,7 @@ pub mod guard;
 pub mod hash;
 pub mod loop_;
 pub mod log;
+pub mod models;
 pub mod projection;
 pub mod provider;
 pub mod provider_openai;
@@ -41,6 +42,7 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(routes::health::health))
         .route("/composition", get(routes::composition::composition))
+        .route("/models", get(routes::models::models))
         .route("/tree", get(routes::tree::tree))
         .route("/file", get(routes::file::file))
         .route("/voicenotes", get(routes::voicenotes::voicenotes))

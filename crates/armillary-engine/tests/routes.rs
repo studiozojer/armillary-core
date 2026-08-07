@@ -9,7 +9,7 @@ use armillary_engine::{
 };
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -937,4 +937,74 @@ async fn create_without_a_model_is_accepted_and_reports_none() {
         post_json(router, "/instances", serde_json::json!({ "operator": "tycho" })).await;
     assert_eq!(status, StatusCode::CREATED);
     assert!(created["model"].is_null());
+}
+
+#[tokio::test]
+async fn models_reports_an_empty_catalog_rather_than_failing() {
+    // `app_over` already points `models_path` at `/nonexistent/models.toml` —
+    // a guaranteed-absent path, exactly "no models.toml anywhere".
+    let app = app_over(|_| {});
+
+    let response = app
+        .oneshot(Request::builder().uri("/models").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    // 200 with nothing in it, never a 500: a host that has not written the
+    // file is a working host, and the app's fallback depends on this.
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), ONE_MIB).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["models"].as_array().unwrap().len(), 0);
+}
+
+/// Like `app_over`, but differs only in the three fields Task 4 reads:
+/// `models_path` points at a REAL file (`app_over`'s literal is deliberately
+/// absent), and the two key-presence booleans are set explicitly rather than
+/// always `false` — the only way to exercise `usable` for both a keyed and a
+/// keyless provider in the same request.
+fn app_with_models(root: &Path, models_path: &Path, anthropic: bool, zen: bool) -> axum::Router {
+    let root = root.canonicalize().unwrap();
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let store = LogStore::open(&data_dir).unwrap();
+
+    app(AppState {
+        root,
+        sessions: Arc::new(Sessions::new(store)),
+        model: model_config(),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: models_path.to_path_buf(),
+        anthropic_key_present: anthropic,
+        zen_key_present: zen,
+        boot: None,
+    })
+}
+
+#[tokio::test]
+async fn a_model_whose_provider_has_no_key_is_reported_unusable() {
+    let dir = tempfile::tempdir().unwrap();
+    let models_path = dir.path().join("models.toml");
+    std::fs::write(
+        &models_path,
+        "[[model]]\nid = \"claude-sonnet-5\"\n\n[[model]]\nid = \"zen/deepseek-v4-flash\"\n",
+    )
+    .unwrap();
+    // A host with an Anthropic key and no Zen key.
+    let app = app_with_models(dir.path(), &models_path, true, false);
+
+    let response = app
+        .oneshot(Request::builder().uri("/models").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), ONE_MIB).await.unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(body["models"][0]["provider"], "anthropic");
+    assert_eq!(body["models"][0]["usable"], true);
+    assert_eq!(body["models"][1]["provider"], "zen");
+    assert_eq!(body["models"][1]["usable"], false);
 }
