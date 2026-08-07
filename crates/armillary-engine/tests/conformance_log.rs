@@ -26,7 +26,7 @@
 use armillary_engine::log::envelope::{Actor, Role};
 use armillary_engine::log::store::LogStore;
 use armillary_engine::loop_::run_turn;
-use armillary_engine::provider::ScriptedProvider;
+use armillary_engine::provider::{self, ScriptedProvider};
 use armillary_engine::sessions::{NewEvent, Sessions};
 use armillary_engine::state::{AppState, ModelConfig, SharedState};
 use std::{
@@ -193,7 +193,6 @@ fn every_fixture_event_validates_against_the_schema() {
 fn model_config() -> ModelConfig {
     ModelConfig {
         model: "scripted".to_string(),
-        api_key: None,
     }
 }
 
@@ -238,7 +237,10 @@ async fn every_event_a_scripted_turn_emits_validates_against_the_schema() {
         root: root.path().canonicalize().unwrap(),
         sessions: sessions.clone(),
         model: model_config(),
-        provider: Arc::new(ScriptedProvider::new(vec!["Hel", "Hello there"])),
+        providers: provider::fixed(Arc::new(ScriptedProvider::new(vec!["Hel", "Hello there"]))),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: None,
     });
 

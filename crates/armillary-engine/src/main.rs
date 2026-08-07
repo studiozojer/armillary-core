@@ -1,8 +1,7 @@
 use armillary_engine::{
     app,
     log::store::LogStore,
-    provider::{AnthropicProvider, KeylessProvider, ModelProvider},
-    provider_openai::OpenAiCompatProvider,
+    provider::{KeyedProviders, ProviderFor},
     sessions::Sessions,
     state::{AppState, ModelConfig},
 };
@@ -42,8 +41,10 @@ struct Args {
     /// or `~/.config/armillary/zen-key`); anything else is an Anthropic model
     /// name. The credential is never a flag (env or key file only, below) so
     /// it never lands in shell history or `ps`.
-    #[arg(long, default_value = "claude-sonnet-5")]
-    model: String,
+    ///
+    /// Absent, the default comes from `models.toml`, then `claude-sonnet-5`.
+    #[arg(long)]
+    model: Option<String>,
 }
 
 /// True when `addr` falls inside Tailscale's CGNAT IPv4 range
@@ -210,20 +211,15 @@ fn default_zen_key_file() -> PathBuf {
         .join(".config/armillary/zen-key")
 }
 
-/// Which provider a model string selects, and with what residue. Pure so the
-/// selection rule is testable without booting a server.
-enum ProviderChoice {
-    Anthropic,
-    Zen { slug: String },
-}
-
-fn choose_provider(model: &str) -> ProviderChoice {
-    match model.strip_prefix("zen/") {
-        Some(slug) => ProviderChoice::Zen {
-            slug: slug.to_string(),
-        },
-        None => ProviderChoice::Anthropic,
-    }
+/// The host model catalog's home, beside the key files. Task 4 introduces
+/// `models::load` and a real `models::default_path()` that this literal
+/// mirrors; until that module exists, `AppState.models_path` still needs a
+/// value (it is unread until Task 4 — see `state.rs`'s field doc), and
+/// duplicating the one-line path here is cheaper than blocking this task on
+/// a module Task 4 owns.
+fn default_models_file() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+        .join(".config/armillary/models.toml")
 }
 
 #[tokio::main]
@@ -296,68 +292,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let sessions = Arc::new(Sessions::new(store));
 
-    // Never a flag, never logged — see the struct doc on `ModelConfig` and
-    // `resolve_api_key`'s doc for the env-then-file priority. Which provider
-    // the model string selects is `choose_provider`'s rule: a `zen/` prefix
-    // routes to the OpenAI-compat client; anything else is Anthropic.
-    let (env_name, key_file) = match choose_provider(&args.model) {
-        ProviderChoice::Anthropic => ("ANTHROPIC_API_KEY", default_key_file()),
-        ProviderChoice::Zen { .. } => ("OPENCODE_ZEN_API_KEY", default_zen_key_file()),
-    };
-    let env_val = std::env::var(env_name).ok();
-    let env_present = env_val.as_deref().is_some_and(|v| !v.is_empty());
-    let api_key = resolve_api_key(env_val, &key_file);
+    // `--model` absent falls back to the pre-this-task literal default.
+    // Task 3 replaces this with the full precedence the doc comment on
+    // `Args.model` names (instance → flag → `models.toml` → this literal);
+    // this task changes no behaviour, so the fallback stays exactly what
+    // clap's `default_value` used to produce.
+    let model_str = args.model.clone().unwrap_or_else(|| "claude-sonnet-5".to_string());
+
+    // Never a flag, never logged — see `resolve_api_key`'s doc for the
+    // env-then-file priority. BOTH keys, not just the configured model's —
+    // an Anthropic instance and a Zen instance now coexist in one engine
+    // (design decision 1), so a key resolved lazily would be a key resolved
+    // never. Sources are named; values never are.
+    let anthropic_env = std::env::var("ANTHROPIC_API_KEY").ok();
+    let anthropic_key = resolve_api_key(anthropic_env, &default_key_file());
+    let zen_env = std::env::var("OPENCODE_ZEN_API_KEY").ok();
+    let zen_key = resolve_api_key(zen_env, &default_zen_key_file());
+    let anthropic_key_present = anthropic_key.is_some();
+    let zen_key_present = zen_key.is_some();
+
+    eprintln!(
+        "providers: anthropic {} · opencode-zen {}",
+        if anthropic_key.is_some() { "ready" } else { "no key — those instances fail with no_api_key" },
+        if zen_key.is_some() { "ready" } else { "no key — those instances fail with no_api_key" },
+    );
 
     // `model` keeps the full spelling (`zen/<slug>` included) — it is what
     // the log's `model` field records, and the prefix is honest provenance.
-    let model = ModelConfig {
-        model: args.model.clone(),
-        api_key,
-    };
+    let model = ModelConfig { model: model_str };
 
-    // The engine boots and serves the Explorer regardless of whether a model
-    // is wired in: `KeylessProvider` fails every turn with a named error
-    // (`no_api_key`) rather than refusing to start. Which provider is active,
-    // and where its key came from, is announced — without ever printing the
-    // key itself — see the redacting `Debug` impls on `ModelConfig` and both
-    // providers, and `resolve_api_key`'s doc for why only the source
-    // (env vs. file), never the value, is nameable here.
-    let provider: Arc<dyn ModelProvider> = match (&model.api_key, choose_provider(&args.model)) {
-        (Some(api_key), choice) => {
-            let source = if env_present {
-                "key from env".to_string()
-            } else {
-                format!("key from {}", key_file.display())
-            };
-            match choice {
-                ProviderChoice::Anthropic => {
-                    eprintln!("provider: anthropic (model {}, {source})", model.model);
-                    Arc::new(AnthropicProvider {
-                        model: model.model.clone(),
-                        api_key: api_key.clone(),
-                    })
-                }
-                ProviderChoice::Zen { slug } => {
-                    eprintln!("provider: opencode-zen (model {slug}, {source})");
-                    Arc::new(OpenAiCompatProvider {
-                        base_url: "https://opencode.ai/zen/v1".to_string(),
-                        // The bare slug crosses the wire; the prefixed
-                        // spelling stays in `ModelConfig` for the log.
-                        model: slug,
-                        api_key: api_key.clone(),
-                    })
-                }
-            }
-        }
-        (None, _) => {
-            eprintln!(
-                "provider: keyless — no {env_name} set and no usable key at {}; \
-                 the Explorer works, but every send will fail with no_api_key",
-                key_file.display()
-            );
-            Arc::new(KeylessProvider)
-        }
-    };
+    // The engine boots and serves the Explorer regardless of whether a
+    // model is wired in: a model whose provider has no key resolves to
+    // `KeylessProvider` per turn (`KeyedProviders::provider_for`), which
+    // fails with the named `no_api_key` error rather than refusing to
+    // start.
+    let providers: Arc<dyn ProviderFor> = Arc::new(KeyedProviders { anthropic_key, zen_key });
+
+    let models_path = default_models_file();
 
     let addr = SocketAddr::new(args.bind, args.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -373,7 +344,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             root,
             sessions,
             model,
-            provider,
+            providers,
+            models_path,
+            anthropic_key_present,
+            zen_key_present,
             boot,
         }),
     )
@@ -386,24 +360,6 @@ mod tests {
     use super::*;
     use std::net::Ipv6Addr;
     use std::str::FromStr;
-
-    #[test]
-    fn a_zen_prefix_selects_the_compat_provider_and_bare_names_do_not() {
-        assert!(matches!(
-            choose_provider("zen/kimi-k3"),
-            ProviderChoice::Zen { slug } if slug == "kimi-k3"
-        ));
-        assert!(matches!(
-            choose_provider("claude-sonnet-5"),
-            ProviderChoice::Anthropic
-        ));
-        // A slug containing further slashes passes through whole — Zen's
-        // catalog naming is not ours to constrain.
-        assert!(matches!(
-            choose_provider("zen/deepseek/v4-flash"),
-            ProviderChoice::Zen { slug } if slug == "deepseek/v4-flash"
-        ));
-    }
 
     #[test]
     fn loopback_is_permitted() {

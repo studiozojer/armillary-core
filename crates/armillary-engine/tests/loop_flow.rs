@@ -14,7 +14,7 @@ use armillary_engine::{
     log::envelope::EventEnvelope,
     log::store::LogStore,
     projection::ModelTurn,
-    provider::{ModelProvider, ProviderError, ScriptedProvider, TurnOutcome},
+    provider::{self, ModelProvider, ProviderError, ScriptedProvider, TurnOutcome},
     sessions::Sessions,
     state::{AppState, ModelConfig},
 };
@@ -30,7 +30,6 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 fn model_config() -> ModelConfig {
     ModelConfig {
         model: "scripted".to_string(),
-        api_key: None,
     }
 }
 
@@ -47,7 +46,10 @@ async fn spawn(data_dir: &Path, provider: Arc<dyn ModelProvider>) -> (SocketAddr
         root: root.canonicalize().unwrap(),
         sessions: sessions.clone(),
         model: model_config(),
-        provider,
+        providers: provider::fixed(provider),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: None,
     };
 
@@ -83,7 +85,10 @@ async fn spawn_with_boot(
         root: root.clone(),
         sessions: sessions.clone(),
         model: model_config(),
-        provider,
+        providers: provider::fixed(provider),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: declared.map(|s| s.to_string()),
     };
 
@@ -619,7 +624,10 @@ async fn a_manifest_edited_mid_session_is_re_derived_before_the_next_turn() {
         root: root.canonicalize().unwrap(),
         sessions: sessions.clone(),
         model: model_config(),
-        provider,
+        providers: provider::fixed(provider),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: None,
     };
     tokio::spawn(async move {

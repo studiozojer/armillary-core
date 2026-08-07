@@ -16,6 +16,7 @@
 
 use crate::projection::{ContentBlock, ModelTurn, ProviderRole};
 use futures_util::StreamExt;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
@@ -146,6 +147,14 @@ pub trait ModelProvider: Send + Sync + 'static {
         sink: mpsc::Sender<String>,
         cancel: watch::Receiver<bool>,
     ) -> Result<TurnOutcome, ProviderError>;
+
+    /// A redaction-safe identity for this provider — `"anthropic:<model>"`,
+    /// `"opencode-zen:<slug>"`, `"keyless"`. Exists so selection is
+    /// assertable without a network call and without any impl growing a
+    /// `Debug` that could print a key. Never include the credential.
+    fn describe(&self) -> String {
+        "unknown".to_string()
+    }
 }
 
 /// Calls the real Anthropic Messages API over SSE.
@@ -624,6 +633,10 @@ impl ModelProvider for AnthropicProvider {
             }
         }
     }
+
+    fn describe(&self) -> String {
+        format!("anthropic:{}", self.model)
+    }
 }
 
 /// No credential composed at all. Always fails — the Explorer keeps working
@@ -642,6 +655,102 @@ impl ModelProvider for KeylessProvider {
     ) -> Result<TurnOutcome, ProviderError> {
         Err(ProviderError::NoApiKey)
     }
+
+    fn describe(&self) -> String {
+        "keyless".to_string()
+    }
+}
+
+/// Which provider a model string selects, and with what residue. Pure so the
+/// selection rule is testable without booting a server. Moved here from
+/// `main.rs` — `KeyedProviders::provider_for` below is now the only caller
+/// that matters at runtime, and it belongs beside the providers it chooses
+/// between.
+pub enum ProviderChoice {
+    Anthropic,
+    Zen { slug: String },
+}
+
+pub fn choose_provider(model: &str) -> ProviderChoice {
+    match model.strip_prefix("zen/") {
+        Some(slug) => ProviderChoice::Zen {
+            slug: slug.to_string(),
+        },
+        None => ProviderChoice::Anthropic,
+    }
+}
+
+/// Maps a model string to the provider that can pilot it.
+///
+/// This replaces a single `Arc<dyn ModelProvider>` in `AppState` because
+/// the model is now a property of the INSTANCE (design decision 1), not of
+/// the process — two instances in one engine may want different providers,
+/// so the choice cannot be made once at boot. Both providers are plain
+/// structs holding a model string and a key, so constructing one per turn
+/// costs nothing: there is no client to pool.
+pub trait ProviderFor: Send + Sync + 'static {
+    fn provider_for(&self, model: &str) -> Arc<dyn ModelProvider>;
+}
+
+/// The real one: holds every credential this host resolved at boot, and
+/// applies `choose_provider`'s rule per call.
+///
+/// A model whose provider has no key resolves to `KeylessProvider`, which
+/// is what makes design decision 3 (accept at create, fail at the turn)
+/// need no new error path — the existing `no_api_key` turn failure is the
+/// report, and it names the instance's own model.
+pub struct KeyedProviders {
+    pub anthropic_key: Option<String>,
+    pub zen_key: Option<String>,
+}
+
+/// Hand-written to redact both keys. NEVER derive — a derive prints them
+/// verbatim the first time this lands in a log line or a panic message.
+/// Same discipline as `AnthropicProvider` and `state::ModelConfig`.
+impl std::fmt::Debug for KeyedProviders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyedProviders")
+            .field("anthropic_key", &self.anthropic_key.as_ref().map(|_| "<redacted>"))
+            .field("zen_key", &self.zen_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+impl ProviderFor for KeyedProviders {
+    fn provider_for(&self, model: &str) -> Arc<dyn ModelProvider> {
+        match choose_provider(model) {
+            ProviderChoice::Anthropic => match &self.anthropic_key {
+                Some(key) => Arc::new(AnthropicProvider {
+                    model: model.to_string(),
+                    api_key: key.clone(),
+                }),
+                None => Arc::new(KeylessProvider),
+            },
+            ProviderChoice::Zen { slug } => match &self.zen_key {
+                Some(key) => Arc::new(crate::provider_openai::OpenAiCompatProvider {
+                    base_url: "https://opencode.ai/zen/v1".to_string(),
+                    // The BARE slug crosses the wire; the prefixed spelling
+                    // stays in the log. core#19's rule, unchanged.
+                    model: slug,
+                    api_key: key.clone(),
+                }),
+                None => Arc::new(KeylessProvider),
+            },
+        }
+    }
+}
+
+/// One provider for every model — the test seam. Wraps a single provider
+/// and ignores the model string, so a `ScriptedProvider` still injects
+/// exactly as it did before this trait existed.
+pub fn fixed(provider: Arc<dyn ModelProvider>) -> Arc<dyn ProviderFor> {
+    struct Fixed(Arc<dyn ModelProvider>);
+    impl ProviderFor for Fixed {
+        fn provider_for(&self, _model: &str) -> Arc<dyn ModelProvider> {
+            self.0.clone()
+        }
+    }
+    Arc::new(Fixed(provider))
 }
 
 /// A request shape the Anthropic API rejects with a 400.
@@ -1430,6 +1539,55 @@ mod tests {
         let err = provider.run_turn(empty_turn(), tx, cancel_rx).await.unwrap_err();
 
         assert_eq!(err, ProviderError::NoApiKey);
+    }
+
+    // --- choose_provider (moved from main.rs) ---
+
+    #[test]
+    fn a_zen_prefix_selects_the_compat_provider_and_bare_names_do_not() {
+        assert!(matches!(
+            choose_provider("zen/kimi-k3"),
+            ProviderChoice::Zen { slug } if slug == "kimi-k3"
+        ));
+        assert!(matches!(
+            choose_provider("claude-sonnet-5"),
+            ProviderChoice::Anthropic
+        ));
+        // A slug containing further slashes passes through whole — Zen's
+        // catalog naming is not ours to constrain.
+        assert!(matches!(
+            choose_provider("zen/deepseek/v4-flash"),
+            ProviderChoice::Zen { slug } if slug == "deepseek/v4-flash"
+        ));
+    }
+
+    // --- KeyedProviders::provider_for ---
+
+    #[test]
+    fn keyed_providers_selects_by_prefix_and_falls_keyless_without_a_key() {
+        let both = KeyedProviders {
+            anthropic_key: Some("a".to_string()),
+            zen_key: Some("z".to_string()),
+        };
+        // A bare name is Anthropic; a zen/ prefix crosses the wire as the BARE
+        // slug while the prefixed spelling stays in the log (core#19's rule).
+        assert_eq!(both.provider_for("claude-sonnet-5").describe(), "anthropic:claude-sonnet-5");
+        assert_eq!(both.provider_for("zen/kimi-k3").describe(), "opencode-zen:kimi-k3");
+
+        // Decision 3's posture, and the whole reason it costs no new error
+        // path: an unpilotable model resolves to the provider that already
+        // fails every turn with no_api_key.
+        let neither = KeyedProviders { anthropic_key: None, zen_key: None };
+        assert_eq!(neither.provider_for("claude-sonnet-5").describe(), "keyless");
+        assert_eq!(neither.provider_for("zen/kimi-k3").describe(), "keyless");
+
+        // Each key covers only its own provider.
+        let anthropic_only = KeyedProviders {
+            anthropic_key: Some("a".to_string()),
+            zen_key: None,
+        };
+        assert_eq!(anthropic_only.provider_for("zen/kimi-k3").describe(), "keyless");
+        assert_eq!(anthropic_only.provider_for("claude-sonnet-5").describe(), "anthropic:claude-sonnet-5");
     }
 
     #[test]

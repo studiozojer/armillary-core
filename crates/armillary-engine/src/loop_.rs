@@ -404,7 +404,11 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
             }
         });
 
-        let outcome = state.provider.run_turn(req, tx, cancel_rx.clone()).await;
+        let outcome = state
+            .providers
+            .provider_for(&state.model.model)
+            .run_turn(req, tx, cancel_rx.clone())
+            .await;
         let _ = relay.await;
 
         let outcome = match outcome {
@@ -830,7 +834,7 @@ async fn project_healing(
 mod tests {
     use super::*;
     use crate::log::store::LogStore;
-    use crate::provider::KeylessProvider;
+    use crate::provider::{self, KeylessProvider};
     use crate::sessions::Sessions;
     use crate::state::{AppState, ModelConfig};
 
@@ -902,7 +906,6 @@ mod tests {
     fn model_config() -> ModelConfig {
         ModelConfig {
             model: "claude-sonnet-5".to_string(),
-            api_key: None,
         }
     }
 
@@ -1022,7 +1025,10 @@ mod tests {
             root: root.canonicalize().unwrap(),
             sessions,
             model: model_config(),
-            provider,
+            providers: provider::fixed(provider),
+            models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+            anthropic_key_present: false,
+            zen_key_present: false,
             boot: None,
         })
     }
@@ -1520,7 +1526,10 @@ mod tests {
             root: root.path().canonicalize().unwrap(),
             sessions: sessions.clone(),
             model: model_config(),
-            provider: Arc::new(KeylessProvider),
+            providers: provider::fixed(Arc::new(KeylessProvider)),
+            models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+            anthropic_key_present: false,
+            zen_key_present: false,
             boot: None,
         });
 
@@ -1554,7 +1563,10 @@ mod tests {
             root: root.path().canonicalize().unwrap(),
             sessions: sessions.clone(),
             model: model_config(),
-            provider: Arc::new(KeylessProvider),
+            providers: provider::fixed(Arc::new(KeylessProvider)),
+            models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+            anthropic_key_present: false,
+            zen_key_present: false,
             boot: None,
         });
 

@@ -3,7 +3,7 @@
 use armillary_engine::{
     app,
     log::store::LogStore,
-    provider::KeylessProvider,
+    provider::{self, KeylessProvider},
     sessions::Sessions,
     state::{AppState, ModelConfig},
 };
@@ -18,7 +18,6 @@ const ONE_MIB: usize = 1024 * 1024;
 fn model_config() -> ModelConfig {
     ModelConfig {
         model: "claude-sonnet-5".to_string(),
-        api_key: None,
     }
 }
 
@@ -42,7 +41,10 @@ fn app_over(setup: impl FnOnce(&PathBuf)) -> axum::Router {
         root: root.canonicalize().unwrap(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: None,
     })
 }
@@ -65,7 +67,10 @@ fn app_with_data_dir_under_root(setup: impl FnOnce(&PathBuf)) -> axum::Router {
         root,
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: None,
     })
 }
@@ -93,7 +98,10 @@ fn app_with_boot(boot_rel: &str, contents: &str) -> (axum::Router, PathBuf, Path
         root: root.clone(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: Some(boot_rel.to_string()),
     });
     (router, root, data_dir)
@@ -621,7 +629,10 @@ async fn create_records_the_composition_so_a_session_knows_what_it_was_booted_in
         root: root.canonicalize().unwrap(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: None,
     });
 
@@ -668,7 +679,10 @@ fn app_with_operator_boot() -> (axum::Router, PathBuf, PathBuf) {
         root: root.clone(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: None,
     });
     (router, root, data_dir)
@@ -757,7 +771,10 @@ async fn an_unreadable_boot_source_still_creates_the_instance() {
         root: root.canonicalize().unwrap(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: Some("does-not-exist.md".to_string()),
     });
     let attach = create_and_attach(router).await;
@@ -780,7 +797,10 @@ async fn a_non_utf8_boot_source_is_skipped_not_appended() {
         root: root.canonicalize().unwrap(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: Some("boot.md".to_string()),
     });
     let attach = create_and_attach(router).await;
@@ -803,7 +823,10 @@ async fn a_boot_path_declared_absolute_is_refused_not_relativized() {
         root: root.clone(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: Some(root.join("boot.md").to_string_lossy().to_string()),
     });
     let attach = create_and_attach(router).await;
@@ -833,7 +856,10 @@ async fn a_boot_path_escaping_root_is_skipped_not_honored() {
         root: root.canonicalize().unwrap(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: Some(escape_path),
     });
     let attach = create_and_attach(router).await;
@@ -856,7 +882,10 @@ async fn an_instance_records_whether_it_may_write_the_composition() {
         root,
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: None,
     });
 
