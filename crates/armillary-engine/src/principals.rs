@@ -203,9 +203,14 @@ pub fn write_principal(dir: &Path, p: &Principal) -> std::io::Result<()> {
 /// the day it lands. `a_full_host_grant_changes_nothing_the_manifest_allowed`
 /// in `routes/repos.rs` pins that.
 pub fn ensure_host(dir: &Path, host_token_path: &Path) -> std::io::Result<Option<String>> {
-    if Registry::load(dir).names().iter().any(|p| p.name == "host") {
+    let host_exists = Registry::load(dir).names().iter().any(|p| p.name == "host");
+    if host_exists && host_token_path.exists() {
         return Ok(None);
     }
+
+    // A `host` principal whose token file is missing is not a completed mint,
+    // it is a broken one, and re-minting repairs it. This makes deleting
+    // `host-token` a supported way to force a fresh host token.
 
     let token = mint_token();
     write_principal(
@@ -221,9 +226,23 @@ pub fn ensure_host(dir: &Path, host_token_path: &Path) -> std::io::Result<Option
     if let Some(parent) = host_token_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(host_token_path, &token)?;
-    // Written AFTER the file exists rather than via `OpenOptions::mode`, so
-    // the narrowing applies whether or not the file was already there.
+
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(host_token_path)?;
+    f.write_all(token.as_bytes())?;
+
+    // `.mode()` applies only when the file is created; if a wider-permissioned
+    // file was already there, `.mode()` is ignored and this `set_permissions`
+    // is the thing that narrows it. Both are needed and neither is redundant,
+    // per the ruling in `run_git`'s stdin guard (David 2026-07-31: "Rather
+    // than ship a green light that means nothing, the guarantee is stated
+    // here and left unasserted").
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(host_token_path, std::fs::Permissions::from_mode(0o600))?;
 
@@ -474,6 +493,45 @@ mod tests {
         let first = ensure_host(&reg_dir, &token_path).unwrap().unwrap();
         let second = ensure_host(&reg_dir, &token_path).unwrap();
         assert!(second.is_none(), "an existing host principal is left alone");
+        // Observe what is on disk, not just the in-memory return value.
+        let on_disk = fs::read_to_string(&token_path).unwrap().trim().to_string();
+        assert_eq!(on_disk, first, "the token on disk is the first minted one");
         assert_eq!(Registry::load(&reg_dir).authenticate(&first).unwrap().name, "host");
+    }
+
+    #[test]
+    fn a_broken_mint_with_missing_token_file_is_repaired() {
+        // A `host` principal whose token file is missing is not a completed
+        // mint; it is a broken one, and re-minting repairs it. This makes
+        // deleting `host-token` a supported way to force a fresh host token.
+        let dir = tempfile::tempdir().unwrap();
+        let reg_dir = dir.path().join("devices");
+        let token_path = dir.path().join("host-token");
+
+        // Write a host principal but no token file, simulating a broken mint.
+        write_principal(
+            &reg_dir,
+            &Principal {
+                name: "host".to_string(),
+                token_hash: hash_token("old_token"),
+                grants: vec![Grant::Sync, Grant::Push],
+                minted: "2026-08-07T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(!token_path.exists(), "token file should not exist yet");
+
+        // ensure_host should detect the broken mint and repair it.
+        let repaired = ensure_host(&reg_dir, &token_path).unwrap();
+        assert!(repaired.is_some(), "broken mint is repaired with a fresh token");
+
+        // The new token file exists and authenticates.
+        assert!(token_path.exists(), "token file now exists");
+        let on_disk = fs::read_to_string(&token_path).unwrap().trim().to_string();
+        assert_eq!(on_disk, repaired.unwrap(), "token on disk matches returned token");
+        assert_eq!(
+            Registry::load(&reg_dir).authenticate(&on_disk).unwrap().name,
+            "host"
+        );
     }
 }
