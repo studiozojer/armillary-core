@@ -2,11 +2,15 @@ use armillary_engine::{
     app,
     log::store::LogStore,
     models,
+    principals::{
+        default_host_token_path, default_registry_dir, ensure_host, hash_token, mint_token,
+        write_principal, Grant, Principal, Registry,
+    },
     provider::{KeyedProviders, ProviderFor},
     sessions::Sessions,
     state::{AppState, ModelConfig},
 };
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -48,6 +52,112 @@ struct Args {
     /// Absent, the default comes from `models.toml`, then `claude-sonnet-5`.
     #[arg(long)]
     model: Option<String>,
+    /// Registry management. Absent, the engine serves — which is the form
+    /// launchd invokes on both hosts, so it must stay the default.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Enrol a device and print its token ONCE. The registry stores only a
+    /// SHA-256 hash of it (`principals::hash_token`), never the token
+    /// itself — this line of output is the only place it will ever be
+    /// visible again. A lost token is re-enrolled, not recovered.
+    Enroll {
+        #[arg(long)]
+        name: String,
+        /// Comma-separated: `sync`, `push`.
+        #[arg(long, value_delimiter = ',')]
+        grants: Vec<String>,
+    },
+    /// Remove a principal. Needs no restart to take effect: the registry is
+    /// read fresh on every request (see the module doc on `principals`), the
+    /// same property David named as valuable at the grant site — deleting a
+    /// line revokes it, immediately, on the very next request.
+    Revoke {
+        #[arg(long)]
+        name: String,
+    },
+    /// List principals: name, grants, minted-at. Never tokens — the
+    /// registry never holds one to print.
+    Principals,
+}
+
+/// Parse a grant list, naming the first bad word.
+///
+/// Refused BEFORE anything is written: a typo that enrolled a device with an
+/// empty grant list would present as "my phone can't push" against a
+/// registry file that looks entirely correct.
+fn resolve_grants(words: &[String]) -> Result<Vec<Grant>, String> {
+    words
+        .iter()
+        .map(|w| Grant::parse(w).ok_or_else(|| format!("unknown grant {w:?} — expected sync or push")))
+        .collect()
+}
+
+/// Resolve `grants`, mint a token, and write the principal to `dir` — in
+/// that order. Grant resolution happens first and short-circuits on `?`
+/// before `write_principal` is ever reached, so a typo'd grant writes
+/// nothing to disk; see `an_unknown_grant_is_refused_before_anything_is_written`
+/// below, which asserts the directory is still empty after a bad call, not
+/// just that an error came back.
+///
+/// Takes `dir` as a parameter — rather than calling `default_registry_dir()`
+/// internally — so tests can point it at a tempdir instead of this
+/// machine's real `~/.config/armillary/devices`; `run_command` below passes
+/// the real path.
+fn enroll(dir: &Path, name: &str, grants: &[String]) -> Result<String, String> {
+    let grants = resolve_grants(grants)?;
+    let token = mint_token();
+    write_principal(
+        dir,
+        &Principal {
+            name: name.to_string(),
+            token_hash: hash_token(&token),
+            grants,
+            minted: humantime::format_rfc3339_millis(std::time::SystemTime::now()).to_string(),
+        },
+    )
+    .map_err(|e| format!("could not write principal {name}: {e}"))?;
+    Ok(token)
+}
+
+/// Registry management, run instead of serving.
+///
+/// `Enroll` prints the token exactly once, here, because `write_principal`
+/// stores only its hash — this call site is the token's only appearance,
+/// ever. `Revoke` deletes a file and nothing else: no signal to send, no
+/// process to restart, because the registry is read per request rather than
+/// cached (see the module doc on `principals`), a property David named as
+/// valuable at the grant site.
+fn run_command(cmd: &Command) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = default_registry_dir();
+    match cmd {
+        Command::Enroll { name, grants } => {
+            let token = enroll(&dir, name, grants)?;
+            println!(
+                "enrolled {name}\n\ntoken (shown once, not recoverable — re-enrol if lost):\n{token}"
+            );
+        }
+        Command::Revoke { name } => {
+            let path = dir.join(format!("{name}.toml"));
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("could not revoke {name}: {e} ({})", path.display()))?;
+            println!("revoked {name} — effective on the next request, no restart needed");
+        }
+        Command::Principals => {
+            let reg = Registry::load(&dir);
+            if reg.names().is_empty() {
+                println!("no principals enrolled ({})", dir.display());
+            }
+            for p in reg.names() {
+                let grants: Vec<&str> = p.grants.iter().map(|g| g.as_str()).collect();
+                println!("{:<16} {:<12} {}", p.name, grants.join(","), p.minted);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// True when `addr` falls inside Tailscale's CGNAT IPv4 range
@@ -218,8 +328,30 @@ fn default_zen_key_file() -> PathBuf {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
+    // Registry management runs instead of serving, regardless of what
+    // --bind says — enroll/revoke/principals are local host administration,
+    // not a network-facing mode, so they must work even against a --bind
+    // value that would otherwise be refused below.
+    if let Some(cmd) = &args.command {
+        return run_command(cmd);
+    }
+
     if let Err(msg) = bind_permitted(args.bind) {
         return Err(msg.into());
+    }
+
+    // First run mints the `host` principal with full grants — see
+    // `ensure_host`'s doc for why that is a no-op for host behavior on the
+    // day it lands. Never fatal: the Explorer must serve regardless of the
+    // registry's state, exactly as it serves regardless of a key file's
+    // state (see `resolve_api_key`'s doc for the same posture).
+    match ensure_host(&default_registry_dir(), &default_host_token_path()) {
+        Ok(Some(_)) => eprintln!(
+            "minted the `host` principal; its token is at {}",
+            default_host_token_path().display()
+        ),
+        Ok(None) => {}
+        Err(e) => eprintln!("warning: could not mint the host principal — {e}"),
     }
 
     let root = args
@@ -587,5 +719,84 @@ mod tests {
         std::fs::write(dir.path().join("modules.toml"), "[router\nboot = ").unwrap();
         // The Explorer must keep serving a workspace whose manifest is broken.
         assert_eq!(declared_boot(dir.path()), None);
+    }
+
+    // Command parsing: the bare form must keep serving (launchd invokes
+    // exactly that on two hosts), and grant validation must refuse before
+    // any write.
+
+    #[test]
+    fn the_bare_form_still_serves() {
+        // launchd runs `armillary-engine --root <path>` with no subcommand
+        // on both hosts. If this parse ever yields a subcommand, the service
+        // stops serving and starts doing something else.
+        let args = Args::try_parse_from(["armillary-engine", "--root", "/tmp/ws"]).unwrap();
+        assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn enroll_parses_a_name_and_a_grant_list() {
+        let args = Args::try_parse_from([
+            "armillary-engine",
+            "--root",
+            "/tmp/ws",
+            "enroll",
+            "--name",
+            "iphone",
+            "--grants",
+            "sync,push",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Enroll { name, grants }) => {
+                assert_eq!(name, "iphone");
+                assert_eq!(grants, vec!["sync".to_string(), "push".to_string()]);
+            }
+            other => panic!("expected Enroll, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_grant_is_refused_before_anything_is_written() {
+        // A typo'd grant that silently enrolled a device with NO authority
+        // would present as "my phone can't push" with a correct-looking
+        // registry file. Refuse at parse, name the bad word — AND leave the
+        // directory untouched, not just return an error. Exercised through
+        // `enroll`, not `resolve_grants` alone, so the second claim in this
+        // test's name (nothing is written) is actually observable: a
+        // resolve_grants-only test can't see the filesystem at all, and
+        // would stay green even if `enroll` wrote before validating.
+        let dir = tempfile::tempdir().unwrap();
+        let grants = ["sync".to_string(), "shove".to_string()];
+        let err = enroll(dir.path(), "iphone", &grants).unwrap_err();
+        assert!(err.contains("shove"), "the error must name the bad grant: {err}");
+        assert!(
+            !dir.path().join("iphone.toml").exists(),
+            "a refused grant must not reach write_principal"
+        );
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "the registry directory must be untouched, not just missing the one file"
+        );
+    }
+
+    #[test]
+    fn resolving_a_good_grant_list_yields_both() {
+        let g = resolve_grants(&["sync".to_string(), "push".to_string()]).unwrap();
+        assert_eq!(g, vec![Grant::Sync, Grant::Push]);
+    }
+
+    #[test]
+    fn a_good_enroll_writes_exactly_the_named_principal() {
+        // The positive case beside the refusal above: a valid grant list
+        // DOES reach disk, with the grants it named and none other.
+        let dir = tempfile::tempdir().unwrap();
+        let token = enroll(dir.path(), "iphone", &["sync".to_string()]).unwrap();
+
+        let reg = Registry::load(dir.path());
+        let p = reg.names().into_iter().find(|p| p.name == "iphone").unwrap();
+        assert!(p.holds(Grant::Sync));
+        assert!(!p.holds(Grant::Push));
+        assert_eq!(reg.authenticate(&token).unwrap().name, "iphone");
     }
 }
