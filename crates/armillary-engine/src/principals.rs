@@ -128,7 +128,7 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// One registry directory with two principals and one file that is not a
+    /// One registry directory with three principals and one file that is not a
     /// principal at all — a stray `.DS_Store` is the realistic case, and a
     /// reader that errors on it is a reader that stops working when Finder
     /// visits the directory.
@@ -144,6 +144,11 @@ mod tests {
             "name = \"ipad\"\ntoken_hash = \"sha256:bbbb\"\ngrants = [\"sync\"]\nminted = \"2026-08-07T14:23:00Z\"\n",
         )
         .unwrap();
+        fs::write(
+            dir.path().join("laptop.toml"),
+            "name = \"laptop\"\ntoken_hash = \"sha256:cccc\"\ngrants = [\"push\"]\nminted = \"2026-08-07T14:24:00Z\"\n",
+        )
+        .unwrap();
         fs::write(dir.path().join(".DS_Store"), "junk").unwrap();
         dir
     }
@@ -154,7 +159,7 @@ mod tests {
         let reg = Registry::load(dir.path());
         let mut names: Vec<&str> = reg.names().iter().map(|p| p.name.as_str()).collect();
         names.sort();
-        assert_eq!(names, vec!["ipad", "iphone"]);
+        assert_eq!(names, vec!["ipad", "iphone", "laptop"]);
     }
 
     #[test]
@@ -170,6 +175,17 @@ mod tests {
     }
 
     #[test]
+    fn push_does_not_imply_sync() {
+        // Regression guard for the specific direction that was unobservable
+        // in the original fixture: a principal with push-only must not hold sync.
+        let dir = farm();
+        let reg = Registry::load(dir.path());
+        let laptop = reg.names().into_iter().find(|p| p.name == "laptop").unwrap();
+        assert!(laptop.holds(Grant::Push));
+        assert!(!laptop.holds(Grant::Sync));
+    }
+
+    #[test]
     fn an_unparseable_file_is_skipped_not_fatal() {
         // A reader that returns Err on one bad file takes every OTHER
         // principal down with it — and the failure mode would be "all my
@@ -177,7 +193,7 @@ mod tests {
         let dir = farm();
         fs::write(dir.path().join("broken.toml"), "this is not toml = = =").unwrap();
         let reg = Registry::load(dir.path());
-        assert_eq!(reg.names().len(), 2, "the two good ones still load");
+        assert_eq!(reg.names().len(), 3, "the three good ones still load");
     }
 
     #[test]
