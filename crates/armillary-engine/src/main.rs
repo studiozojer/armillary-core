@@ -263,8 +263,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // it lets the host publish under its own credential, a strictly bigger
     // authority than fetch/fast-forward), and a typo there would be exactly
     // as silent if it went unannounced.
-    let sync_on = armillary_engine::repos::gate_enabled(&root);
-    let push_on = armillary_engine::repos::push_enabled(&root);
+    let banner_comp =
+        armillary_composition::parse_workspace(&root).unwrap_or_default();
+    let sync_on = armillary_engine::repos::gate_enabled(&banner_comp);
+    let push_on = armillary_engine::repos::push_enabled(&banner_comp);
     if sync_on {
         eprintln!(
             "sync: enabled by [router] sync — /repos/{{name}}/fetch and /repos/{{name}}/pull will act"

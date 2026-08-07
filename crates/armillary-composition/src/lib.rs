@@ -117,35 +117,84 @@ fn check_internally_unique(c: &Composition) -> Result<(), CompositionError> {
 /// and a missing *or dangling* `modules.local.toml` means "no overlay". Neither
 /// is an error — a bare clone is a working host, not a broken one.
 pub fn parse_workspace(root: &Path) -> Result<Composition, CompositionError> {
-    let base = read_optional_manifest(&root.join("modules.toml"))?;
-    let overlay = read_optional_manifest(&root.join("modules.local.toml"))?;
-    merge(base, overlay)
+    let base = read_manifest_text(&root.join("modules.toml"))?;
+    let overlay = read_manifest_text(&root.join("modules.local.toml"))?;
+    compose_manifest_texts(base.as_deref(), overlay.as_deref())
 }
 
-fn read_optional_manifest(path: &Path) -> Result<Composition, CompositionError> {
-    // `metadata` follows symlinks, so a dangling link reads as absent — which is
-    // exactly what C-4 wants here, because the private overlay is normally a
-    // symlink into a commons that may not be cloned on this machine.
+/// Read one optional manifest's text.
+///
+/// C-4: absent is `None`, not an error — and `metadata` follows symlinks, so a
+/// dangling link reads as absent too, which is exactly what C-4 wants: the
+/// private overlay is normally a symlink into a commons that may not be cloned
+/// on this machine. Public so a caller (the engine's `WorkspaceSnapshot`) can
+/// hash exactly the bytes this crate parses, instead of reading the file a
+/// second time and hoping nothing changed between the reads.
+pub fn read_manifest_text(path: &Path) -> Result<Option<String>, CompositionError> {
     if path.metadata().is_err() {
-        return Ok(Composition::default());
+        return Ok(None);
     }
-    let text = std::fs::read_to_string(path).map_err(|source| CompositionError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let raw: RawManifest = toml::from_str(&text).map_err(|source| CompositionError::Toml {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let composition: Composition = raw.into();
-    check_internally_unique(&composition)?;
-    Ok(composition)
+    std::fs::read_to_string(path)
+        .map(Some)
+        .map_err(|source| CompositionError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// Compose from already-read manifest texts — `parse_workspace` minus the
+/// reads. Pure, so one read can feed both this and a digest.
+///
+/// A TOML error here carries the `<str>` path (it came from text, not a file);
+/// callers who read the file themselves know which one they handed over.
+pub fn compose_manifest_texts(
+    base: Option<&str>,
+    overlay: Option<&str>,
+) -> Result<Composition, CompositionError> {
+    let base = base.map(parse_manifest_str).transpose()?.unwrap_or_default();
+    let overlay = overlay.map(parse_manifest_str).transpose()?.unwrap_or_default();
+    merge(base, overlay)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn compose_from_texts_matches_parse_workspace_on_the_same_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = "[[repos]]\nname = \"a\"\npath = \"repos/a\"\n";
+        let overlay = "[router]\nboot = \"getting-started.md\"\n";
+        fs::write(dir.path().join("modules.toml"), base).unwrap();
+        fs::write(dir.path().join("modules.local.toml"), overlay).unwrap();
+
+        let via_files = parse_workspace(dir.path()).unwrap();
+        let via_texts = compose_manifest_texts(Some(base), Some(overlay)).unwrap();
+
+        assert_eq!(via_files, via_texts);
+    }
+
+    #[test]
+    fn read_manifest_text_treats_absent_and_dangling_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_manifest_text(&dir.path().join("modules.toml")).unwrap(),
+            None
+        );
+
+        let dangling = dir.path().join("modules.local.toml");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+        assert_eq!(read_manifest_text(&dangling).unwrap(), None);
+
+        fs::write(dir.path().join("real.toml"), "x = 1").unwrap();
+        assert_eq!(
+            read_manifest_text(&dir.path().join("real.toml"))
+                .unwrap()
+                .as_deref(),
+            Some("x = 1")
+        );
+    }
 
     #[test]
     fn bare_workspace_yields_empty_composition() {

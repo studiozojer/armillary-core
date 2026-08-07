@@ -22,6 +22,7 @@ pub mod repos;
 pub mod routes;
 mod search;
 pub mod sessions;
+pub mod snapshot;
 pub mod state;
 #[cfg(test)]
 pub mod testgit;

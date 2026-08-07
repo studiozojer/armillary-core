@@ -31,6 +31,8 @@ use tokio::sync::Semaphore;
 /// different kind of rude.
 pub(crate) const CONCURRENCY: usize = 8;
 
+use armillary_composition::Composition;
+
 /// A module the manifest declares AND that exists on disk as a git checkout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredModule {
@@ -48,7 +50,12 @@ const MODULE_CONTAINERS: [&str; 2] = ["operators", "repos"];
 /// an error — C-4, the same rule that lets a bare clone be a working host.
 /// Presence is tested by `<path>/.git` existing at all, which covers both an
 /// ordinary clone (a directory) and a worktree or submodule (a file).
-pub fn declared_modules(root: &Path) -> Vec<DeclaredModule> {
+///
+/// Takes the request's one parsed `Composition` (a `WorkspaceSnapshot`'s)
+/// rather than parsing here: the malformed-manifest posture — sweep the root
+/// rather than refuse to sweep anything — now lives at the route boundary,
+/// where an unloadable snapshot defaults to nothing composed.
+pub fn declared_modules(root: &Path, composition: &Composition) -> Vec<DeclaredModule> {
     let mut out = Vec::new();
 
     let is_checkout = |rel: &str| root.join(rel).join(".git").exists();
@@ -62,13 +69,6 @@ pub fn declared_modules(root: &Path) -> Vec<DeclaredModule> {
             path: ".".to_string(),
         });
     }
-
-    let Ok(composition) = armillary_composition::parse_workspace(root) else {
-        // A malformed manifest is a warning posture everywhere else in this
-        // engine (see main::declared_boot) and is one here too: sweep the root
-        // rather than refusing to sweep anything.
-        return out;
-    };
 
     for module in composition
         .operators
@@ -136,13 +136,18 @@ pub fn undeclared_checkouts(root: &Path, declared: &[DeclaredModule]) -> Vec<Str
 /// needs no new field and `conformance/` is untouched — and a change to
 /// `conformance/` is a change to every implementation of the standard.
 ///
-/// **Fails closed everywhere**: absent, misspelled, non-boolean, or an
-/// unparseable manifest all mean disabled. The cost is that a typo is silent,
-/// which `main.rs`'s startup banner is what pays for.
-pub fn gate_enabled(root: &Path) -> bool {
-    armillary_composition::parse_workspace(root)
-        .ok()
-        .and_then(|c| c.router.extra.get("sync").and_then(|v| v.as_bool()))
+/// **Fails closed everywhere**: absent, misspelled, or non-boolean all mean
+/// disabled — and an unparseable manifest reaches here as the route
+/// boundary's default (nothing composed), which reads the same way. The cost
+/// is that a typo is silent, which `main.rs`'s startup banner is what pays
+/// for. The parse now happens once at the route boundary; every answer in a
+/// request derives from that one snapshot.
+pub fn gate_enabled(composition: &Composition) -> bool {
+    composition
+        .router
+        .extra
+        .get("sync")
+        .and_then(|v| v.as_bool())
         .unwrap_or(false)
 }
 
@@ -277,8 +282,10 @@ pub async fn read_one(root: &Path, module: &DeclaredModule, with_commit: bool) -
 /// approach costs to get right: it once validated the string the client sent
 /// and then opened whatever that resolved to, producing two independent
 /// one-request bypasses.
-pub fn resolve(root: &Path, name: &str) -> Option<DeclaredModule> {
-    declared_modules(root).into_iter().find(|m| m.name == name)
+pub fn resolve(root: &Path, composition: &Composition, name: &str) -> Option<DeclaredModule> {
+    declared_modules(root, composition)
+        .into_iter()
+        .find(|m| m.name == name)
 }
 
 /// Whether this workspace has granted the engine authority to PUBLISH.
@@ -287,17 +294,19 @@ pub fn resolve(root: &Path, name: &str) -> Option<DeclaredModule> {
 /// enrolled device make a host fetch; push lets it make a host publish, under
 /// the host user's own credential, with no undo. Same fail-closed posture —
 /// absent, misspelled, non-boolean or unparseable all mean disabled.
-pub fn push_enabled(root: &Path) -> bool {
-    armillary_composition::parse_workspace(root)
-        .ok()
-        .and_then(|c| c.router.extra.get("push").and_then(|v| v.as_bool()))
+pub fn push_enabled(composition: &Composition) -> bool {
+    composition
+        .router
+        .extra
+        .get("push")
+        .and_then(|v| v.as_bool())
         .unwrap_or(false)
 }
 
 /// Every composed repo's state, manifest order, no network call.
-pub async fn list(root: &Path) -> Vec<RepoState> {
+pub async fn list(root: &Path, composition: &Composition) -> Vec<RepoState> {
     let mut out = Vec::new();
-    for module in declared_modules(root) {
+    for module in declared_modules(root, composition) {
         out.push(read_one(root, &module, false).await);
     }
     out
@@ -335,12 +344,12 @@ pub fn fetch_action_error(e: GitError) -> ActionError {
 /// **Never returns `Err`.** A repo that fails is a line in the result carrying
 /// its own error — twenty-three good answers and one failure is the useful
 /// outcome, and a 500 would throw all of it away for one bad repo.
-pub async fn fetch_all(root: &Path) -> Vec<RepoState> {
+pub async fn fetch_all(root: &Path, composition: &Composition) -> Vec<RepoState> {
     let permits = Arc::new(Semaphore::new(CONCURRENCY));
     let mut handles = Vec::new();
     let mut labels = Vec::new();
 
-    for module in declared_modules(root) {
+    for module in declared_modules(root, composition) {
         labels.push(module.clone());
         let permits = permits.clone();
         let root = root.to_path_buf();
@@ -419,10 +428,17 @@ mod tests {
         root
     }
 
+    /// The old signatures parsed internally; these tests keep their exact
+    /// pre-snapshot behavior by parsing the fixture the same way the route
+    /// boundary now does (unparseable -> nothing composed).
+    fn comp(root: &Path) -> Composition {
+        armillary_composition::parse_workspace(root).unwrap_or_default()
+    }
+
     #[test]
     fn declared_modules_includes_the_router_root_first() {
         let root = workspace();
-        let got = declared_modules(&root);
+        let got = declared_modules(&root, &comp(&root));
         assert_eq!(got[0].path, ".");
         assert_eq!(got[0].name, "armillary");
     }
@@ -433,7 +449,7 @@ mod tests {
         // Bound to a local first: `.iter()` on the call result directly borrows
         // a temporary that the `let` statement's own type annotation forces to
         // outlive its statement, and the borrow checker rejects that.
-        let declared = declared_modules(&root);
+        let declared = declared_modules(&root, &comp(&root));
         let paths: Vec<&str> = declared.iter().map(|m| m.path.as_str()).collect();
         assert_eq!(paths, vec![".", "operators/tycho", "zojercommons", "repos/jianyi"]);
     }
@@ -449,7 +465,7 @@ mod tests {
             "[[repos]]\nname = \"never-cloned\"\npath = \"repos/never-cloned\"\n",
         )
         .unwrap();
-        let declared = declared_modules(&root);
+        let declared = declared_modules(&root, &comp(&root));
         let paths: Vec<&str> = declared.iter().map(|m| m.path.as_str()).collect();
         assert_eq!(paths, vec!["."]);
     }
@@ -458,21 +474,21 @@ mod tests {
     fn declared_modules_is_just_the_root_when_nothing_is_composed() {
         let root = tempfile::tempdir().unwrap().keep();
         fs::create_dir_all(root.join(".git")).unwrap();
-        assert_eq!(declared_modules(&root).len(), 1);
+        assert_eq!(declared_modules(&root, &comp(&root)).len(), 1);
     }
 
     #[test]
     fn undeclared_checkouts_finds_a_module_on_disk_and_not_in_the_manifest() {
         let root = workspace();
         fs::create_dir_all(root.join("operators/ariadne").join(".git")).unwrap();
-        let declared = declared_modules(&root);
+        let declared = declared_modules(&root, &comp(&root));
         assert_eq!(undeclared_checkouts(&root, &declared), vec!["operators/ariadne"]);
     }
 
     #[test]
     fn undeclared_checkouts_is_empty_when_the_manifest_is_complete() {
         let root = workspace();
-        let declared = declared_modules(&root);
+        let declared = declared_modules(&root, &comp(&root));
         assert!(undeclared_checkouts(&root, &declared).is_empty());
     }
 
@@ -481,7 +497,7 @@ mod tests {
         // `operators/blank` is a scratch template, not a clone.
         let root = workspace();
         fs::create_dir_all(root.join("operators/blank")).unwrap();
-        let declared = declared_modules(&root);
+        let declared = declared_modules(&root, &comp(&root));
         assert!(undeclared_checkouts(&root, &declared).is_empty());
     }
 
@@ -492,14 +508,14 @@ mod tests {
         // an undeclared container stays out of the sweep entirely.
         let root = workspace();
         fs::create_dir_all(root.join("repos/external/pi").join(".git")).unwrap();
-        let declared = declared_modules(&root);
+        let declared = declared_modules(&root, &comp(&root));
         assert!(undeclared_checkouts(&root, &declared).is_empty());
     }
 
     #[test]
     fn gate_is_off_when_nothing_declares_it() {
         let root = workspace();
-        assert!(!gate_enabled(&root));
+        assert!(!gate_enabled(&comp(&root)));
     }
 
     #[test]
@@ -510,7 +526,7 @@ mod tests {
             "[router]\nsync = true\n",
         )
         .unwrap();
-        assert!(gate_enabled(&root));
+        assert!(gate_enabled(&comp(&root)));
     }
 
     #[test]
@@ -521,14 +537,14 @@ mod tests {
         // banner in main.rs is what makes it visible to a human.
         let root = workspace();
         fs::write(root.join("modules.local.toml"), "[router]\nsnyc = true\n").unwrap();
-        assert!(!gate_enabled(&root));
+        assert!(!gate_enabled(&comp(&root)));
     }
 
     #[test]
     fn gate_is_off_when_the_value_is_not_a_boolean() {
         let root = workspace();
         fs::write(root.join("modules.local.toml"), "[router]\nsync = \"yes\"\n").unwrap();
-        assert!(!gate_enabled(&root));
+        assert!(!gate_enabled(&comp(&root)));
     }
 
     #[test]
@@ -536,14 +552,14 @@ mod tests {
         // Fail closed. A broken manifest must not grant an authority.
         let root = workspace();
         fs::write(root.join("modules.local.toml"), "[router\nsync = ").unwrap();
-        assert!(!gate_enabled(&root));
+        assert!(!gate_enabled(&comp(&root)));
     }
 
     #[test]
     fn resolve_finds_a_declared_module_by_name() {
         let root = workspace();
-        assert_eq!(resolve(&root, "tycho").unwrap().path, "operators/tycho");
-        assert_eq!(resolve(&root, "armillary").unwrap().path, ".");
+        assert_eq!(resolve(&root, &comp(&root), "tycho").unwrap().path, "operators/tycho");
+        assert_eq!(resolve(&root, &comp(&root), "armillary").unwrap().path, ".");
     }
 
     #[test]
@@ -553,26 +569,26 @@ mod tests {
         // `..`-stripping exists anywhere in this module.
         let root = workspace();
         for name in ["../../../etc", "..", "/etc/passwd", "operators/tycho", "nope"] {
-            assert!(resolve(&root, name).is_none(), "{name:?} must not resolve");
+            assert!(resolve(&root, &comp(&root), name).is_none(), "{name:?} must not resolve");
         }
     }
 
     #[test]
     fn resolve_is_case_sensitive_and_exact() {
         let root = workspace();
-        assert!(resolve(&root, "Tycho").is_none());
-        assert!(resolve(&root, "tycho ").is_none());
+        assert!(resolve(&root, &comp(&root), "Tycho").is_none());
+        assert!(resolve(&root, &comp(&root), "tycho ").is_none());
     }
 
     #[test]
     fn push_and_sync_are_independent_gates() {
         let root = workspace();
         std::fs::write(root.join("modules.local.toml"), "[router]\nsync = true\n").unwrap();
-        assert!(gate_enabled(&root));
-        assert!(!push_enabled(&root), "sync must not grant push");
+        assert!(gate_enabled(&comp(&root)));
+        assert!(!push_enabled(&comp(&root)), "sync must not grant push");
 
         std::fs::write(root.join("modules.local.toml"), "[router]\npush = true\n").unwrap();
-        assert!(push_enabled(&root));
+        assert!(push_enabled(&comp(&root)));
     }
 
     #[test]
@@ -580,7 +596,7 @@ mod tests {
         let root = workspace();
         for body in ["[router]\npsuh = true\n", "[router]\npush = \"yes\"\n", "[router\npush = "] {
             std::fs::write(root.join("modules.local.toml"), body).unwrap();
-            assert!(!push_enabled(&root), "must fail closed on {body:?}");
+            assert!(!push_enabled(&comp(&root)), "must fail closed on {body:?}");
         }
     }
 
@@ -706,7 +722,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = fetch_all(&root).await;
+        let out = fetch_all(&root, &comp(&root)).await;
         let names: Vec<&str> = out.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["armillary", "gamma", "alpha", "beta"]);
     }
@@ -718,7 +734,7 @@ mod tests {
         // succeeding against nothing.
         git_sync(&root.join("repos/jianyi"), &["remote", "remove", "origin"]);
 
-        let out = fetch_all(&root).await;
+        let out = fetch_all(&root, &comp(&root)).await;
         let jianyi = out.iter().find(|s| s.path == "repos/jianyi").unwrap();
         let err = jianyi.action_error.as_ref().expect("a repo with no remote must carry its fetch error");
         assert_eq!(err.kind, "transport", "fetch's own failures are always transport, never dirty");
@@ -734,9 +750,9 @@ mod tests {
         // remote either, so both declared checkouts fail their fetch once
         // jianyi's remote is stripped too.
         git_sync(&root.join("repos/jianyi"), &["remote", "remove", "origin"]);
-        let declared = declared_modules(&root);
+        let declared = declared_modules(&root, &comp(&root));
 
-        let out = fetch_all(&root).await;
+        let out = fetch_all(&root, &comp(&root)).await;
         assert_eq!(out.len(), declared.len(), "a failing fetch must not shrink the result");
         assert!(
             out.iter().all(|s| s.action_error.is_some()),
@@ -749,7 +765,7 @@ mod tests {
         // D5: the list route must not carry `newest_commit` — the guarantee
         // `with_commit: false` makes to every caller of `read_one` beneath it.
         let (root, _remote) = live_workspace();
-        let out = list(&root).await;
+        let out = list(&root, &comp(&root)).await;
         assert!(
             out.iter().all(|s| s.newest_commit.is_none()),
             "list must never pay the second fork per repo"
