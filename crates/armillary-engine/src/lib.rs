@@ -16,6 +16,7 @@ pub mod hash;
 pub mod loop_;
 pub mod log;
 pub mod models;
+pub mod principals;
 pub mod projection;
 pub mod provider;
 pub mod provider_openai;
