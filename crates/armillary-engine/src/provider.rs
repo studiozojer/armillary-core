@@ -42,12 +42,13 @@ use tokio::sync::{mpsc, watch};
 /// behaviour change for some workspaces and a no-op for others. That is a call
 /// for the workspace owner, not a fix to slip into a truncation patch.
 ///
-/// Still unhandled, and worth knowing before tools land: **thinking blocks are
-/// never captured.** The parser keeps text and tool blocks and discards the
-/// rest. That is survivable while a turn's content is a bare string, and stops
-/// being survivable when a `tool_use` block must travel back alongside the
-/// thinking blocks from the same assistant turn.
-const MAX_TOKENS: u32 = 64_000;
+/// **Thinking blocks are captured opaquely and replayed verbatim** — the
+/// documented contract, honored rather than leaned on (the 2026-08-07 probe
+/// measured the stripped replay *tolerated* on `claude-sonnet-5`; tolerance is
+/// not a guarantee, and always-thinking families may refuse the shape). One
+/// deliberate exception: a thinking block cut before its `signature_delta` is
+/// dropped at materialization — unsigned, it is unreplayable.
+pub(crate) const MAX_TOKENS: u32 = 64_000;
 
 /// What one turn produced. `stopped` is true only when `cancel` fired before
 /// the model finished on its own — a normal end-of-stream (or a scripted
@@ -90,6 +91,15 @@ pub enum ProviderError {
     NoApiKey,
 }
 
+/// A constraint on what the model may do this round, dialect-neutral: each
+/// provider projects it to its own wire shape. One variant today — the loop's
+/// at-bound "answer in prose" — and adding one later forces every projection
+/// to choose, which is the point of the enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolChoice {
+    ForceText,
+}
+
 /// One request to the provider: what the model sees, plus what it may do.
 ///
 /// `turn` is the projection's output and nothing else — P-4's flattened shape.
@@ -104,10 +114,11 @@ pub struct TurnRequest {
     /// render at the very front of the prompt, so a set that changes between
     /// requests invalidates the whole cached prefix — keep the order fixed.
     pub tools: Vec<crate::tools::ToolDef>,
-    /// `{"type":"none"}` at a bound to force text; `{"type":"tool","name":…}` to
-    /// compel a specific call. Measured: both are accepted on `claude-sonnet-5`
-    /// with adaptive thinking on, which is this engine's default.
-    pub tool_choice: Option<serde_json::Value>,
+    /// `ToolChoice::ForceText` at a bound to force prose. Dialect-neutral —
+    /// the Anthropic projection is `{"type":"none"}`, measured accepted on
+    /// `claude-sonnet-5` with adaptive thinking on, which is this engine's
+    /// default.
+    pub tool_choice: Option<ToolChoice>,
 }
 
 impl TurnRequest {
@@ -161,7 +172,7 @@ impl std::fmt::Debug for AnthropicProvider {
 /// Returns `None` for anything that isn't a `data:` line (an `event:` line,
 /// a blank keep-alive line, or a `[DONE]` sentinel) or whose payload isn't
 /// valid JSON.
-fn parse_sse_data_line(line: &str) -> Option<serde_json::Value> {
+pub(crate) fn parse_sse_data_line(line: &str) -> Option<serde_json::Value> {
     let payload = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:"))?;
     let payload = payload.trim();
     if payload.is_empty() || payload == "[DONE]" {
@@ -199,6 +210,13 @@ enum PartialBlock {
         id: String,
         name: String,
         json: String,
+    },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    Redacted {
+        data: String,
     },
 }
 
@@ -259,10 +277,31 @@ impl StreamAccumulator {
                             },
                         );
                     }
-                    // A block kind this engine does not model (thinking,
-                    // server_tool_use, …). Deliberately not opened: an unknown
-                    // block we cannot faithfully echo back is worse than one we
-                    // never claim to have.
+                    "thinking" => {
+                        let seed = block
+                            .get("thinking")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or_default();
+                        self.open.insert(
+                            index,
+                            PartialBlock::Thinking {
+                                thinking: seed.to_string(),
+                                signature: String::new(),
+                            },
+                        );
+                    }
+                    // Arrives complete in the start frame — no deltas follow.
+                    "redacted_thinking" => {
+                        let data = block
+                            .get("data")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or_default();
+                        self.open.insert(index, PartialBlock::Redacted { data: data.to_string() });
+                    }
+                    // A block kind this engine does not model (server_tool_use,
+                    // …). Deliberately not opened: an unknown block we cannot
+                    // faithfully echo back is worse than one we never claim to
+                    // have.
                     _ => {}
                 }
             }
@@ -281,6 +320,16 @@ impl StreamAccumulator {
                     (Some(PartialBlock::ToolUse { json, .. }), "input_json_delta") => {
                         if let Some(fragment) = delta.get("partial_json").and_then(|p| p.as_str()) {
                             json.push_str(fragment);
+                        }
+                    }
+                    (Some(PartialBlock::Thinking { thinking, .. }), "thinking_delta") => {
+                        if let Some(t) = delta.get("thinking").and_then(|t| t.as_str()) {
+                            thinking.push_str(t);
+                        }
+                    }
+                    (Some(PartialBlock::Thinking { signature, .. }), "signature_delta") => {
+                        if let Some(s) = delta.get("signature").and_then(|s| s.as_str()) {
+                            signature.push_str(s);
                         }
                     }
                     _ => {}
@@ -348,6 +397,19 @@ impl StreamAccumulator {
                         input,
                     })
                 }
+                PartialBlock::Thinking { thinking, signature } => {
+                    // Cut before signature_delta: unreplayable, and an
+                    // unsigned block sent back is a tamper-shaped 400 risk.
+                    // Dropped, never salvaged — same rule as the truncated
+                    // tool-call JSON above.
+                    (!signature.is_empty()).then(|| ContentBlock::Thinking {
+                        thinking: thinking.clone(),
+                        signature: signature.clone(),
+                    })
+                }
+                PartialBlock::Redacted { data } => {
+                    Some(ContentBlock::RedactedThinking { data: data.clone() })
+                }
             })
             .collect()
     }
@@ -366,9 +428,18 @@ fn role_str(role: ProviderRole) -> &'static str {
 /// never gain a `status` key — measured, that is a 400 ("Extra inputs are not
 /// permitted"). See `projection::ContentBlock`'s doc for where the typed status
 /// actually lives.
-fn block_json(block: &ContentBlock) -> serde_json::Value {
+pub(crate) fn block_json(block: &ContentBlock) -> serde_json::Value {
     match block {
         ContentBlock::Text(text) => serde_json::json!({ "type": "text", "text": text }),
+        ContentBlock::Thinking { thinking, signature } => serde_json::json!({
+            "type": "thinking",
+            "thinking": thinking,
+            "signature": signature,
+        }),
+        ContentBlock::RedactedThinking { data } => serde_json::json!({
+            "type": "redacted_thinking",
+            "data": data,
+        }),
         ContentBlock::ToolUse { id, name, input } => serde_json::json!({
             "type": "tool_use",
             "id": id,
@@ -440,7 +511,9 @@ fn build_request_body(model: &str, req: &TurnRequest) -> serde_json::Value {
         body["tools"] = serde_json::json!(tools);
     }
     if let Some(choice) = &req.tool_choice {
-        body["tool_choice"] = choice.clone();
+        body["tool_choice"] = match choice {
+            ToolChoice::ForceText => serde_json::json!({ "type": "none" }),
+        };
     }
     body
 }
@@ -1359,6 +1432,133 @@ mod tests {
         assert_eq!(err, ProviderError::NoApiKey);
     }
 
+    #[test]
+    fn force_text_projects_to_the_anthropic_none_shape() {
+        // The neutral enum must land on the wire as the exact bytes the loop
+        // used to hand-build — measured accepted on claude-sonnet-5 with
+        // adaptive thinking on.
+        let turn = ModelTurn {
+            system: None,
+            messages: vec![text_msg(ProviderRole::User, "hi")],
+        };
+        let body = build_request_body(
+            "m",
+            &TurnRequest { turn, tools: Vec::new(), tool_choice: Some(ToolChoice::ForceText) },
+        );
+
+        assert_eq!(body["tool_choice"], serde_json::json!({ "type": "none" }));
+    }
+
+    #[test]
+    fn a_replayed_turn_carries_its_thinking_blocks_verbatim() {
+        let turn = ModelTurn {
+            system: None,
+            messages: vec![
+                text_msg(ProviderRole::User, "hi"),
+                ProviderMessage {
+                    role: ProviderRole::Assistant,
+                    content: vec![
+                        ContentBlock::Thinking {
+                            thinking: "let me look".to_string(),
+                            signature: "sig-1".to_string(),
+                        },
+                        ContentBlock::Text("checking".to_string()),
+                        ContentBlock::ToolUse {
+                            id: "tu_1".to_string(),
+                            name: "read_file".to_string(),
+                            input: serde_json::json!({"path": "a.md"}),
+                        },
+                    ],
+                },
+            ],
+        };
+
+        assert_eq!(
+            build_request_body("m", &TurnRequest::bare(turn))["messages"][1]["content"],
+            serde_json::json!([
+                {"type": "thinking", "thinking": "let me look", "signature": "sig-1"},
+                {"type": "text", "text": "checking"},
+                {"type": "tool_use", "id": "tu_1", "name": "read_file", "input": {"path": "a.md"}},
+            ])
+        );
+    }
+
+    // --- streaming thinking blocks ---
+
+    #[test]
+    fn thinking_deltas_accumulate_and_materialize_in_wire_order() {
+        let mut acc = StreamAccumulator::default();
+        for v in [
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "let me "}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "check"}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "signature_delta", "signature": "sig-abc"}}),
+            serde_json::json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "text", "text": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "text_delta", "text": "on it"}}),
+            serde_json::json!({"type": "content_block_start", "index": 2,
+                "content_block": {"type": "tool_use", "id": "tu_1", "name": "read_file", "input": {}}}),
+            serde_json::json!({"type": "content_block_delta", "index": 2,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"path\": \"a.md\"}"}}),
+        ] {
+            acc.observe(&v);
+        }
+
+        assert_eq!(
+            acc.blocks(),
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "let me check".to_string(),
+                    signature: "sig-abc".to_string(),
+                },
+                ContentBlock::Text("on it".to_string()),
+                ContentBlock::ToolUse {
+                    id: "tu_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "a.md"}),
+                },
+            ]
+        );
+        // Thinking never enters the visible prose.
+        assert_eq!(acc.text(), "on it");
+    }
+
+    #[test]
+    fn a_thinking_block_cut_before_its_signature_is_dropped_not_salvaged() {
+        // An unsigned thinking block on replay is a tamper-shaped 400 risk —
+        // the same rule blocks() applies to truncated tool-call JSON.
+        let mut acc = StreamAccumulator::default();
+        for v in [
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "cut mid-"}}),
+            serde_json::json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "text", "text": "still here"}}),
+        ] {
+            acc.observe(&v);
+        }
+
+        assert_eq!(acc.blocks(), vec![ContentBlock::Text("still here".to_string())]);
+    }
+
+    #[test]
+    fn redacted_thinking_arrives_whole_and_survives_whole() {
+        let mut acc = StreamAccumulator::default();
+        acc.observe(&serde_json::json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "redacted_thinking", "data": "opaque-bytes"}}));
+
+        assert_eq!(
+            acc.blocks(),
+            vec![ContentBlock::RedactedThinking { data: "opaque-bytes".to_string() }]
+        );
+    }
+
     // --- the request body, pinned ---
     //
     // These two goldens are captured against the PRE-migration build and must
@@ -1467,6 +1667,27 @@ mod tests {
             role,
             content: vec![ContentBlock::Text(s.to_string())],
         }
+    }
+
+    #[test]
+    fn thinking_blocks_encode_in_their_exact_wire_shapes() {
+        // Opaque capture-and-echo: the engine never interprets these fields, so
+        // the encoding must be exactly what the stream delivered.
+        assert_eq!(
+            block_json(&ContentBlock::Thinking {
+                thinking: "let me check".to_string(),
+                signature: "sig-abc".to_string(),
+            }),
+            serde_json::json!({
+                "type": "thinking",
+                "thinking": "let me check",
+                "signature": "sig-abc",
+            })
+        );
+        assert_eq!(
+            block_json(&ContentBlock::RedactedThinking { data: "opaque-bytes".to_string() }),
+            serde_json::json!({ "type": "redacted_thinking", "data": "opaque-bytes" })
+        );
     }
 
     #[test]

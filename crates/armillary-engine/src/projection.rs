@@ -56,7 +56,7 @@ pub struct ProviderMessage {
     pub content: Vec<ContentBlock>,
 }
 
-/// A single content block, mirroring the three Anthropic shapes this engine
+/// A single content block, mirroring the Anthropic shapes this engine
 /// can produce. Materialized to JSON by `provider::build_request_body` — this
 /// type is deliberately wire-*shaped* but not wire-*encoded*, so the encoding
 /// lives at one edge (P-4's separate flattening stage).
@@ -78,6 +78,19 @@ pub enum ContentBlock {
         tool_use_id: String,
         content: String,
         is_error: bool,
+    },
+    /// Opaque: captured from the stream, persisted, echoed verbatim. The
+    /// engine never reads `thinking` or `signature` — the documented replay
+    /// contract is "unchanged", and absence is the only alternative the API
+    /// cannot distinguish from a turn that never thought.
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    /// Encrypted thinking the API returns pre-opaque. Same rule, no fields
+    /// the engine can even pretend to read.
+    RedactedThinking {
+        data: String,
     },
 }
 
@@ -696,6 +709,32 @@ pub fn project_context(
             }
 
             "assistant_message" => {
+                // Replayed verbatim, ahead of the text — the wire order for
+                // this engine's models (thinking first, then text, then
+                // calls). Malformed items are skipped: intra-event data is
+                // not schema-pinned, and a bad item must not be able to 400
+                // every later turn on the stream.
+                if let Some(items) = ev.data.get("thinking").and_then(|v| v.as_array()) {
+                    let blocks: Vec<ContentBlock> = items
+                        .iter()
+                        .filter_map(|item| match item.get("type").and_then(|t| t.as_str()) {
+                            Some("thinking") => Some(ContentBlock::Thinking {
+                                thinking: item.get("thinking")?.as_str()?.to_string(),
+                                signature: item.get("signature")?.as_str()?.to_string(),
+                            }),
+                            Some("redacted_thinking") => Some(ContentBlock::RedactedThinking {
+                                data: item.get("data")?.as_str()?.to_string(),
+                            }),
+                            _ => None,
+                        })
+                        .collect();
+                    if !blocks.is_empty() {
+                        raw.push(ProviderMessage {
+                            role: ProviderRole::Assistant,
+                            content: blocks,
+                        });
+                    }
+                }
                 let mut content = text_field(&ev.data, "text");
                 if ev.data.get("interrupted").and_then(|v| v.as_bool()).unwrap_or(false) {
                     // The `interrupt` event itself carries no separate
@@ -878,6 +917,63 @@ mod tests {
             cost: None,
             data,
         }
+    }
+
+    #[test]
+    fn persisted_thinking_replays_ahead_of_text_and_folds_with_the_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = vec![
+            ev(1, "u1", "user_message", json!({"text": "hi"})),
+            ev(2, "a1", "assistant_message", json!({
+                "text": "checking",
+                "thinking": [
+                    {"type": "thinking", "thinking": "let me look", "signature": "sig-1"},
+                    {"type": "redacted_thinking", "data": "opaque"},
+                ],
+            })),
+            ev(3, "t1", "tool_use", json!({"id": "tu_1", "name": "read_file", "input": {"path": "a.md"}})),
+            ev(4, "r1", "tool_result", json!({"toolUseId": "tu_1", "status": "ok", "content": "a.md lines 1-1", "isError": false})),
+        ];
+
+        let turn = project_context(&events, dir.path()).unwrap();
+        let assistant = &turn.messages[1];
+        assert_eq!(assistant.role, ProviderRole::Assistant);
+        assert_eq!(
+            assistant.content,
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "let me look".to_string(),
+                    signature: "sig-1".to_string(),
+                },
+                ContentBlock::RedactedThinking { data: "opaque".to_string() },
+                ContentBlock::Text("checking".to_string()),
+                ContentBlock::ToolUse {
+                    id: "tu_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: json!({"path": "a.md"}),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_malformed_thinking_item_is_skipped_rather_than_sent_broken() {
+        // Intra-event data is not schema-pinned; a bad item must not be able to
+        // 400 every later turn on the stream.
+        let dir = tempfile::tempdir().unwrap();
+        let events = vec![
+            ev(1, "u1", "user_message", json!({"text": "hi"})),
+            ev(2, "a1", "assistant_message", json!({
+                "text": "checking",
+                "thinking": [{"type": "thinking", "thinking": "no signature field"}],
+            })),
+        ];
+
+        let turn = project_context(&events, dir.path()).unwrap();
+        assert_eq!(
+            turn.messages[1].content,
+            vec![ContentBlock::Text("checking".to_string())]
+        );
     }
 
     #[test]

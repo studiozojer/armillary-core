@@ -17,6 +17,7 @@ pub mod loop_;
 pub mod log;
 pub mod projection;
 pub mod provider;
+pub mod provider_openai;
 pub mod repos;
 pub mod routes;
 mod search;
