@@ -13,7 +13,7 @@ use std::sync::Arc;
 #[derive(Parser, Debug)]
 #[command(
     name = "armillary-engine",
-    about = "files service + chat loop (v0, single-provider) for a composed armillary workspace"
+    about = "files service + chat loop for a composed armillary workspace, piloted per-instance across Anthropic and OpenCode Zen"
 )]
 struct Args {
     /// Workspace root — the directory holding modules.toml.
@@ -292,10 +292,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let sessions = Arc::new(Sessions::new(store));
 
-    // `--model` absent falls back to the pre-this-task literal default.
-    // Task 3 replaces this with the full precedence the doc comment on
-    // `Args.model` names (instance → flag → `models.toml` → this literal);
-    // this task changes no behaviour, so the fallback stays exactly what
+    // `--model` absent falls back to this literal — unchanged by Task 3,
+    // which gives the INSTANCE's own recorded model precedence over this
+    // default per turn (`loop_::run_turn`, not here). `models.toml`'s own
+    // default slots into this `.unwrap_or_else` in Task 4, once
+    // `models::declared_default` exists; until then this stays exactly what
     // clap's `default_value` used to produce.
     let model_str = args.model.clone().unwrap_or_else(|| "claude-sonnet-5".to_string());
 

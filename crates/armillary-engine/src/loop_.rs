@@ -181,13 +181,16 @@ fn machine_code_for_provider_error(e: &ProviderError) -> String {
 /// type minted mid-sprint (ratified in the brief; revisit with
 /// machine-verdicts).
 ///
-/// `model` is the CONFIGURED model string (`state.model.model`), not one a
-/// provider ever confirmed running — a failure path by definition has no
-/// `TurnOutcome::model` to report, since it either never reached the
-/// provider or the provider itself is what failed. Included anyway so the
-/// success and failure shapes agree on which fields an `assistant_message`
-/// always carries, rather than the failure shape silently being the one
-/// case missing it.
+/// `model` is the INSTANCE's resolved model (`loop_::model_for`, falling
+/// back to `state.model.model` when unrecorded) — not one a provider ever
+/// confirmed running, since a failure path by definition has no
+/// `TurnOutcome::model` to report: it either never reached the provider or
+/// the provider itself is what failed. Included anyway so the success and
+/// failure shapes agree on which fields an `assistant_message` always
+/// carries, rather than the failure shape silently being the one case
+/// missing it. One caller — the `log_unreadable` path in `run_turn` — passes
+/// `state.model.model` directly rather than a resolved instance model: the
+/// read that would have named the instance's model is the one that failed.
 async fn fail_turn(
     sessions: &Arc<Sessions>,
     stream: &str,
@@ -327,13 +330,19 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
         Ok(events) => events,
         Err(e) => {
             eprintln!("failed to read stream {stream:?} for a turn: {e}");
+            // The engine's default, necessarily: the read that would have
+            // told us the instance's model is the one that just failed.
             fail_turn(&state.sessions, &stream, "dispatcher", &generation, "log_unreadable", &state.model.model).await;
             return;
         }
     };
     let operator = operator_label(&events);
-    // Read once per turn, from the same event slice `operator_label` was given.
+    // Read once per turn, from the same event slice `operator_label` and
+    // `may_write_composition` were given — no extra I/O. Absent, the
+    // engine's default pilots, so an instance created before per-instance
+    // models keeps working unchanged.
     let write_grant = may_write_composition(&events);
+    let model = model_for(&events).unwrap_or_else(|| state.model.model.clone());
 
     // Text produced by rounds already finished. The provider restarts its own
     // accumulator on every call, so without this the phone's bubble would jump
@@ -355,11 +364,11 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
         // A stop that arrives between rounds is observed here. Inside a round
         // the provider owns the signal; between them nothing else was watching.
         if *cancel_rx.borrow() {
-            record_interrupt(&state, &stream, &operator, &generation, &turn_text).await;
+            record_interrupt(&state, &stream, &operator, &generation, &turn_text, &model).await;
             return;
         }
 
-        let turn = match project_healing(&state, &stream, &operator, &generation).await {
+        let turn = match project_healing(&state, &stream, &operator, &generation, &model).await {
             Some(turn) => turn,
             None => return, // fail_turn already recorded the reason
         };
@@ -406,7 +415,7 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
 
         let outcome = state
             .providers
-            .provider_for(&state.model.model)
+            .provider_for(&model)
             .run_turn(req, tx, cancel_rx.clone())
             .await;
         let _ = relay.await;
@@ -415,7 +424,7 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
             Ok(o) => o,
             Err(e) => {
                 let code = machine_code_for_provider_error(&e);
-                fail_turn(&state.sessions, &stream, &operator, &generation, &code, &state.model.model).await;
+                fail_turn(&state.sessions, &stream, &operator, &generation, &code, &model).await;
                 return;
             }
         };
@@ -707,6 +716,7 @@ async fn record_interrupt(
     operator: &str,
     generation: &str,
     text_so_far: &str,
+    model: &str,
 ) {
     let ev = NewEvent {
         actor: Actor { role: Role::User, instance: None },
@@ -723,7 +733,7 @@ async fn record_interrupt(
             "text": text_so_far,
             "generation": generation,
             "interrupted": true,
-            "model": state.model.model,
+            "model": model,
         }),
     };
     if let Err(e) = append_blocking(&state.sessions, stream, ev).await {
@@ -743,6 +753,7 @@ async fn project_healing(
     stream: &str,
     operator: &str,
     generation: &str,
+    model: &str,
 ) -> Option<crate::projection::ModelTurn> {
     // Bounded: each pass must consume at least one distinct fault, so a
     // repair that fails to make progress cannot spin.
@@ -751,7 +762,7 @@ async fn project_healing(
             Ok(events) => events,
             Err(e) => {
                 eprintln!("failed to read stream {stream:?}: {e}");
-                fail_turn(&state.sessions, stream, operator, generation, "log_unreadable", &state.model.model).await;
+                fail_turn(&state.sessions, stream, operator, generation, "log_unreadable", model).await;
                 return None;
             }
         };
@@ -768,11 +779,11 @@ async fn project_healing(
                 let paths = declared_boot_paths(&events);
                 if paths.is_empty() {
                     eprintln!("drift on {path:?} but no boot event declares it on {stream:?}");
-                    fail_turn(&state.sessions, stream, operator, generation, "boot_unreadable", &state.model.model).await;
+                    fail_turn(&state.sessions, stream, operator, generation, "boot_unreadable", model).await;
                     return None;
                 }
                 if let Err(code) = rerecord_boot(state, stream, &paths).await {
-                    fail_turn(&state.sessions, stream, operator, generation, code, &state.model.model).await;
+                    fail_turn(&state.sessions, stream, operator, generation, code, model).await;
                     return None;
                 }
             }
@@ -785,7 +796,7 @@ async fn project_healing(
                 if let Err(code) =
                     crate::routes::instances::append_composition_event(state, stream).await
                 {
-                    fail_turn(&state.sessions, stream, operator, generation, code, &state.model.model).await;
+                    fail_turn(&state.sessions, stream, operator, generation, code, model).await;
                     return None;
                 }
             }
@@ -812,21 +823,21 @@ async fn project_healing(
                     .await
                     {
                         eprintln!("log_write_failed healing {id} on stream {stream:?}: {e:?}");
-                        fail_turn(&state.sessions, stream, operator, generation, "heal_failed", &state.model.model).await;
+                        fail_turn(&state.sessions, stream, operator, generation, "heal_failed", model).await;
                         return None;
                     }
                 }
             }
 
             Err(ProjectionError::BootUnreadable { .. }) | Err(ProjectionError::Transient) => {
-                fail_turn(&state.sessions, stream, operator, generation, "boot_unreadable", &state.model.model).await;
+                fail_turn(&state.sessions, stream, operator, generation, "boot_unreadable", model).await;
                 return None;
             }
         }
     }
 
     eprintln!("projection did not converge after repairs on stream {stream:?}");
-    fail_turn(&state.sessions, stream, operator, generation, "projection_unstable", &state.model.model).await;
+    fail_turn(&state.sessions, stream, operator, generation, "projection_unstable", model).await;
     None
 }
 
