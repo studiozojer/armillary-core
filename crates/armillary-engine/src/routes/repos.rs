@@ -408,18 +408,31 @@ pub async fn pull(
     }
 
     let abs = root.join(&module.path);
-    let pull_error = match git::is_dirty(&abs, git::DEFAULT_TIMEOUT).await {
-        Ok(true) => Some(repos::ActionError {
-            kind: "dirty",
-            message: "refusing to pull: the working tree has uncommitted changes".to_string(),
-        }),
-        Ok(false) => git::pull_ff(&abs, git::DEFAULT_TIMEOUT).await.err().map(pull_action_error),
-        Err(e) => Some(dirty_check_action_error(e)),
-    };
+    let pull_error = locked_dirty_check_then_pull(&abs).await;
 
     let mut new_state = repos::read_one(&root, &module, true).await;
     new_state.action_error = pull_error;
     Ok(Json(new_state))
+}
+
+/// The dirty check and the merge, under the process write lock.
+///
+/// **WD-15 extended over pull's check-then-merge.** `is_dirty` and
+/// `git merge` are two subprocesses; without the lock, a `write_file` landing
+/// between them defeats the refusal `pull`'s doc presents as the point — the
+/// cross-session hazard the lock was built for, previously unextended here.
+/// The guard spans only check+merge: `read_one` after it is a read and must
+/// not serialize against writes.
+async fn locked_dirty_check_then_pull(abs: &std::path::Path) -> Option<repos::ActionError> {
+    let _write_guard = crate::write::write_lock_async().await;
+    match git::is_dirty(abs, git::DEFAULT_TIMEOUT).await {
+        Ok(true) => Some(repos::ActionError {
+            kind: "dirty",
+            message: "refusing to pull: the working tree has uncommitted changes".to_string(),
+        }),
+        Ok(false) => git::pull_ff(abs, git::DEFAULT_TIMEOUT).await.err().map(pull_action_error),
+        Err(e) => Some(dirty_check_action_error(e)),
+    }
 }
 
 /// `POST /repos/{name}/push` — `git push` on one repo, returning its state
@@ -465,6 +478,28 @@ pub async fn fetch_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_pull_path_waits_on_a_held_write_lock() {
+        // Discriminates the extension itself: with the guard removed from
+        // locked_dirty_check_then_pull, the timeout branch completes and this
+        // fails. 100ms is the safe direction — a false PASS would need the
+        // whole check+merge to take longer than the timeout while unblocked,
+        // and both subprocesses run against a local tempdir clone.
+        let (_remote, clone) = crate::testgit::remote_and_clone();
+
+        let guard = crate::write::write_lock_async().await;
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            locked_dirty_check_then_pull(&clone),
+        )
+        .await;
+        assert!(blocked.is_err(), "pull must wait while the write lock is held");
+
+        drop(guard);
+        let outcome = locked_dirty_check_then_pull(&clone).await;
+        assert!(outcome.is_none(), "an up-to-date clone pulls clean: {outcome:?}");
+    }
 
     #[test]
     fn clamp_limit_defaults_when_the_query_key_is_absent() {

@@ -33,13 +33,28 @@ use std::path::{Path, PathBuf};
 /// process-wide, and a handle threaded through `AppState` would serialize
 /// per-`AppState` — tests alone construct several over one root. Same
 /// guarantee, taken literally.
-static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+///
+/// `tokio::sync::Mutex`, not `std` (changed with the pull extension): the
+/// pull route's check-then-merge holds this guard across two awaited git
+/// subprocesses, and a `std` guard is `!Send` — the compiler refuses it in
+/// an async fn. The write path acquires it blocking (below), which is legal
+/// where that path runs: under `spawn_blocking`, never on an executor thread.
+static WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Poisoning is not a failure mode worth propagating: what this guards is the
-/// filesystem, not an invariant held in memory, so a panic in another thread
-/// leaves nothing here to be inconsistent.
-pub(crate) fn write_lock() -> std::sync::MutexGuard<'static, ()> {
-    WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+/// The write path's acquire. Blocking is safe here — and ONLY here — because
+/// every write body runs under `dispatch`'s `spawn_blocking` (or a sync
+/// test); `blocking_lock` panics by design if an executor thread tries.
+pub(crate) fn write_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    WRITE_LOCK.blocking_lock()
+}
+
+/// The async acquire, for the one async holder: pull's check-then-merge
+/// (WD-15 extended, survey 2026-08-06 weakness #2). A `write_file` landing
+/// between `is_dirty` and `git merge` would defeat the dirty refusal that
+/// route's doc presents as the point — exactly the cross-session hazard this
+/// lock was built for, previously unextended over it.
+pub(crate) async fn write_lock_async() -> tokio::sync::MutexGuard<'static, ()> {
+    WRITE_LOCK.lock().await
 }
 
 /// Where a verb intends to write, and what it will have to make first.
