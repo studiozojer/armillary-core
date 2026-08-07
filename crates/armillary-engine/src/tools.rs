@@ -83,6 +83,45 @@ impl From<crate::guard::GuardError> for ToolError {
     }
 }
 
+/// One tool's provider-facing identity, dialect-neutral.
+///
+/// `schema` is a JSON Schema object and it is the ONE schema: both wire
+/// shapes below are projections of it, so the two provider dialects cannot
+/// drift apart per-tool. Ratified 2026-08-07 — an OpenAI-compat provider is
+/// next on the queue, and a registry that only spoke Anthropic would have
+/// moved this seam twice.
+#[derive(Debug, Clone)]
+pub struct ToolDef {
+    pub name: &'static str,
+    pub description: String,
+    pub schema: serde_json::Value,
+}
+
+impl ToolDef {
+    /// The Anthropic Messages shape: `{name, description, input_schema}`.
+    pub fn anthropic_definition(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "description": self.description,
+            "input_schema": self.schema,
+        })
+    }
+
+    /// The OpenAI chat-completions shape:
+    /// `{type: "function", function: {name, description, parameters}}`.
+    /// No `strict`: that is per-provider compat data, not a tool property.
+    pub fn openai_definition(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.schema,
+            },
+        })
+    }
+}
+
 /// The tool definitions sent with every request.
 ///
 /// Order is fixed and deliberate. Tool definitions render at the front of the
@@ -1609,6 +1648,59 @@ mod tests {
         assert_eq!(
             ToolError::new("invalid_pattern", "x").http_status(),
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    // ---- dialect projections ----
+
+    #[test]
+    fn one_schema_projects_to_both_dialects_without_forking() {
+        let def = ToolDef {
+            name: "specimen",
+            description: "a tool description long enough to be real".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string", "description": "p" } },
+                "required": ["path"],
+            }),
+        };
+
+        // The requirement ratified 2026-08-07: one schema, two wire shapes.
+        assert_eq!(
+            def.anthropic_definition()["input_schema"],
+            def.openai_definition()["function"]["parameters"],
+        );
+        assert_eq!(
+            def.anthropic_definition(),
+            serde_json::json!({
+                "name": "specimen",
+                "description": "a tool description long enough to be real",
+                "input_schema": def.schema,
+            })
+        );
+    }
+
+    #[test]
+    fn the_openai_projection_is_the_function_wrapper_shape() {
+        // Pinned in full: this is the shape OpenAiCompatProvider will send.
+        // `strict` is deliberately absent — per-provider compat data, not a
+        // property of the tool.
+        let def = ToolDef {
+            name: "specimen",
+            description: "d".to_string(),
+            schema: serde_json::json!({ "type": "object", "properties": {}, "required": [] }),
+        };
+
+        assert_eq!(
+            def.openai_definition(),
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "specimen",
+                    "description": "d",
+                    "parameters": { "type": "object", "properties": {}, "required": [] },
+                },
+            })
         );
     }
 }
