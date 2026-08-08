@@ -292,6 +292,7 @@ mod tests {
             actor: Actor {
                 role: Role::User,
                 instance: None,
+                principal: None,
             },
             event_type: "user_message".to_string(),
             thread: None,
@@ -539,6 +540,7 @@ mod tests {
             actor: Actor {
                 role: Role::Operator,
                 instance: Some("tycho".to_string()),
+                principal: None,
             },
             event_type: "boot".to_string(),
             thread: None,

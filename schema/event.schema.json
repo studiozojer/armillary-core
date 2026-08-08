@@ -34,7 +34,13 @@
           "type": "string",
           "enum": ["user", "operator", "system", "tool", "machine"]
         },
-        "instance": { "type": "string" }
+        "instance": { "type": "string" },
+        "principal": {
+          "type": "object",
+          "description": "Who requested this action, when that differs from what performed it. Absent when they are the same.",
+          "properties": { "name": { "type": "string" } },
+          "required": ["name"]
+        }
       },
       "description": "Structured {role, instance} — never a free-form string."
     },

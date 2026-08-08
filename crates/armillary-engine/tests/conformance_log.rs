@@ -213,6 +213,7 @@ async fn every_event_a_scripted_turn_emits_validates_against_the_schema() {
                 actor: Actor {
                     role: Role::System,
                     instance: None,
+                    principal: None,
                 },
                 event_type: "instance_created".to_string(),
                 data: serde_json::json!({ "operator": "tycho" }),
@@ -226,6 +227,7 @@ async fn every_event_a_scripted_turn_emits_validates_against_the_schema() {
                 actor: Actor {
                     role: Role::User,
                     instance: None,
+                    principal: None,
                 },
                 event_type: "user_message".to_string(),
                 data: serde_json::json!({ "text": "hi", "clientKey": "c1" }),

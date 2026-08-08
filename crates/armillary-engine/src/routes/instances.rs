@@ -296,6 +296,7 @@ async fn append_boot_event(
                 actor: Actor {
                     role: Role::System,
                     instance: None,
+                    principal: None,
                 },
                 event_type: "boot".to_string(),
                 data: serde_json::json!({ "files": files }),
@@ -367,6 +368,7 @@ pub(crate) async fn append_composition_event_from(
                 actor: Actor {
                     role: Role::System,
                     instance: None,
+                    principal: None,
                 },
                 event_type: "composition".to_string(),
                 data,
@@ -410,6 +412,7 @@ pub async fn create(
                     actor: Actor {
                         role: Role::System,
                         instance: None,
+                        principal: None,
                     },
                     event_type: "instance_created".to_string(),
                     data: serde_json::json!({

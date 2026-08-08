@@ -909,6 +909,7 @@ mod tests {
             actor: Actor {
                 role: Role::User,
                 instance: None,
+                principal: None,
             },
             event_type: event_type.to_string(),
             thread: None,

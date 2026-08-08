@@ -108,6 +108,7 @@ pub async fn send(
                     actor: Actor {
                         role: Role::User,
                         instance: None,
+                        principal: None,
                     },
                     event_type: "user_message".to_string(),
                     data: serde_json::json!({ "text": text, "clientKey": client_key }),
@@ -182,6 +183,7 @@ fn append_evict(sessions: &Sessions, stream: &str, event_id: &str) -> Result<(),
             actor: Actor {
                 role: Role::User,
                 instance: None,
+                principal: None,
             },
             event_type: "context_evict".to_string(),
             data: serde_json::json!({ "target": event_id }),
