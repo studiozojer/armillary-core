@@ -85,6 +85,10 @@ fn instance_from_first_event(stream: &str, first: &EventEnvelope, head_seq: u64)
         .get("operator")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // The one reader for a per-instance string field, shared with `loop_`'s
+    // resolvers — see `created_str_field` for why both the absence and the
+    // empty-string filters are there.
+    let read = crate::loop_::created_str_field;
 
     // Defaulted, not required: an instance created before this field existed
     // must list as `false` rather than fail to parse. The same defaulting
@@ -99,12 +103,7 @@ fn instance_from_first_event(stream: &str, first: &EventEnvelope, head_seq: u64)
     // Defaulted like the grant above, and for the same reason: an instance
     // created before this field existed must list and attach, not fail to
     // parse.
-    let model = first
-        .data
-        .get("model")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+    let model = read("model")(first);
 
     Some(Instance {
         id: stream.to_string(),
@@ -391,10 +390,16 @@ pub(crate) async fn append_composition_event_from(
 /// so this parameter is load-bearing for Stage 3 even before it is read.
 pub async fn create(
     State(state): State<SharedState>,
-    _caller: Caller,
+    caller: Caller,
     Json(body): Json<CreateRequest>,
 ) -> Result<(StatusCode, Json<Instance>), (StatusCode, String)> {
     let sessions = state.sessions.clone();
+    // Normalized on the WRITE side, not only on the read. `model` needed a
+    // read-side filter because its write side once admitted `""`; `principal`
+    // has never been written, so the wound is closed at the source and never
+    // opens. The read filter in `created_str_field` stays anyway — it does a
+    // different job, absorbing instances created before this field existed.
+    let principal = Some(caller.0.name.clone()).filter(|s| !s.trim().is_empty());
     let operator = body.operator;
     // `operator` is moved into the `instance_created` payload below; B-2 needs
     // the name again afterwards to resolve that operator's declared boot.
@@ -427,6 +432,12 @@ pub async fn create(
                         "startedAt": started_at,
                         "mayWriteComposition": may_write_composition,
                         "model": model,
+                        // Who asked for this instance to exist. Every write
+                        // the instance later performs inherits it (§ 3.4):
+                        // there is no HTTP write route, so a file write is a
+                        // model tool inside a turn, and the turn belongs to
+                        // this instance.
+                        "principal": principal,
                     }),
                 },
             )

@@ -16,7 +16,7 @@
 //! noise at every call site, and `loop_` with this doc comment is the
 //! quieter spelling of the same module.
 
-use crate::log::envelope::{Actor, EventEnvelope, Role};
+use crate::log::envelope::{Actor, ActorPrincipal, EventEnvelope, Role};
 use crate::projection::{project_context, ProjectionError};
 use crate::provider::ProviderError;
 #[cfg(test)]
@@ -126,10 +126,45 @@ pub fn model_for(events: &[EventEnvelope]) -> Option<String> {
     events
         .iter()
         .find(|e| e.event_type == "instance_created")
-        .and_then(|e| e.data.get("model"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .and_then(created_str_field("model"))
+}
+
+/// Which principal asked for this instance to exist, as recorded at its
+/// creation. `None` for an instance created before principals existed, and
+/// for one created on the host path with no requester to name.
+///
+/// This is what a `file_changed` inherits: there is no HTTP write route, so a
+/// write is a model tool reached inside a turn, and the principal behind that
+/// turn is the one that created the instance the turn belongs to.
+pub fn principal_for(events: &[EventEnvelope]) -> Option<String> {
+    events
+        .iter()
+        .find(|e| e.event_type == "instance_created")
+        .and_then(created_str_field("principal"))
+}
+
+/// Read one string field off an `instance_created` event, the one way.
+///
+/// **Both filters are load-bearing and they do different jobs.** An absent key
+/// is an instance created before the field existed; an EMPTY string is the
+/// shape a well-meaning serializer produces. A reader checking only for
+/// absence passes every test written against absent keys while silently
+/// regressing `""` — which is why `model` needed this on the read side at all,
+/// its write side having once admitted `""`.
+///
+/// Extracted rather than copied a third time. By the ruling that triggered it,
+/// the tree stood at three per-instance fields across two readers
+/// (`loop_`'s resolvers and `routes::instances::instance_from_first_event`)
+/// and a helper that deduped only one of the two would have left the worse
+/// copy behind — the one feeding every list and attach.
+pub fn created_str_field(key: &'static str) -> impl Fn(&EventEnvelope) -> Option<String> {
+    move |e: &EventEnvelope| {
+        e.data
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
 }
 
 fn assistant_actor(operator: &str) -> Actor {
@@ -345,6 +380,12 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
     // models keeps working unchanged.
     let write_grant = may_write_composition(&events);
     let model = model_for(&events).unwrap_or_else(|| state.model.model.clone());
+    // Resolved from the SAME first event, at the same point, for the same
+    // reason: read back rather than threaded through the loop as a parameter.
+    // Every `file_changed` this turn produces carries it — the write is a
+    // model tool inside a turn, so "at whose request" is the principal that
+    // created this instance.
+    let principal = principal_for(&events).map(|name| ActorPrincipal { name });
 
     // Text produced by rounds already finished. The provider restarts its own
     // accumulator on every call, so without this the phone's bubble would jump
@@ -588,7 +629,11 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
                             crate::tools::Effect::FileChanged { path, op, before, after } => NewEvent {
                                 // `Role::Tool`, matching `tool_result` — the
                                 // model asked, the tool answered.
-                                actor: Actor { role: Role::Tool, instance: None, principal: None },
+                                actor: Actor {
+                                    role: Role::Tool,
+                                    instance: None,
+                                    principal: principal.clone(),
+                                },
                                 event_type: "file_changed".to_string(),
                                 data: serde_json::json!({
                                     "path": path, "op": op, "before": before, "after": after,
@@ -917,6 +962,52 @@ mod tests {
         assert_eq!(model_for(&without), None);
     }
 
+    #[test]
+    fn an_empty_string_reads_as_absent_for_every_per_instance_field() {
+        // MUTATION-CHECKED, and it was found the hard way: deleting the
+        // `.filter(|s| !s.is_empty())` from `created_str_field` left the ENTIRE
+        // suite green. The filter's doc called both guards load-bearing and
+        // nothing held that claim up — a reason with no contact behind it,
+        // which is the defect this build exists to stop shipping.
+        //
+        // The two filters answer different questions and both are needed. An
+        // ABSENT key is an instance created before the field existed. An EMPTY
+        // string is what a well-meaning serializer emits, and it must read as
+        // "not set" rather than as a model named "" or a principal named "" —
+        // the latter would put a nameless requester on every write the
+        // instance performs.
+        let empty = vec![bare_event(
+            1,
+            "i1",
+            "instance_created",
+            serde_json::json!({ "operator": "tycho", "model": "", "principal": "" }),
+        )];
+        assert_eq!(model_for(&empty), None, "an empty model is not a model");
+        assert_eq!(principal_for(&empty), None, "an empty principal names nobody");
+
+        // And a real value still reads through, so the filter cannot be
+        // "fixed" by rejecting everything.
+        let set = vec![bare_event(
+            1,
+            "i1",
+            "instance_created",
+            serde_json::json!({ "operator": "tycho", "model": "zen/x", "principal": "iphone" }),
+        )];
+        assert_eq!(model_for(&set).as_deref(), Some("zen/x"));
+        assert_eq!(principal_for(&set).as_deref(), Some("iphone"));
+    }
+
+    #[test]
+    fn principal_for_is_none_when_the_field_was_never_written() {
+        let without = vec![bare_event(
+            1,
+            "i1",
+            "instance_created",
+            serde_json::json!({ "operator": "tycho" }),
+        )];
+        assert_eq!(principal_for(&without), None);
+    }
+
     fn model_config() -> ModelConfig {
         ModelConfig {
             model: "claude-sonnet-5".to_string(),
@@ -924,6 +1015,18 @@ mod tests {
     }
 
     async fn create_instance(sessions: &Sessions, operator: Option<&str>) -> String {
+        create_instance_as(sessions, operator, None).await
+    }
+
+    /// `create_instance`, plus the principal the HTTP route records at
+    /// creation. The key written here is pinned to the route's own by
+    /// `tests/routes.rs`'s `an_instance_records_the_principal_that_asked_for_it`,
+    /// so this fixture cannot drift into agreeing only with itself.
+    async fn create_instance_as(
+        sessions: &Sessions,
+        operator: Option<&str>,
+        principal: Option<&str>,
+    ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         sessions
             .append(
@@ -935,7 +1038,11 @@ mod tests {
                         principal: None,
                     },
                     event_type: "instance_created".to_string(),
-                    data: serde_json::json!({ "operator": operator, "startedAt": now_rfc3339() }),
+                    data: serde_json::json!({
+                        "operator": operator,
+                        "startedAt": now_rfc3339(),
+                        "principal": principal,
+                    }),
                 },
             )
             .unwrap();
@@ -1049,6 +1156,79 @@ mod tests {
             zen_key_present: false,
             boot: None,
         })
+    }
+
+    #[tokio::test]
+    async fn a_file_changed_names_the_principal_behind_its_turn() {
+        // § 3.4. There is no HTTP write route: `write_file` is a model tool
+        // reached inside a turn, so a file write inherits the principal that
+        // authenticated the `send`, by way of the instance that turn belongs
+        // to. Without this, the one existing effect-event in the system is the
+        // only one that cannot answer "at whose request".
+        let data_dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("modules.toml"), "[[repos]]\nname='r'\npath='p'\n")
+            .unwrap();
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance_as(&sessions, Some("tycho"), Some("iphone")).await;
+
+        let provider = std::sync::Arc::new(RoundScript::new(vec![
+            calls_with(
+                "toolu_w1",
+                "write_file",
+                serde_json::json!({ "path": "notes.md", "content": "from the phone\n" }),
+            ),
+            says("done"),
+        ]));
+        let state = state_with(provider, sessions.clone(), root.path()).await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+
+        let events = sessions.store().read_from(&id, 0).unwrap();
+        let changed = events.iter().find(|e| e.event_type == "file_changed").unwrap();
+        assert_eq!(
+            changed.actor.principal.as_ref().map(|p| p.name.as_str()),
+            Some("iphone"),
+            "the write must name who asked for the turn that produced it"
+        );
+        // The performer is unchanged: the tool did it, at a device's request.
+        assert_eq!(changed.actor.role, Role::Tool);
+    }
+
+    #[tokio::test]
+    async fn a_file_changed_from_a_principal_less_instance_names_nobody_rather_than_guessing() {
+        // An instance created before principals existed, or on the host path
+        // with no requester to name. Absent is the honest answer; a
+        // placeholder like "host" would be a fact nobody measured.
+        let data_dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("modules.toml"), "[[repos]]\nname='r'\npath='p'\n")
+            .unwrap();
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance(&sessions, Some("tycho")).await;
+
+        let provider = std::sync::Arc::new(RoundScript::new(vec![
+            calls_with(
+                "toolu_w1",
+                "write_file",
+                serde_json::json!({ "path": "notes.md", "content": "no principal\n" }),
+            ),
+            says("done"),
+        ]));
+        let state = state_with(provider, sessions.clone(), root.path()).await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+
+        let events = sessions.store().read_from(&id, 0).unwrap();
+        let changed = events.iter().find(|e| e.event_type == "file_changed").unwrap();
+        assert!(changed.actor.principal.is_none());
+        // And the field is omitted from the wire, not serialized as null.
+        let wire = serde_json::to_value(changed).unwrap();
+        assert!(wire["actor"].get("principal").is_none(), "{wire}");
     }
 
     #[tokio::test]

@@ -1240,3 +1240,43 @@ async fn models_default_and_label_survive_serialization_under_their_wire_names()
     assert_eq!(body["default"], "claude-sonnet-5");
     assert_eq!(body["models"][0]["label"], "Sonnet 5");
 }
+
+#[tokio::test]
+async fn an_instance_records_the_principal_that_asked_for_it() {
+    // The same SEAM as `an_instance_records_whether_it_may_write_the_composition`
+    // above, for the field a `file_changed` inherits. The route WRITES
+    // `principal` into `instance_created.data` and `loop_::principal_for`
+    // READS it back; each is correct alone and the pair fails silently if they
+    // disagree about the key. So the reader runs against events the writer
+    // actually produced, never against a hand-built one.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.keep().canonicalize().unwrap();
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let store = LogStore::open(&data_dir).unwrap();
+    let router = armillary_engine::app(AppState {
+        root,
+        sessions: Arc::new(Sessions::new(store)),
+        model: model_config(),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
+        registry_dir: full_grant_registry(),
+        anthropic_key_present: false,
+        zen_key_present: false,
+        boot: None,
+    });
+
+    let (status, created) =
+        post_json(router.clone(), "/instances", serde_json::json!({}), Some(TEST_TOKEN)).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let id = created["id"].as_str().unwrap().to_string();
+    let events = LogStore::open(&data_dir).unwrap().read_from(&id, 0).unwrap();
+    assert_eq!(
+        armillary_engine::loop_::principal_for(&events).as_deref(),
+        Some("test-client"),
+        "the loop's reader did not see the principal the route wrote"
+    );
+    // And it is on the durable event itself, under the key the reader uses.
+    assert_eq!(events[0].data["principal"], "test-client");
+}
