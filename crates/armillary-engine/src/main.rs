@@ -32,7 +32,7 @@ struct Args {
     /// BEFORE dispatching, `armillary-engine enroll --name x --grants sync`
     /// exited with "the following required arguments were not provided" — and
     /// that invocation is the one printed by this engine's own 401 body, by
-    /// the app's enrolment screen, and by every doc. The instruction handed to
+    /// the app's enrollment screen, and by every doc. The instruction handed to
     /// a locked-out device did not run. Optional here is what makes those
     /// sentences true rather than merely rewritten.
     #[arg(long)]
@@ -73,7 +73,7 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Enrol a device and print its token ONCE. The registry stores only a
+    /// Enroll a device and print its token ONCE. The registry stores only a
     /// SHA-256 hash of it (`principals::hash_token`), never the token
     /// itself — this line of output is the only place it will ever be
     /// visible again. A lost token is re-enrolled, not recovered.
@@ -167,7 +167,7 @@ fn run_command(cmd: &Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Enroll { name, grants } => {
             let token = enroll(&dir, name, grants)?;
             println!(
-                "enrolled {name}\n\ntoken (shown once, not recoverable — re-enrol if lost):\n{token}"
+                "enrolled {name}\n\ntoken (shown once, not recoverable — re-enroll if lost):\n{token}"
             );
         }
         Command::Revoke { name } => {
