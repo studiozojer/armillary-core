@@ -22,8 +22,21 @@ use std::sync::Arc;
 )]
 struct Args {
     /// Workspace root — the directory holding modules.toml.
+    ///
+    /// **Required to SERVE, ignored by every subcommand.** `enroll`, `revoke`
+    /// and `principals` administer a registry at `~/.config/armillary/devices/`
+    /// whose location does not depend on any workspace, so demanding a root
+    /// from them was asking for a value nothing read.
+    ///
+    /// It was not a harmless wart. Because clap enforces a required global
+    /// BEFORE dispatching, `armillary-engine enroll --name x --grants sync`
+    /// exited with "the following required arguments were not provided" — and
+    /// that invocation is the one printed by this engine's own 401 body, by
+    /// the app's enrollment screen, and by every doc. The instruction handed to
+    /// a locked-out device did not run. Optional here is what makes those
+    /// sentences true rather than merely rewritten.
     #[arg(long)]
-    root: PathBuf,
+    root: Option<PathBuf>,
 
     /// Interface to bind. Defaults to loopback; pass the tailnet address to
     /// serve the tailnet.
@@ -60,7 +73,7 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Enrol a device and print its token ONCE. The registry stores only a
+    /// Enroll a device and print its token ONCE. The registry stores only a
     /// SHA-256 hash of it (`principals::hash_token`), never the token
     /// itself — this line of output is the only place it will ever be
     /// visible again. A lost token is re-enrolled, not recovered.
@@ -154,7 +167,7 @@ fn run_command(cmd: &Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Enroll { name, grants } => {
             let token = enroll(&dir, name, grants)?;
             println!(
-                "enrolled {name}\n\ntoken (shown once, not recoverable — re-enrol if lost):\n{token}"
+                "enrolled {name}\n\ntoken (shown once, not recoverable — re-enroll if lost):\n{token}"
             );
         }
         Command::Revoke { name } => {
@@ -369,10 +382,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => eprintln!("warning: could not mint the host principal — {e}"),
     }
 
-    let root = args
+    // Required only on this path — the serving path. Named as a missing
+    // argument rather than unwrapped, so omitting it reads the way clap's own
+    // error did rather than as a panic.
+    let declared_root = args
         .root
+        .ok_or("--root is required to serve a workspace (it is not needed by enroll/revoke/principals)")?;
+    let root = declared_root
         .canonicalize()
-        .map_err(|e| format!("--root {} is not readable: {e}", args.root.display()))?;
+        .map_err(|e| format!("--root {} is not readable: {e}", declared_root.display()))?;
 
     // C-4: a workspace that composes nothing is a working host, not an error.
     // Said out loud rather than silently, because an empty Explorer and a

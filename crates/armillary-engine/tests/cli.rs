@@ -190,3 +190,87 @@ fn a_subcommand_does_not_serve() {
         "a subcommand must not print the serving line: {lines:?}"
     );
 }
+
+/// **The command the engine tells a locked-out device to run must actually
+/// run.**
+///
+/// `--root` used to be a required global, so clap rejected
+/// `armillary-engine enroll …` before dispatching — and that exact invocation
+/// is what `auth::denied` prints in a 401 body, what the app's enrollment
+/// screen displays, and what every doc repeated. Someone locked out was handed
+/// an instruction that exited with "the following required arguments were not
+/// provided".
+///
+/// Nothing caught it because every test either passed `--root` (having copied
+/// the serving form) or asserted on the message as a STRING rather than
+/// running it. So this extracts the command out of the refusal body the engine
+/// really emits and executes it, which is the only version of this test that
+/// could have failed.
+#[test]
+fn the_command_named_in_a_refusal_actually_runs() {
+    let (_status, body) = armillary_engine::auth::denied("no_principal");
+
+    // Pull the backticked command out of the engine's own sentence rather
+    // than restating it here — a hardcoded copy would keep passing after the
+    // message changed, which is how the original defect survived.
+    let cmd = body
+        .split('`')
+        .find(|s| s.starts_with("armillary-engine "))
+        .expect("the refusal must name a command");
+    assert!(cmd.contains("enroll"), "{cmd}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let args: Vec<&str> = cmd.split_whitespace().skip(1).collect();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_armillary-engine"))
+        .args(&args)
+        .env("HOME", dir.path())
+        .output()
+        .expect("the binary runs");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("required arguments were not provided"),
+        "the refusal names a command the binary rejects: {stderr}"
+    );
+}
+
+/// The three subcommands work with NO `--root`, which is the whole point of
+/// making it optional: they administer `~/.config/armillary/devices/`, whose
+/// location no workspace determines.
+#[test]
+fn enroll_revoke_and_principals_need_no_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_armillary-engine"))
+            .args(args)
+            .env("HOME", dir.path())
+            .output()
+            .expect("the binary runs")
+    };
+
+    let enrolled = run(&["enroll", "--name", "iphone", "--grants", "sync,push"]);
+    assert!(enrolled.status.success(), "{}", String::from_utf8_lossy(&enrolled.stderr));
+
+    let listed = run(&["principals"]);
+    assert!(listed.status.success());
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("iphone"));
+
+    let revoked = run(&["revoke", "--name", "iphone"]);
+    assert!(revoked.status.success(), "{}", String::from_utf8_lossy(&revoked.stderr));
+}
+
+/// Serving still REQUIRES a root, and says so as a missing argument rather
+/// than panicking on an unwrap — the other half of making it optional.
+#[test]
+fn serving_without_a_root_is_a_named_error_not_a_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_armillary-engine"))
+        .env("HOME", dir.path())
+        .output()
+        .expect("the binary runs");
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--root is required to serve"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}

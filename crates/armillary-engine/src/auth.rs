@@ -35,15 +35,15 @@ pub fn denied(code: &'static str) -> (StatusCode, String) {
     let (status, why) = match code {
         "no_principal" => (
             StatusCode::UNAUTHORIZED,
-            "this request mutates state and carried no credential. Enrol this device on the host with `armillary-engine enroll --name <name> --grants sync,push` and send its token as `Authorization: Bearer <token>`.",
+            "this request mutates state and carried no credential. Enroll this device by running `armillary-engine enroll --name <name> --grants sync,push` ON THE HOST, then send the token it prints as `Authorization: Bearer <token>`. The token is printed once and is not recoverable.",
         ),
         "unknown_principal" => (
             StatusCode::UNAUTHORIZED,
-            "that token belongs to no principal on this host — it may have been revoked. Re-enrol with `armillary-engine enroll`.",
+            "that token belongs to no principal on this host — it may have been revoked, or minted on a different host (the registry is host-local). Run `armillary-engine enroll --name <name> --grants sync,push` on THIS host to mint a new one.",
         ),
         "principal_not_granted" => (
             StatusCode::FORBIDDEN,
-            "this device is enrolled but was not granted that authority. Re-enrol it with the grant: `armillary-engine enroll --name <name> --grants sync,push`.",
+            "this device is enrolled but was not granted that authority. Re-run `armillary-engine enroll --name <name> --grants sync,push` on the host with the grant it needs; re-enrolling an existing name replaces its entry.",
         ),
         other => (StatusCode::FORBIDDEN, other),
     };
