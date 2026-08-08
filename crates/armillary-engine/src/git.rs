@@ -882,6 +882,63 @@ fn parse_log(stdout: &str) -> Vec<LogEntry> {
         .collect()
 }
 
+/// `run_git` with bytes piped to the child's stdin.
+///
+/// Exists for exactly one caller class: values that must never enter argv.
+/// A commit message is request-derived free text; `-F -` reads it from stdin,
+/// so there is no argument position for git to misread (§ 3.2's rule in its
+/// strongest form — not even `validate_arg` is asked to carry it).
+pub async fn run_git_stdin(
+    repo: &Path,
+    args: &[&str],
+    input: &[u8],
+    timeout: Duration,
+) -> Result<GitOutput, GitError> {
+    use tokio::io::AsyncWriteExt;
+    let mut cmd = git_command(repo, args);
+    cmd.stdin(Stdio::piped());
+    let fut = async {
+        let mut child = cmd.spawn().map_err(|e| GitError::Failed(e.to_string()))?;
+        let mut stdin = child.stdin.take().expect("stdin was piped two lines up");
+        stdin
+            .write_all(input)
+            .await
+            .map_err(|e| GitError::Failed(e.to_string()))?;
+        drop(stdin); // EOF: git reads the message to end-of-input
+        child
+            .wait_with_output()
+            .await
+            .map_err(|e| GitError::Failed(e.to_string()))
+    };
+    match tokio::time::timeout(timeout, fut).await {
+        Err(_) => Err(GitError::Timeout),
+        Ok(Err(e)) => Err(e),
+        Ok(Ok(out)) => Ok(GitOutput {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        }),
+    }
+}
+
+/// `git add --all` — stage everything, untracked included. No request value
+/// reaches argv at all.
+pub async fn add_all(repo: &Path, timeout: Duration) -> Result<(), GitError> {
+    require_ok(run_git(repo, &["add", "--all"], timeout).await?, "git add --all")
+}
+
+/// `git commit -F -` — the message arrives on stdin, never argv.
+///
+/// No `--amend`, no `--allow-empty`, deliberately: the commit grant's stated
+/// meaning is append-only authorship on the current branch, and this
+/// invocation is where that sentence is true or false.
+pub async fn commit(repo: &Path, message: &str, timeout: Duration) -> Result<(), GitError> {
+    require_ok(
+        run_git_stdin(repo, &["commit", "-F", "-"], message.as_bytes(), timeout).await?,
+        "git commit",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1507,5 +1564,40 @@ mod tests {
         assert!(!has_submodules(&clone));
         std::fs::write(clone.join(".gitmodules"), "[submodule \"x\"]\n").unwrap();
         assert!(has_submodules(&clone));
+    }
+
+    #[tokio::test]
+    async fn commit_records_the_full_stdin_message_and_stages_untracked() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git_sync(repo, &["init", "-b", "main"]);
+        commit(repo, "tracked.md", "original"); // fixture: an initial commit
+        std::fs::write(repo.join("tracked.md"), "edited").unwrap();
+        std::fs::write(repo.join("untracked.md"), "new").unwrap();
+
+        super::add_all(repo, DEFAULT_TIMEOUT).await.unwrap();
+        super::commit(repo, "subject line\n\nbody\n\nCommitted-from: iphone", DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+
+        let log = run_git(repo, &["log", "-1", "--format=%B"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(log.stdout.contains("subject line"));
+        assert!(log.stdout.contains("Committed-from: iphone"));
+        let status = run_git(repo, &["status", "--porcelain"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(status.stdout.is_empty(), "both files must be committed, got: {}", status.stdout);
+    }
+
+    #[tokio::test]
+    async fn commit_on_nonzero_exit_is_failed_not_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git_sync(repo, &["init", "-b", "main"]);
+        // Nothing staged, nothing committed ever: `git commit` exits nonzero.
+        let err = super::commit(repo, "message", DEFAULT_TIMEOUT).await.unwrap_err();
+        assert!(matches!(err, GitError::Failed(_)));
     }
 }
