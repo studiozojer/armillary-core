@@ -616,15 +616,104 @@ pub fn validate_arg(value: &str) -> Result<(), GitError> {
     Ok(())
 }
 
-/// `git push`. No `--force`, no `--force-with-lease`, no refspec — the branch
-/// and its upstream come from the repo's own config, so nothing here is
-/// request-derived.
+/// What the REMOTE moved, as git itself reported it.
+///
+/// Every field is optional and stays absent rather than being defaulted. A new
+/// branch has no `before` because there was nothing to move from, and an
+/// up-to-date push moved nothing at all — in both cases a zero-filled sha
+/// would be a fabrication with the shape of a measurement.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PushReport {
+    pub reference: Option<String>,
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+
+/// Parse `git push --porcelain` stdout.
+///
+/// The format is one tab-separated line per ref — `<flag>\t<from>:<to>\t<summary>`
+/// — wrapped by a `To <remote>` header and a `Done` trailer. The flag is a
+/// single character (a SPACE for a fast-forward, `*` new, `=` up to date, `!`
+/// rejected, `+` forced, `-` deleted) and the summary is `<old>..<new>` for a
+/// fast-forward and a bracketed phrase for everything else.
+///
+/// **Only a summary matching `<hex>..<hex>` yields shas.** Anything else yields
+/// none, including a format this function does not recognise — a future git
+/// must produce "we don't know", never a plausible pair.
+///
+/// Shapes below are transcribed from live `git push --porcelain` runs against a
+/// scratch remote (2026-08-08, git 2.x/macOS), not from documentation.
+pub fn parse_porcelain(stdout: &str) -> PushReport {
+    for line in stdout.lines() {
+        let mut fields = line.split('\t');
+        let _flag = fields.next();
+        let Some(refspec) = fields.next() else { continue };
+        let Some(summary) = fields.next() else { continue };
+        let Some((_from, to)) = refspec.split_once(':') else { continue };
+        if !to.starts_with("refs/") {
+            continue;
+        }
+
+        let (before, after) = match summary.split_once("..") {
+            Some((b, a))
+                if !b.is_empty()
+                    && !a.is_empty()
+                    && b.chars().all(|c| c.is_ascii_hexdigit())
+                    && a.chars().all(|c| c.is_ascii_hexdigit()) =>
+            {
+                (Some(b.to_string()), Some(a.to_string()))
+            }
+            _ => (None, None),
+        };
+        return PushReport { reference: Some(to.to_string()), before, after };
+    }
+    PushReport::default()
+}
+
+/// `git push --porcelain`.
+///
+/// **No `--force`, no `--force-with-lease`, no refspec, no branch argument** —
+/// the branch and its upstream come from the repo's own config, so nothing here
+/// is request-derived. `--porcelain` is a REPORTING flag: it changes what git
+/// prints, never what git does. That distinction is the whole content of the
+/// `push` grant, whose wording in `modules.local.toml` was updated in the same
+/// change that added this flag rather than left to contradict the code.
 ///
 /// A non-fast-forward is a nonzero exit and therefore an `Err`, and that is
-/// the whole safety story: a diverged branch is refused by git rather than
-/// resolved by us.
-pub async fn push(repo: &Path, timeout: Duration) -> Result<(), GitError> {
-    require_ok(run_git(repo, &["push"], timeout).await?, "git push")
+/// still the whole safety story: a diverged branch is refused by git rather
+/// than resolved by us.
+///
+/// # Why the failure message carries stdout, and why that is not cosmetic
+///
+/// `require_ok` is deliberately NOT used here. It builds its message from
+/// stderr alone, which is correct for every other verb and **wrong for a
+/// porcelain push**: measured 2026-08-08, `--porcelain` moves the per-ref
+/// status line — the only text carrying `[rejected]` or `[remote rejected]` —
+/// from stderr onto STDOUT, leaving stderr with nothing but the generic
+/// `error: failed to push some refs to '<remote>'`.
+///
+/// `routes::repos::push_action_error` classifies on exactly those two markers.
+/// Had this reported stderr alone, both `not-fast-forwardable` and
+/// `refused-by-remote` would have silently collapsed to `transport` — a
+/// two-thirds loss of the taxonomy, invisible from the happy path and
+/// invisible to any test that exercises a no-upstream failure (which carries
+/// no marker either way, and whose stdout under `--porcelain` is empty).
+///
+/// So the report is prepended to the message: the discriminator survives the
+/// flag that displaced it. Asserted end-to-end, per classified variant, by
+/// `routes::repos`'s `each_rejection_keeps_its_kind_under_the_porcelain_flag`.
+pub async fn push(repo: &Path, timeout: Duration) -> Result<PushReport, GitError> {
+    let out = run_git(repo, &["push", "--porcelain"], timeout).await?;
+    if !out.ok() {
+        let joined = match (out.stdout.trim(), out.stderr.trim()) {
+            ("", "") => format!("git push exited {}", out.code),
+            ("", e) => e.to_string(),
+            (o, "") => o.to_string(),
+            (o, e) => format!("{o}\n{e}"),
+        };
+        return Err(GitError::Failed(joined));
+    }
+    Ok(parse_porcelain(&out.stdout))
 }
 
 /// One entry from `git log`, before anything knows about upstream state.
@@ -907,6 +996,117 @@ mod tests {
         let verify = tempfile::tempdir().unwrap().keep();
         git_sync(&verify, &["clone", remote.to_str().unwrap(), verify.to_str().unwrap()]);
         assert!(verify.join("mine.md").exists(), "the remote never received the commit");
+    }
+
+    // The four porcelain shapes below are transcribed from live runs against a
+    // scratch remote on 2026-08-08, not composed by hand. The fast-forward
+    // flag is a literal SPACE, which is easy to write as an empty field and
+    // then never exercise.
+
+    #[test]
+    fn porcelain_reports_what_the_remote_moved() {
+        // The summary field carries the REMOTE's account of the transition —
+        // which is why we read this instead of a local `@{u}`, a value that
+        // describes a remote we may not have fetched.
+        let out = "To /tmp/remote.git\n \
+                   \trefs/heads/main:refs/heads/main\t8b8d973..8c4d533\n\
+                   Done";
+        let r = parse_porcelain(out);
+        assert_eq!(r.reference.as_deref(), Some("refs/heads/main"));
+        assert_eq!(r.before.as_deref(), Some("8b8d973"));
+        assert_eq!(r.after.as_deref(), Some("8c4d533"));
+    }
+
+    #[test]
+    fn a_new_branch_has_no_before_and_it_stays_absent() {
+        // `--porcelain` reports a created ref with `*` and `[new branch]`,
+        // carrying NO old sha, because there was nothing to move from. A
+        // `000000…` here would be a fabrication dressed as a measurement.
+        let out = "To /tmp/remote.git\n\
+                   *\trefs/heads/feature/y:refs/heads/feature/y\t[new branch]\n\
+                   Done";
+        let r = parse_porcelain(out);
+        assert_eq!(r.reference.as_deref(), Some("refs/heads/feature/y"));
+        assert_eq!(r.before, None, "no old sha may be invented");
+        assert_eq!(r.after, None, "and no new one may be read out of a summary that has none");
+    }
+
+    #[test]
+    fn an_up_to_date_push_reports_no_movement() {
+        let out = "To /tmp/remote.git\n\
+                   =\trefs/heads/main:refs/heads/main\t[up to date]\n\
+                   Done";
+        let r = parse_porcelain(out);
+        assert_eq!(r.reference.as_deref(), Some("refs/heads/main"));
+        assert_eq!(r.before, None);
+        assert_eq!(r.after, None);
+    }
+
+    #[test]
+    fn a_rejection_summary_yields_a_ref_but_never_a_sha_pair() {
+        // The rejected line reaches the parser too, because the failure
+        // message carries stdout. It must name the ref and invent nothing.
+        let out = "To /tmp/remote.git\n\
+                   !\trefs/heads/main:refs/heads/main\t[rejected] (fetch first)\n\
+                   Done";
+        let r = parse_porcelain(out);
+        assert_eq!(r.reference.as_deref(), Some("refs/heads/main"));
+        assert_eq!(r.before, None);
+        assert_eq!(r.after, None);
+    }
+
+    #[test]
+    fn unparseable_output_yields_an_empty_report_rather_than_a_wrong_one() {
+        // A future git whose format we do not recognise must produce
+        // "we don't know" and never a plausible-looking pair of shas.
+        let r = parse_porcelain("something entirely unexpected");
+        assert_eq!(r.reference, None);
+        assert_eq!(r.before, None);
+        assert_eq!(r.after, None);
+    }
+
+    #[tokio::test]
+    async fn a_successful_push_reports_the_range_the_remote_moved() {
+        let (_remote, clone) = remote_and_clone();
+        let before = run_git(&clone, &["rev-parse", "HEAD"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap()
+            .stdout;
+        commit(&clone, "mine.md", "local work");
+        let after = run_git(&clone, &["rev-parse", "HEAD"], DEFAULT_TIMEOUT)
+            .await
+            .unwrap()
+            .stdout;
+
+        let report = push(&clone, DEFAULT_TIMEOUT).await.unwrap();
+        assert_eq!(report.reference.as_deref(), Some("refs/heads/main"));
+        // Git abbreviates in the porcelain summary, so the assertion is a
+        // prefix relation against the FULL shas read from the repo — not a
+        // re-derivation of the same abbreviation, which would be a tautology.
+        let (rb, ra) = (report.before.unwrap(), report.after.unwrap());
+        assert!(before.starts_with(&rb), "{before} does not begin with {rb}");
+        assert!(after.starts_with(&ra), "{after} does not begin with {ra}");
+        assert_ne!(rb, ra, "a push that moved something reports two different shas");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_push_keeps_its_discriminator_after_the_flag_moved_it() {
+        // BUILD RISK 1, at this layer. `--porcelain` relocates the `[rejected]`
+        // marker from stderr to stdout; `push_action_error` classifies on that
+        // marker. If `push` reported stderr alone the marker would be gone and
+        // the kind would degrade silently. Measured, not assumed: under the
+        // flag, stderr carries only "error: failed to push some refs".
+        let (remote, clone) = remote_and_clone();
+        advance_remote(&remote);
+        commit(&clone, "mine.md", "local work");
+        fetch(&clone, DEFAULT_TIMEOUT).await.unwrap();
+
+        let err = push(&clone, DEFAULT_TIMEOUT).await.unwrap_err();
+        let GitError::Failed(msg) = err else { panic!("expected Failed, got {err:?}") };
+        assert!(
+            msg.contains("[rejected]"),
+            "the discriminator must survive the reporting flag; got: {msg}"
+        );
     }
 
     #[tokio::test]

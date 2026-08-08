@@ -505,7 +505,8 @@ pub async fn push(
     }
 
     let abs = root.join(&module.path);
-    let push_error = git::push(&abs, git::DEFAULT_TIMEOUT).await.err().map(push_action_error);
+    let outcome = git::push(&abs, git::DEFAULT_TIMEOUT).await;
+    let push_error = outcome.as_ref().err().cloned().map(push_action_error);
 
     let mut new_state = repos::read_one(&root, &module, true).await;
     new_state.action_error = push_error;
@@ -536,6 +537,62 @@ pub async fn fetch_all(
 mod tests {
     use super::*;
     use tower::ServiceExt;
+
+    /// BUILD RISK 1, discharged at the seam rather than at either end.
+    ///
+    /// `git.rs` proves the `[rejected]` marker survives `--porcelain`, and the
+    /// classifier above is a pure function over that marker. Both can be green
+    /// while the assembly is broken, which is the defect class this build kept
+    /// finding — so this drives a REAL failing push of each classified kind
+    /// through `push` into `push_action_error` and asserts the kind that comes
+    /// out.
+    ///
+    /// The no-upstream case is included deliberately: it is the case the plan
+    /// originally chose as its guard, and it is `transport` with or without the
+    /// flag, so it could never have observed the regression it was written for.
+    #[tokio::test]
+    async fn each_rejection_keeps_its_kind_under_the_porcelain_flag() {
+        use crate::git::{self, DEFAULT_TIMEOUT};
+        use crate::testgit::{advance_remote, commit, git_sync, remote_and_clone};
+
+        // 1 — a diverged branch: the remote moved, we did too.
+        let (remote, clone) = remote_and_clone();
+        advance_remote(&remote);
+        commit(&clone, "mine.md", "local work");
+        git::fetch(&clone, DEFAULT_TIMEOUT).await.unwrap();
+        let err = push_action_error(git::push(&clone, DEFAULT_TIMEOUT).await.unwrap_err());
+        assert_eq!(
+            err.kind, "not-fast-forwardable",
+            "a non-fast-forward must not degrade to transport; got {err:?}"
+        );
+
+        // 2 — a policy refusal: the remote was reached and declined.
+        let (remote2, clone2) = remote_and_clone();
+        let hooks = remote2.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-receive");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        commit(&clone2, "mine.md", "local work");
+        let err = push_action_error(git::push(&clone2, DEFAULT_TIMEOUT).await.unwrap_err());
+        assert_eq!(
+            err.kind, "refused-by-remote",
+            "a declining hook is not a transport failure; got {err:?}"
+        );
+
+        // 3 — no upstream: genuinely `transport`, and the reason the plan's
+        // original guard was blind. Kept so that stays visible rather than
+        // being rediscovered.
+        let (_remote3, clone3) = remote_and_clone();
+        git_sync(&clone3, &["checkout", "-b", "orphan"]);
+        commit(&clone3, "mine.md", "local work");
+        let err = push_action_error(git::push(&clone3, DEFAULT_TIMEOUT).await.unwrap_err());
+        assert_eq!(err.kind, "transport", "got {err:?}");
+    }
 
     #[test]
     fn a_mid_request_manifest_write_cannot_split_gate_from_act() {
