@@ -218,6 +218,9 @@ const HANDLED_TYPES: &[&str] = &[
     "tool_use",
     "tool_result",
     "file_changed",
+    "repo_fetched",
+    "repo_pulled",
+    "repo_pushed",
 ];
 
 /// Resolve a boot event's `data.path` under `root`, through the same guard
@@ -861,6 +864,18 @@ pub fn project_context(
             // renders `[unhandled event type: file_changed]` into the model's
             // context, which is the opposite of the decision.
             "file_changed" => {}
+
+            // The three repo verbs. Handled by producing NOTHING: they live in
+            // the `workspace` stream, which no model context window projects
+            // over, so there is no message for them to become.
+            //
+            // Stated as an arm rather than left to the catch-all on purpose. A
+            // type absent from `HANDLED_TYPES` reaches a model as
+            // "[unhandled event type: …]", and a type present but silently
+            // falling through is indistinguishable from one nobody thought
+            // about. This arm is the difference between "decided" and
+            // "missed", and it is the only record of which one this was.
+            "repo_fetched" | "repo_pulled" | "repo_pushed" => {}
 
             // Never silent (P-3): visible in the transcript rather than
             // dropped, so a gap in coverage shows up where a human or the
@@ -1691,13 +1706,21 @@ mod tests {
         // the compiler's sense — this test stands in for that. Add a ninth
         // durable type to `DURABLE_TYPES` and this fails until `HANDLED_TYPES`
         // (and the match arms it mirrors) grow to cover it.
-        assert_eq!(HANDLED_TYPES.len(), DURABLE_TYPES.len());
+        // The naming loop runs FIRST, deliberately. The count assertion below
+        // is the cheaper check and used to sit above this, where it
+        // short-circuited on the very case this guard exists to report — a new
+        // durable type failed with `left: 12, right: 15` and never reached the
+        // line that says WHICH type. A guard that fires without naming its
+        // finding makes the reader re-derive it by hand.
         for t in DURABLE_TYPES {
             assert!(
                 HANDLED_TYPES.contains(t),
                 "{t} is durable but has no explicit arm in project_context / HANDLED_TYPES"
             );
         }
+        // Kept, and not redundant: the loop cannot see a type in HANDLED_TYPES
+        // that is no longer durable — a stale arm outliving its event.
+        assert_eq!(HANDLED_TYPES.len(), DURABLE_TYPES.len());
     }
 
     #[test]
@@ -1740,6 +1763,27 @@ mod tests {
                     "op": "modified",
                     "before": "aa",
                     "after": "bb",
+                }),
+                // Like `file_changed`, durable and deliberately projecting
+                // nothing — and for a stronger reason: these never appear in
+                // an instance stream at all. They are in this fixture anyway,
+                // because the assertion is about the CATCH-ALL, and a type
+                // omitted here would be one this guard never exercised.
+                "repo_fetched" => json!({ "repo": "daoUI", "result": "ok" }),
+                "repo_pulled" => json!({
+                    "repo": "daoUI",
+                    "before": "aaaaaaa",
+                    "after": "bbbbbbb",
+                    "result": "ok",
+                }),
+                "repo_pushed" => json!({
+                    "repo": "daoUI",
+                    "ref": "refs/heads/main",
+                    "before": "aaaaaaa",
+                    "after": "bbbbbbb",
+                    "commits": 1,
+                    "executed_as": { "host": "test-host", "credential": "host-user-git" },
+                    "result": "ok",
                 }),
                 other => panic!("test fixture missing a data payload for durable type {other}"),
             };

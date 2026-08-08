@@ -141,6 +141,7 @@ mod tests {
             model: ModelConfig { model: "claude-sonnet-5".to_string() },
             providers: crate::provider::fixed(Arc::new(crate::provider::KeylessProvider)),
             models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
             registry_dir,
             anthropic_key_present: false,
             zen_key_present: false,

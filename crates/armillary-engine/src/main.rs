@@ -518,6 +518,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             model,
             providers,
             models_path,
+            // Read once, here, so no route ever calls out to the system for
+            // it. `hostname(1)` rather than a crate: `/etc/hostname` is
+            // Linux-only and `$HOSTNAME` is not exported on macOS, and this
+            // is not worth a dependency.
+            hostname: std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unknown".to_string()),
             registry_dir,
             anthropic_key_present,
             zen_key_present,

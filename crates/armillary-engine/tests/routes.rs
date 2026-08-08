@@ -72,6 +72,7 @@ fn app_over(setup: impl FnOnce(&PathBuf)) -> axum::Router {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
         registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
@@ -99,6 +100,7 @@ fn app_with_data_dir_under_root(setup: impl FnOnce(&PathBuf)) -> axum::Router {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
         registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
@@ -131,6 +133,7 @@ fn app_with_boot(boot_rel: &str, contents: &str) -> (axum::Router, PathBuf, Path
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
         registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
@@ -732,6 +735,7 @@ async fn create_records_the_composition_so_a_session_knows_what_it_was_booted_in
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
         registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
@@ -783,6 +787,7 @@ fn app_with_operator_boot() -> (axum::Router, PathBuf, PathBuf) {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
         registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
@@ -876,6 +881,7 @@ async fn an_unreadable_boot_source_still_creates_the_instance() {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
         registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
@@ -903,6 +909,7 @@ async fn a_non_utf8_boot_source_is_skipped_not_appended() {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
         registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
@@ -930,6 +937,7 @@ async fn a_boot_path_declared_absolute_is_refused_not_relativized() {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
         registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
@@ -964,6 +972,7 @@ async fn a_boot_path_escaping_root_is_skipped_not_honored() {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
         registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
@@ -991,6 +1000,7 @@ async fn an_instance_records_whether_it_may_write_the_composition() {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
         registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
@@ -1067,6 +1077,7 @@ async fn create_with_an_empty_model_string_is_normalized_to_none_in_the_log() {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
         registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
@@ -1130,6 +1141,7 @@ fn app_with_models(root: &Path, models_path: &Path, anthropic: bool, zen: bool) 
 
     app(AppState {
         root,
+        hostname: "test-host".to_string(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
@@ -1185,6 +1197,7 @@ async fn models_default_is_the_boot_resolved_value_not_a_fresh_catalog_read() {
     let store = LogStore::open(&data_dir).unwrap();
     let app = app(AppState {
         root,
+        hostname: "test-host".to_string(),
         sessions: Arc::new(Sessions::new(store)),
         model: ModelConfig {
             model: "claude-opus-5".to_string(),
@@ -1226,4 +1239,44 @@ async fn models_default_and_label_survive_serialization_under_their_wire_names()
     // just "some truthy field survived".
     assert_eq!(body["default"], "claude-sonnet-5");
     assert_eq!(body["models"][0]["label"], "Sonnet 5");
+}
+
+#[tokio::test]
+async fn an_instance_records_the_principal_that_asked_for_it() {
+    // The same SEAM as `an_instance_records_whether_it_may_write_the_composition`
+    // above, for the field a `file_changed` inherits. The route WRITES
+    // `principal` into `instance_created.data` and `loop_::principal_for`
+    // READS it back; each is correct alone and the pair fails silently if they
+    // disagree about the key. So the reader runs against events the writer
+    // actually produced, never against a hand-built one.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.keep().canonicalize().unwrap();
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let store = LogStore::open(&data_dir).unwrap();
+    let router = armillary_engine::app(AppState {
+        root,
+        sessions: Arc::new(Sessions::new(store)),
+        model: model_config(),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
+        registry_dir: full_grant_registry(),
+        anthropic_key_present: false,
+        zen_key_present: false,
+        boot: None,
+    });
+
+    let (status, created) =
+        post_json(router.clone(), "/instances", serde_json::json!({}), Some(TEST_TOKEN)).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let id = created["id"].as_str().unwrap().to_string();
+    let events = LogStore::open(&data_dir).unwrap().read_from(&id, 0).unwrap();
+    assert_eq!(
+        armillary_engine::loop_::principal_for(&events).as_deref(),
+        Some("test-client"),
+        "the loop's reader did not see the principal the route wrote"
+    );
+    // And it is on the durable event itself, under the key the reader uses.
+    assert_eq!(events[0].data["principal"], "test-client");
 }

@@ -21,6 +21,7 @@ pub mod principals;
 pub mod projection;
 pub mod provider;
 pub mod provider_openai;
+pub mod repo_events;
 pub mod repos;
 pub mod routes;
 mod search;

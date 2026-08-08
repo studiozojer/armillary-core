@@ -29,6 +29,14 @@ pub const DURABLE_TYPES: &[&str] = &[
     // work shipped a `verdict()` returning `current` for twenty-four repos
     // having contacted nothing).
     "file_changed",
+    // A repo verb's EFFECT, in the `file_changed` tradition: past tense,
+    // because these record what happened rather than what was asked for. They
+    // live in the `workspace` stream, which no model context projects over —
+    // see `projection.rs`'s arm for why that is stated rather than achieved by
+    // leaving them out.
+    "repo_fetched",
+    "repo_pulled",
+    "repo_pushed",
 ];
 
 /// Who REQUESTED an action, when that differs from what performed it.
