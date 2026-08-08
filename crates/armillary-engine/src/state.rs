@@ -44,6 +44,18 @@ pub struct AppState {
     /// hard-coded `$HOME` path is untestable — and a test that only passes
     /// on a machine which happens to lack the file is worse than no test.
     pub models_path: PathBuf,
+    /// Where this host's principal registry lives. A field rather than a
+    /// call to `principals::default_registry_dir()` inside the extractor,
+    /// for exactly the reason `models_path` is one: a route reading a
+    /// hard-coded `$HOME` path is untestable, and a test that only passes
+    /// on a machine which happens to lack the directory is worse than no
+    /// test. Resolving the default at the outermost caller and passing the
+    /// path inward is the pattern Task 4 established with `enroll(dir, …)`.
+    ///
+    /// Read per request by the `Caller` extractor — the path is fixed at
+    /// startup, its CONTENTS are not, so `revoke` still takes effect on the
+    /// next request with no restart.
+    pub registry_dir: PathBuf,
     /// Key PRESENCE, never the keys. `GET /models` reports usability from
     /// these, so that route can never be the place a credential escapes.
     pub anthropic_key_present: bool,

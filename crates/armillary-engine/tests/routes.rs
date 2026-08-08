@@ -3,6 +3,7 @@
 use armillary_engine::{
     app,
     log::store::LogStore,
+    principals::{hash_token, write_principal, Grant, Principal},
     provider::{self, KeylessProvider},
     sessions::Sessions,
     state::{AppState, ModelConfig},
@@ -14,6 +15,34 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 const ONE_MIB: usize = 1024 * 1024;
+
+/// The bearer token every authenticated call in this file presents. Fixed,
+/// mirroring `tests/repos.rs`'s `TEST_TOKEN` (Task 7's precedent): nothing
+/// here asserts anything about the token itself, only about what a request
+/// carrying it is allowed to do, so a literal string keeps `full_grant_registry`
+/// and `post_json`'s callers in sync without threading a return value through
+/// every call site.
+const TEST_TOKEN: &str = "test-fixed-token-for-tests-routes-rs-2026-08-07";
+
+/// A fresh registry directory holding one principal — both grants — that
+/// authenticates as `TEST_TOKEN`. Mirrors `tests/repos.rs`'s
+/// `full_grant_registry`: a new tempdir per call, since `Registry::load` is
+/// read per request regardless and nothing here needs state to persist
+/// across calls.
+fn full_grant_registry() -> PathBuf {
+    let dir = tempfile::tempdir().unwrap().keep();
+    write_principal(
+        &dir,
+        &Principal {
+            name: "test-client".to_string(),
+            token_hash: hash_token(TEST_TOKEN),
+            grants: vec![Grant::Sync, Grant::Push],
+            minted: "2026-08-07T00:00:00Z".to_string(),
+        },
+    )
+    .unwrap();
+    dir
+}
 
 fn model_config() -> ModelConfig {
     ModelConfig {
@@ -43,6 +72,7 @@ fn app_over(setup: impl FnOnce(&PathBuf)) -> axum::Router {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: None,
@@ -69,6 +99,7 @@ fn app_with_data_dir_under_root(setup: impl FnOnce(&PathBuf)) -> axum::Router {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: None,
@@ -100,6 +131,7 @@ fn app_with_boot(boot_rel: &str, contents: &str) -> (axum::Router, PathBuf, Path
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: Some(boot_rel.to_string()),
@@ -120,20 +152,25 @@ async fn get_json(router: axum::Router, uri: &str) -> (StatusCode, serde_json::V
     (status, json)
 }
 
+/// `bearer`, when `Some`, is sent as `Authorization: Bearer <token>` —
+/// threaded through here rather than a parallel helper (Task 8's precedent),
+/// so every call site says explicitly whether it is authenticating or
+/// deliberately not.
 async fn post_json(
     router: axum::Router,
     uri: &str,
     body: serde_json::Value,
+    bearer: Option<&str>,
 ) -> (StatusCode, serde_json::Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(token) = bearer {
+        builder = builder.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+    }
     let response = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(uri)
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
         .await
         .unwrap();
     let status = response.status();
@@ -151,7 +188,7 @@ async fn post_json(
 /// doc comment).
 async fn create_and_attach(router: axum::Router) -> serde_json::Value {
     let (status, created) =
-        post_json(router.clone(), "/instances", serde_json::json!({ "operator": null })).await;
+        post_json(router.clone(), "/instances", serde_json::json!({ "operator": null }), Some(TEST_TOKEN)).await;
     assert_eq!(status, StatusCode::CREATED);
     let id = created["id"].as_str().unwrap().to_string();
 
@@ -463,7 +500,7 @@ async fn unopenable_type_is_415_and_still_lists() {
 async fn create_instance_returns_201_and_logs_instance_created_at_seq_1() {
     let router = app_over(|_| {});
     let (status, created) =
-        post_json(router.clone(), "/instances", serde_json::json!({ "operator": "tycho" })).await;
+        post_json(router.clone(), "/instances", serde_json::json!({ "operator": "tycho" }), Some(TEST_TOKEN)).await;
 
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(created["operator"], "tycho");
@@ -485,18 +522,82 @@ async fn create_instance_returns_201_and_logs_instance_created_at_seq_1() {
 async fn create_instance_with_a_null_operator_is_accepted() {
     let router = app_over(|_| {});
     let (status, created) =
-        post_json(router, "/instances", serde_json::json!({ "operator": null })).await;
+        post_json(router, "/instances", serde_json::json!({ "operator": null }), Some(TEST_TOKEN)).await;
 
     assert_eq!(status, StatusCode::CREATED);
     assert!(created["operator"].is_null());
 }
 
 #[tokio::test]
+async fn creating_an_instance_without_a_credential_is_refused() {
+    // Instance creation spends the model budget and starts a turn that can
+    // write files. It is a mutation, and it is the route a file write
+    // inherits its principal through.
+    let router = app_over(|_| {});
+    let (status, _) = post_json(router, "/instances", serde_json::json!({}), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn listing_instances_without_a_credential_still_works() {
+    // Reads stay open (R1). Pinned so the gate does not creep onto the read
+    // surface without the decision being made again.
+    let (status, _) = get_json(app_over(|_| {}), "/instances").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+// The three tests below use a DELIBERATELY NONEXISTENT instance id
+// (`no-such-instance`) rather than a real one. That makes each one assert
+// something stronger than "auth is required": it asserts auth runs BEFORE
+// the route resolves the instance. A 401 (not 404) proves the `Caller`
+// extractor rejects the request before the handler ever looks the instance
+// up — `send`/`interrupt`/`evict` all 404 on an unknown id once past the
+// gate, so a 404 here would mean extraction is not running first, the
+// ordering a future refactor could quietly invert with nothing else in this
+// file able to notice (nothing here calls `/send`, `/interrupt`, or
+// `/evict` otherwise, and `tests/loop_flow.rs`'s client attaches a
+// credential to every request unconditionally).
+
+#[tokio::test]
+async fn sending_without_a_credential_is_401_before_the_instance_is_resolved() {
+    let router = app_over(|_| {});
+    let (status, _) = post_json(
+        router,
+        "/instances/no-such-instance/send",
+        serde_json::json!({ "text": "hi", "clientKey": "c1" }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn interrupting_without_a_credential_is_401_before_the_instance_is_resolved() {
+    let router = app_over(|_| {});
+    let (status, _) =
+        post_json(router, "/instances/no-such-instance/interrupt", serde_json::json!({}), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn evicting_without_a_credential_is_401_before_the_instance_is_resolved() {
+    let router = app_over(|_| {});
+    let (status, _) = post_json(
+        router,
+        "/instances/no-such-instance/evict",
+        serde_json::json!({ "eventId": "whatever" }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn list_shows_created_instances() {
     let router = app_over(|_| {});
-    let (_, a) = post_json(router.clone(), "/instances", serde_json::json!({ "operator": "tycho" })).await;
+    let (_, a) = post_json(router.clone(), "/instances", serde_json::json!({ "operator": "tycho" }), Some(TEST_TOKEN)).await;
     let (_, b) =
-        post_json(router.clone(), "/instances", serde_json::json!({ "operator": "kepler" })).await;
+        post_json(router.clone(), "/instances", serde_json::json!({ "operator": "kepler" }), Some(TEST_TOKEN)).await;
 
     let (status, listed) = get_json(router, "/instances").await;
     assert_eq!(status, StatusCode::OK);
@@ -519,7 +620,7 @@ async fn list_is_empty_before_any_instance_is_created() {
 async fn attach_returns_earliest_and_head_seq_and_the_instance() {
     let router = app_over(|_| {});
     let (_, created) =
-        post_json(router.clone(), "/instances", serde_json::json!({ "operator": "tycho" })).await;
+        post_json(router.clone(), "/instances", serde_json::json!({ "operator": "tycho" }), Some(TEST_TOKEN)).await;
     let id = created["id"].as_str().unwrap();
 
     let (status, attach) = get_json(router, &format!("/instances/{id}")).await;
@@ -542,7 +643,7 @@ async fn tree_and_file_deny_the_data_dir_when_it_lives_under_the_served_root() {
     let router = app_with_data_dir_under_root(|_| {});
 
     let (_, created) =
-        post_json(router.clone(), "/instances", serde_json::json!({ "operator": null })).await;
+        post_json(router.clone(), "/instances", serde_json::json!({ "operator": null }), Some(TEST_TOKEN)).await;
     let id = created["id"].as_str().unwrap();
 
     let (status, json) = get_json(router.clone(), "/tree?path=").await;
@@ -631,13 +732,14 @@ async fn create_records_the_composition_so_a_session_knows_what_it_was_booted_in
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: None,
     });
 
     let (status, created) =
-        post_json(router, "/instances", serde_json::json!({ "operator": null })).await;
+        post_json(router, "/instances", serde_json::json!({ "operator": null }), Some(TEST_TOKEN)).await;
     assert_eq!(status, StatusCode::CREATED);
     let id = created["id"].as_str().unwrap().to_string();
 
@@ -681,6 +783,7 @@ fn app_with_operator_boot() -> (axum::Router, PathBuf, PathBuf) {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: None,
@@ -690,7 +793,7 @@ fn app_with_operator_boot() -> (axum::Router, PathBuf, PathBuf) {
 
 async fn create_for(router: axum::Router, operator: serde_json::Value) -> String {
     let (status, created) =
-        post_json(router, "/instances", serde_json::json!({ "operator": operator })).await;
+        post_json(router, "/instances", serde_json::json!({ "operator": operator }), Some(TEST_TOKEN)).await;
     assert_eq!(status, StatusCode::CREATED);
     created["id"].as_str().unwrap().to_string()
 }
@@ -773,6 +876,7 @@ async fn an_unreadable_boot_source_still_creates_the_instance() {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: Some("does-not-exist.md".to_string()),
@@ -799,6 +903,7 @@ async fn a_non_utf8_boot_source_is_skipped_not_appended() {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: Some("boot.md".to_string()),
@@ -825,6 +930,7 @@ async fn a_boot_path_declared_absolute_is_refused_not_relativized() {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: Some(root.join("boot.md").to_string_lossy().to_string()),
@@ -858,6 +964,7 @@ async fn a_boot_path_escaping_root_is_skipped_not_honored() {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: Some(escape_path),
@@ -884,6 +991,7 @@ async fn an_instance_records_whether_it_may_write_the_composition() {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: None,
@@ -893,6 +1001,7 @@ async fn an_instance_records_whether_it_may_write_the_composition() {
         router.clone(),
         "/instances",
         serde_json::json!({ "mayWriteComposition": true }),
+        Some(TEST_TOKEN),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -908,7 +1017,7 @@ async fn an_instance_records_whether_it_may_write_the_composition() {
 
     // Default OFF, asserted rather than assumed — a grant that defaults on is
     // the whole protection gone.
-    let (_, plain) = post_json(router.clone(), "/instances", serde_json::json!({})).await;
+    let (_, plain) = post_json(router.clone(), "/instances", serde_json::json!({}), Some(TEST_TOKEN)).await;
     assert_eq!(plain["mayWriteComposition"], false);
 
     let plain_id = plain["id"].as_str().unwrap().to_string();
@@ -924,6 +1033,7 @@ async fn create_records_the_requested_model_and_returns_it() {
         router,
         "/instances",
         serde_json::json!({ "operator": "tycho", "model": "zen/deepseek-v4-flash" }),
+        Some(TEST_TOKEN),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -934,7 +1044,7 @@ async fn create_records_the_requested_model_and_returns_it() {
 async fn create_without_a_model_is_accepted_and_reports_none() {
     let router = app_over(|_| {});
     let (status, created) =
-        post_json(router, "/instances", serde_json::json!({ "operator": "tycho" })).await;
+        post_json(router, "/instances", serde_json::json!({ "operator": "tycho" }), Some(TEST_TOKEN)).await;
     assert_eq!(status, StatusCode::CREATED);
     assert!(created["model"].is_null());
 }
@@ -957,6 +1067,7 @@ async fn create_with_an_empty_model_string_is_normalized_to_none_in_the_log() {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: None,
@@ -966,6 +1077,7 @@ async fn create_with_an_empty_model_string_is_normalized_to_none_in_the_log() {
         router,
         "/instances",
         serde_json::json!({ "operator": "tycho", "model": "" }),
+        Some(TEST_TOKEN),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
@@ -1022,6 +1134,7 @@ fn app_with_models(root: &Path, models_path: &Path, anthropic: bool, zen: bool) 
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: models_path.to_path_buf(),
+        registry_dir: full_grant_registry(),
         anthropic_key_present: anthropic,
         zen_key_present: zen,
         boot: None,
@@ -1078,6 +1191,7 @@ async fn models_default_is_the_boot_resolved_value_not_a_fresh_catalog_read() {
         },
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path,
+        registry_dir: full_grant_registry(),
         anthropic_key_present: true,
         zen_key_present: false,
         boot: None,

@@ -7,10 +7,22 @@
 //! so it is invisible from here — an integration test binary links the
 //! library built WITHOUT that cfg — and these are a self-contained
 //! second copy of exactly the fixtures this task needs, not the whole file.
+//!
+//! **Every write verb now carries `Authorization` (2026-08-07, Task 7:
+//! `registry ∧ manifest`).** This suite was written to exercise the MANIFEST
+//! ceiling alone, before a registry existed — so `build_app` always enrolls
+//! `TEST_TOKEN` with BOTH grants and every POST below presents it.
+//! `full ∧ manifest ≡ manifest` (`principals::ensure_host`'s own invariant,
+//! pinned in `routes/repos.rs`'s `a_full_host_grant_changes_nothing_the_manifest_allowed`),
+//! so a fixed full-grant caller makes every test here continue to test
+//! exactly what it tested before this task: the manifest gate, never the
+//! registry. `routes/repos.rs`'s own unit tests are where the registry half
+//! of the AND — 401 unauthenticated, 403 ungranted — is actually exercised.
 
 use armillary_engine::{
     app,
     log::store::LogStore,
+    principals::{hash_token, write_principal, Grant, Principal},
     provider::{self, KeylessProvider},
     sessions::Sessions,
     state::{AppState, ModelConfig},
@@ -20,6 +32,34 @@ use axum::http::{Request, StatusCode};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tower::ServiceExt;
+
+/// The bearer token every write-verb call in this file presents. Fixed
+/// rather than minted per test: nothing here asserts anything about the
+/// token itself, only about what it is granted, so a literal string keeps
+/// `build_app` and the `post_*` helpers in sync without threading a return
+/// value through every call site.
+const TEST_TOKEN: &str = "test-fixed-token-for-tests-repos-rs-2026-08-07";
+
+/// A fresh registry directory holding one principal — `test-client`, both
+/// grants — that authenticates as `TEST_TOKEN`. A new directory per call
+/// (mirroring `build_app`'s own per-call `data_dir`) rather than a shared
+/// static: `Registry::load` is read per request regardless, so nothing here
+/// needs to persist across calls, and a fresh tempdir keeps this file's tests
+/// free of any cross-test filesystem sharing.
+fn full_grant_registry() -> PathBuf {
+    let dir = tempfile::tempdir().unwrap().keep();
+    write_principal(
+        &dir,
+        &Principal {
+            name: "test-client".to_string(),
+            token_hash: hash_token(TEST_TOKEN),
+            grants: vec![Grant::Sync, Grant::Push],
+            minted: "2026-08-07T00:00:00Z".to_string(),
+        },
+    )
+    .unwrap();
+    dir
+}
 
 /// Run git synchronously for test setup, isolated from the machine's own git
 /// config — no global `user.email`, no inherited `commit.gpgsign`, no
@@ -167,6 +207,7 @@ fn build_app(root: &Path) -> axum::Router {
         model: ModelConfig { model: "claude-sonnet-5".to_string() },
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: None,
@@ -198,6 +239,7 @@ async fn post_json(root: &Path, uri: &str) -> serde_json::Value {
             Request::builder()
                 .method("POST")
                 .uri(uri)
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -215,6 +257,7 @@ async fn post_status(root: &Path, uri: &str) -> u16 {
             Request::builder()
                 .method("POST")
                 .uri(uri)
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
                 .body(Body::empty())
                 .unwrap(),
         )

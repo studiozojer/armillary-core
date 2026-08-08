@@ -13,6 +13,7 @@ use armillary_engine::{
     app,
     log::envelope::EventEnvelope,
     log::store::LogStore,
+    principals::{hash_token, write_principal, Grant, Principal},
     projection::ModelTurn,
     provider::{self, ModelProvider, ProviderError, ScriptedProvider, TurnOutcome},
     sessions::Sessions,
@@ -20,7 +21,7 @@ use armillary_engine::{
 };
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -31,6 +32,48 @@ fn model_config() -> ModelConfig {
     ModelConfig {
         model: "scripted".to_string(),
     }
+}
+
+/// The bearer token every `reqwest::Client` built by `authed_client` presents.
+/// Fixed, mirroring `tests/repos.rs`'s `TEST_TOKEN` and `tests/routes.rs`'s
+/// own copy: nothing in this file asserts anything about the token itself,
+/// only that instance creation and the loop's own POSTs now need SOME valid
+/// credential (2026-08-07, Task 8: instance lifecycle gated on
+/// authentication).
+const TEST_TOKEN: &str = "test-fixed-token-for-tests-loop-flow-rs-2026-08-07";
+
+/// A fresh registry directory holding one principal that authenticates as
+/// `TEST_TOKEN`. Mirrors `tests/repos.rs`'s `full_grant_registry` — this file
+/// never calls `auth::require`, so the grants themselves are inert, but a
+/// full set keeps this fixture identical in shape to the other two suites
+/// rather than inventing a "why does this one have fewer grants" question.
+fn full_grant_registry() -> PathBuf {
+    let dir = tempfile::tempdir().unwrap().keep();
+    write_principal(
+        &dir,
+        &Principal {
+            name: "test-client".to_string(),
+            token_hash: hash_token(TEST_TOKEN),
+            grants: vec![Grant::Sync, Grant::Push],
+            minted: "2026-08-07T00:00:00Z".to_string(),
+        },
+    )
+    .unwrap();
+    dir
+}
+
+/// A `reqwest::Client` that presents `TEST_TOKEN` on every request it sends,
+/// GET included (harmless — reads stay open, R1). Centralizing the header
+/// here, rather than adding it call-by-call to this file's ~30 `.post(...)`
+/// sites, is the same shape Task 7 used for `tests/repos.rs`'s shared POST
+/// helpers: one place carries the credential, no assertion anywhere changes.
+fn authed_client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {TEST_TOKEN}")).unwrap(),
+    );
+    reqwest::Client::builder().default_headers(headers).build().unwrap()
 }
 
 /// Spawns a real listener on an OS-assigned loopback port, serving `app`
@@ -48,6 +91,7 @@ async fn spawn(data_dir: &Path, provider: Arc<dyn ModelProvider>) -> (SocketAddr
         model: model_config(),
         providers: provider::fixed(provider),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: None,
@@ -87,6 +131,7 @@ async fn spawn_with_boot(
         model: model_config(),
         providers: provider::fixed(provider),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: declared.map(|s| s.to_string()),
@@ -122,6 +167,7 @@ async fn spawn_keyless(data_dir: &Path) -> (SocketAddr, Arc<Sessions>) {
             zen_key: None,
         }),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: None,
@@ -293,7 +339,7 @@ async fn send_returns_the_user_events_id_and_seq() {
     let data_dir = tempfile::tempdir().unwrap().keep();
     let provider = Arc::new(ScriptedProvider::new(vec!["hi"]));
     let (addr, sessions) = spawn(&data_dir, provider).await;
-    let client = reqwest::Client::new();
+    let client = authed_client();
     let id = create_instance(&client, addr).await;
 
     let response = client
@@ -329,7 +375,7 @@ async fn subscriber_sees_echo_then_transients_then_the_durable_assistant_message
             .with_pause(Duration::from_millis(20)),
     );
     let (addr, _sessions) = spawn(&data_dir, provider).await;
-    let client = reqwest::Client::new();
+    let client = authed_client();
     let id = create_instance(&client, addr).await;
 
     let mut sub = SseClient::connect(&client, &format!("http://{addr}/streams/{id}/events?from=0")).await;
@@ -393,7 +439,7 @@ async fn interrupt_mid_script_records_interrupt_then_a_partial_assistant_message
         ScriptedProvider::new(vec!["a", "ab", "abc", "abcd"]).with_pause(Duration::from_millis(50)),
     );
     let (addr, sessions) = spawn(&data_dir, provider).await;
-    let client = reqwest::Client::new();
+    let client = authed_client();
     let id = create_instance(&client, addr).await;
 
     client
@@ -451,7 +497,7 @@ async fn evicted_message_is_absent_from_the_next_turns_projection() {
     let data_dir = tempfile::tempdir().unwrap().keep();
     let recorder = Arc::new(RecordingProvider::new(ScriptedProvider::new(vec!["ok"])));
     let (addr, sessions) = spawn(&data_dir, recorder.clone()).await;
-    let client = reqwest::Client::new();
+    let client = authed_client();
     let id = create_instance(&client, addr).await;
 
     let first: serde_json::Value = client
@@ -513,7 +559,7 @@ async fn a_second_send_while_a_turn_runs_is_409_turn_in_progress() {
     let data_dir = tempfile::tempdir().unwrap().keep();
     let provider = Arc::new(ScriptedProvider::new(vec!["a", "b"]).with_pause(Duration::from_millis(200)));
     let (addr, _sessions) = spawn(&data_dir, provider).await;
-    let client = reqwest::Client::new();
+    let client = authed_client();
     let id = create_instance(&client, addr).await;
 
     let first = client
@@ -542,7 +588,7 @@ async fn crash_resume_the_log_survives_dropping_and_rebuilding_the_whole_process
     let data_dir = tempfile::tempdir().unwrap().keep();
     let provider = Arc::new(ScriptedProvider::new(vec!["done"]));
     let (addr, sessions) = spawn(&data_dir, provider).await;
-    let client = reqwest::Client::new();
+    let client = authed_client();
     let id = create_instance(&client, addr).await;
 
     client
@@ -612,7 +658,7 @@ async fn a_drifted_boot_event_is_rerecorded_fresh_before_the_turn_runs() {
     let (addr, sessions, _root) =
         spawn_with_boot(&data_dir, provider, "boot.md", "# current boot content", None).await;
 
-    let client = reqwest::Client::new();
+    let client = authed_client();
     let id = create_instance(&client, addr).await;
 
     // Hand-append a `boot` event recording the WRONG hash — simulating
@@ -675,6 +721,7 @@ async fn a_manifest_edited_mid_session_is_re_derived_before_the_next_turn() {
         model: model_config(),
         providers: provider::fixed(provider),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: None,
@@ -683,7 +730,7 @@ async fn a_manifest_edited_mid_session_is_re_derived_before_the_next_turn() {
         let _ = axum::serve(listener, app(state)).await;
     });
 
-    let client = reqwest::Client::new();
+    let client = authed_client();
     let id = create_instance(&client, addr).await;
 
     // The workspace is recomposed while the session is open — a repo added to
@@ -756,7 +803,7 @@ async fn both_boot_writers_land_on_one_stream_and_the_turn_reads_the_current_fil
     )
     .await;
 
-    let client = reqwest::Client::new();
+    let client = authed_client();
     let id = create_instance(&client, addr).await;
 
     // Writer one: the create path, no hand-appending anywhere in this test.
@@ -822,7 +869,7 @@ async fn a_failed_turn_names_the_instances_model_not_the_engines() {
     // keys absent, so every turn fails with `no_api_key`.
     let data_dir = tempfile::tempdir().unwrap().keep();
     let (addr, sessions) = spawn_keyless(&data_dir).await;
-    let client = reqwest::Client::new();
+    let client = authed_client();
 
     let id = create_instance_with(&client, addr, Some("tycho"), Some("zen/deepseek-v4-flash")).await;
 
@@ -855,7 +902,7 @@ async fn send_to_an_unknown_instance_is_404_unknown_instance() {
     let data_dir = tempfile::tempdir().unwrap().keep();
     let provider = Arc::new(ScriptedProvider::new(vec!["unused"]));
     let (addr, _sessions) = spawn(&data_dir, provider).await;
-    let client = reqwest::Client::new();
+    let client = authed_client();
 
     let response = client
         .post(format!("http://{addr}/instances/does-not-exist/send"))
@@ -873,7 +920,7 @@ async fn interrupt_on_an_unknown_instance_is_404_unknown_instance() {
     let data_dir = tempfile::tempdir().unwrap().keep();
     let provider = Arc::new(ScriptedProvider::new(vec!["unused"]));
     let (addr, _sessions) = spawn(&data_dir, provider).await;
-    let client = reqwest::Client::new();
+    let client = authed_client();
 
     let response = client
         .post(format!("http://{addr}/instances/does-not-exist/interrupt"))
@@ -890,7 +937,7 @@ async fn evict_on_an_unknown_instance_is_404_unknown_instance() {
     let data_dir = tempfile::tempdir().unwrap().keep();
     let provider = Arc::new(ScriptedProvider::new(vec!["unused"]));
     let (addr, _sessions) = spawn(&data_dir, provider).await;
-    let client = reqwest::Client::new();
+    let client = authed_client();
 
     let response = client
         .post(format!("http://{addr}/instances/does-not-exist/evict"))
@@ -908,7 +955,7 @@ async fn evict_with_an_event_id_not_in_the_stream_is_404_unknown_event() {
     let data_dir = tempfile::tempdir().unwrap().keep();
     let provider = Arc::new(ScriptedProvider::new(vec!["ok"]));
     let (addr, _sessions) = spawn(&data_dir, provider).await;
-    let client = reqwest::Client::new();
+    let client = authed_client();
     let id = create_instance(&client, addr).await;
 
     let response = client

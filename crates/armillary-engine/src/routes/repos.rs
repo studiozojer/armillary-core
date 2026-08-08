@@ -17,9 +17,12 @@
 //! where one extra fork is unmeasurable.
 //!
 //! The four POST routes below are the only ones on this branch that change
-//! anything. Each follows the same shape: resolve the name (404 on a miss,
-//! before the gate is even checked — an unknown repo is not this workspace's
-//! business to refuse or permit), check the one gate that verb requires (403
+//! anything. Each is now gated `registry ∧ manifest` (2026-08-07): the
+//! `Caller` extractor authenticates first (401 with no mention of grants at
+//! all), `crate::auth::require` checks the DEVICE's own grant from the
+//! registry (403, naming `enroll`), THEN the existing shape resumes — resolve
+//! the name (404 on a miss — an unknown repo is not this workspace's business
+//! to refuse or permit), check the one MANIFEST gate that verb requires (403
 //! naming the exact table and key, worded identically across every verb this
 //! module gates), act, then `read_one(root, &module, true)` for the response
 //! — **never** the state computed before acting. A git failure during the
@@ -32,7 +35,9 @@
 //! inventing a second one `RepoState` would need to carry for no reader that
 //! needs to tell them apart).
 
+use crate::auth::Caller;
 use crate::git::{self, GitError};
+use crate::principals::Grant;
 use crate::repos;
 use crate::state::SharedState;
 use axum::{
@@ -155,11 +160,37 @@ fn push_action_error(e: GitError) -> repos::ActionError {
     }
 }
 
-/// 403 for a missing `[router] sync = true` grant. One function shared by
-/// every verb this gate covers (fetch, fetch-one, pull) — `Router.extra` is
-/// unvalidated by design (C-5), so a misspelled `snyc` must read exactly
-/// like a deliberate off, and a second, differently-worded refusal for the
-/// same gate would make that indistinguishable from a genuine second gate.
+/// The MANIFEST half of `registry ∧ manifest`: the workspace's outer bound.
+///
+/// # Why a check that may never fire is still not decorative
+///
+/// This gate is expected to answer `true` on every machine for a long time —
+/// David accepted a global `push` grant on 2026-08-07 ("in these early days
+/// it makes it a lot easier on me"), so in practice the ceiling will not
+/// deny. A check that never fires invites the daoUI precedent: the Figma
+/// snapshot gate was DELETED on David's call because "a check whose name
+/// claims more than it delivers is worse than an absent one, because it
+/// reads as covered ground."
+///
+/// **That precedent does not apply here, and the difference is structural.**
+/// The snapshot gate could not *possibly* see what its name claimed — it
+/// compared `tokens.json` to a file generated from `tokens.json`, so no state
+/// of the world would have made it fire. This gate is one edit away from
+/// denying: remove `push = true` from `modules.local.toml`, commit, and every
+/// host loses push on the next sync regardless of what any device registry
+/// says. That single-edit, all-hosts revocation is the entire reason the
+/// manifest keys were kept as a ceiling rather than retired into the registry
+/// (design § 1.4). A fuse that has not blown is not a decorative check.
+///
+/// **The condition to revisit:** if a ceiling denial has never once been the
+/// correct answer after a year of use, it is a fuse for a fire that does not
+/// happen — and then deleting it is right.
+///
+/// One function shared by every verb this gate covers (fetch, fetch-one,
+/// pull) — `Router.extra` is unvalidated by design (C-5), so a misspelled
+/// `snyc` must read exactly like a deliberate off, and a second,
+/// differently-worded refusal for the same gate would make that
+/// indistinguishable from a genuine second gate.
 fn sync_gate_denied() -> (StatusCode, String) {
     (
         StatusCode::FORBIDDEN,
@@ -377,8 +408,10 @@ pub async fn changes(
 /// (the group sweep) already requires.
 pub async fn fetch_one(
     State(state): State<SharedState>,
+    caller: Caller,
     Path(name): Path<String>,
 ) -> Result<Json<repos::RepoState>, (StatusCode, String)> {
+    crate::auth::require(&caller, Grant::Sync)?;
     let root = state.root.clone();
     let snap = snapshot_or_default(&root);
     let module = repos::resolve(&root, &snap.composition, &name)
@@ -413,8 +446,10 @@ pub async fn fetch_one(
 /// conflicting one.
 pub async fn pull(
     State(state): State<SharedState>,
+    caller: Caller,
     Path(name): Path<String>,
 ) -> Result<Json<repos::RepoState>, (StatusCode, String)> {
+    crate::auth::require(&caller, Grant::Sync)?;
     let root = state.root.clone();
     let snap = snapshot_or_default(&root);
     let module = repos::resolve(&root, &snap.composition, &name)
@@ -457,8 +492,10 @@ async fn locked_dirty_check_then_pull(abs: &std::path::Path) -> Option<repos::Ac
 /// than letting a device make this host fetch or fast-forward.
 pub async fn push(
     State(state): State<SharedState>,
+    caller: Caller,
     Path(name): Path<String>,
 ) -> Result<Json<repos::RepoState>, (StatusCode, String)> {
+    crate::auth::require(&caller, Grant::Push)?;
     let root = state.root.clone();
     let snap = snapshot_or_default(&root);
     let module = repos::resolve(&root, &snap.composition, &name)
@@ -484,7 +521,9 @@ pub async fn push(
 /// gate in front of it.
 pub async fn fetch_all(
     State(state): State<SharedState>,
+    caller: Caller,
 ) -> Result<Json<Vec<repos::RepoState>>, (StatusCode, String)> {
+    crate::auth::require(&caller, Grant::Sync)?;
     let root = state.root.clone();
     let snap = snapshot_or_default(&root);
     if !repos::gate_enabled(&snap.composition) {
@@ -496,6 +535,7 @@ pub async fn fetch_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
 
     #[test]
     fn a_mid_request_manifest_write_cannot_split_gate_from_act() {
@@ -573,5 +613,143 @@ mod tests {
     #[test]
     fn clamp_limit_falls_back_to_the_default_on_garbage() {
         assert_eq!(clamp_limit(Some("abc")), DEFAULT_LOG_LIMIT);
+    }
+
+    // `registry ∧ manifest` at the three write verbs (2026-08-07). These
+    // exercise the ASSEMBLED path through the real router — `crate::app` —
+    // rather than calling handlers directly, so the extractor's ordering
+    // (auth, then registry, then manifest) is what actually runs, the same
+    // lesson Task 6's review drew about `Caller` itself: the pieces can be
+    // tested while the assembly is not.
+
+    /// A registry directory with one principal holding exactly `grants`,
+    /// plus the token that authenticates as it.
+    ///
+    /// Returns the directory so the caller can put it on `AppState`. It does
+    /// NOT touch `$HOME`: `std::env::set_var` mutates process-global state
+    /// and Rust runs tests in parallel threads, so several tests doing it
+    /// concurrently produce failures that appear only under load — passing
+    /// alone, red in CI, and blaming the wrong test.
+    fn enrolled(grants: Vec<crate::principals::Grant>) -> (tempfile::TempDir, String) {
+        use crate::principals::{hash_token, mint_token, write_principal, Principal};
+        let dir = tempfile::tempdir().unwrap();
+        let token = mint_token();
+        write_principal(
+            dir.path(),
+            &Principal {
+                name: "iphone".to_string(),
+                token_hash: hash_token(&token),
+                grants,
+                minted: "2026-08-07T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        (dir, token)
+    }
+
+    /// A workspace whose only declared repo is "a" — a bare `.git` directory
+    /// stand-in, mirroring `a_mid_request_manifest_write_cannot_split_gate_from_act`'s
+    /// fixture above. These tests exercise the GATE (`registry ∧ manifest`),
+    /// never git itself — `tests/repos.rs` is where a real clone earns its
+    /// cost, for the verbs that actually need one to run to completion.
+    fn workspace_with(modules_toml: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("repos/a/.git")).unwrap();
+        std::fs::write(dir.path().join("modules.toml"), modules_toml).unwrap();
+        dir
+    }
+
+    /// `POST /repos/a/push` against `ws`, authenticating against
+    /// `registry_dir` with `token` (or unauthenticated when `None`), through
+    /// the real axum router (`crate::app`) rather than the handler called
+    /// directly — the extractor ordering is exactly what a live request
+    /// hits, and calling the handler in-process would bypass it.
+    async fn call_push(
+        ws: &tempfile::TempDir,
+        registry_dir: &std::path::Path,
+        token: Option<&str>,
+    ) -> (StatusCode, String) {
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = crate::log::store::LogStore::open(data_dir.path()).unwrap();
+        let state = crate::state::AppState {
+            root: ws.path().to_path_buf(),
+            sessions: std::sync::Arc::new(crate::sessions::Sessions::new(store)),
+            model: crate::state::ModelConfig { model: "claude-sonnet-5".to_string() },
+            providers: crate::provider::fixed(std::sync::Arc::new(crate::provider::KeylessProvider)),
+            models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+            registry_dir: registry_dir.to_path_buf(),
+            anthropic_key_present: false,
+            zen_key_present: false,
+            boot: None,
+        };
+
+        let mut req = axum::http::Request::builder().method("POST").uri("/repos/a/push");
+        if let Some(t) = token {
+            req = req.header(axum::http::header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let response = crate::app(state)
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test]
+    async fn a_push_without_a_token_is_401_before_the_manifest_is_consulted() {
+        // The ordering claim, asserted rather than assumed: an
+        // unauthenticated caller must learn NOTHING about the workspace's
+        // grants, so the refusal must not mention the manifest.
+        let (_home, _t) = enrolled(vec![]);
+        let ws = workspace_with("[router]\npush = true\n[[repos]]\nname = \"a\"\npath = \"repos/a\"\n");
+        let res = call_push(&ws, _home.path(), None).await;
+        assert_eq!(res.0, StatusCode::UNAUTHORIZED);
+        assert!(res.1.contains("no_principal"), "{}", res.1);
+        assert!(!res.1.contains("modules.local.toml"), "must not leak the ceiling: {}", res.1);
+    }
+
+    #[tokio::test]
+    async fn an_ungranted_device_is_403_and_does_not_learn_the_ceiling() {
+        let (_home, token) = enrolled(vec![crate::principals::Grant::Sync]);
+        let ws = workspace_with("[router]\npush = true\n[[repos]]\nname = \"a\"\npath = \"repos/a\"\n");
+        let res = call_push(&ws, _home.path(), Some(&token)).await;
+        assert_eq!(res.0, StatusCode::FORBIDDEN);
+        assert!(res.1.contains("principal_not_granted"), "{}", res.1);
+        assert!(!res.1.contains("modules.local.toml"), "{}", res.1);
+    }
+
+    #[tokio::test]
+    async fn a_granted_device_still_hits_the_manifest_ceiling() {
+        // The AND, in the direction that proves the ceiling is real: full
+        // registry grant, manifest denies, request refused. Without this
+        // test the ceiling could be deleted and every test would stay green.
+        let (_home, token) = enrolled(vec![crate::principals::Grant::Push]);
+        let ws = workspace_with("[router]\npush = false\n[[repos]]\nname = \"a\"\npath = \"repos/a\"\n");
+        let res = call_push(&ws, _home.path(), Some(&token)).await;
+        assert_eq!(res.0, StatusCode::FORBIDDEN);
+        assert!(res.1.contains("modules.local.toml"), "the ceiling's own message: {}", res.1);
+    }
+
+    #[tokio::test]
+    async fn a_full_host_grant_changes_nothing_the_manifest_allowed() {
+        // `full ∧ manifest ≡ manifest` — the property that makes Stage 1 a
+        // no-op for host behavior. With both grants held, the answer is
+        // whatever the manifest alone would have said.
+        let (_home, token) = enrolled(vec![
+            crate::principals::Grant::Sync,
+            crate::principals::Grant::Push,
+        ]);
+        for (manifest_push, expect_gate_refusal) in [("true", false), ("false", true)] {
+            let ws = workspace_with(&format!(
+                "[router]\npush = {manifest_push}\n[[repos]]\nname = \"a\"\npath = \"repos/a\"\n"
+            ));
+            let res = call_push(&ws, _home.path(), Some(&token)).await;
+            assert_eq!(
+                res.0 == StatusCode::FORBIDDEN && res.1.contains("modules.local.toml"),
+                expect_gate_refusal,
+                "manifest push = {manifest_push}"
+            );
+        }
     }
 }
