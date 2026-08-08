@@ -7,6 +7,7 @@
 //! is recorded, per this repo's standing rule that the log is the truth and
 //! everything else is a projection over it.
 
+use crate::auth::Caller;
 use crate::log::envelope::{Actor, EventEnvelope, Role};
 use crate::log::store::LogStore;
 use crate::sessions::{NewEvent, SessionError};
@@ -383,8 +384,14 @@ pub(crate) async fn append_composition_event_from(
     }
 }
 
+/// Authenticated but not grant-checked: `sync`/`push` are authorities over
+/// git, and there is no "may run a turn" grant because nothing has needed to
+/// deny one. The `Caller` is taken here because instance creation is the
+/// route through which a file write inherits its principal (design § 3.4) —
+/// so this parameter is load-bearing for Stage 3 even before it is read.
 pub async fn create(
     State(state): State<SharedState>,
+    _caller: Caller,
     Json(body): Json<CreateRequest>,
 ) -> Result<(StatusCode, Json<Instance>), (StatusCode, String)> {
     let sessions = state.sessions.clone();

@@ -8,6 +8,7 @@
 //! `loop_.rs`'s job, not this module's; nothing here reaches into
 //! `project_context` or `ModelProvider` directly.
 
+use crate::auth::Caller;
 use crate::blocking;
 use crate::loop_;
 use crate::log::envelope::{Actor, Role};
@@ -80,6 +81,7 @@ async fn require_known_instance(state: &SharedState, id: &str) -> Result<(), (St
 ///    independently of this request, which has already gotten its answer.
 pub async fn send(
     State(state): State<SharedState>,
+    _caller: Caller,
     Path(id): Path<String>,
     Json(body): Json<SendRequest>,
 ) -> Result<(StatusCode, Json<SendReceipt>), (StatusCode, String)> {
@@ -157,6 +159,7 @@ pub async fn send(
 /// turn, not an interrupted one.
 pub async fn interrupt(
     State(state): State<SharedState>,
+    _caller: Caller,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     require_known_instance(&state, &id).await?;
@@ -196,6 +199,7 @@ fn append_evict(sessions: &Sessions, stream: &str, event_id: &str) -> Result<(),
 /// `unknown_instance`/`unknown_event`.
 pub async fn evict(
     State(state): State<SharedState>,
+    _caller: Caller,
     Path(id): Path<String>,
     Json(body): Json<EvictRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
