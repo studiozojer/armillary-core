@@ -500,6 +500,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let providers: Arc<dyn ProviderFor> = Arc::new(KeyedProviders { anthropic_key, zen_key });
 
     let models_path = models::default_path();
+    let registry_dir = default_registry_dir();
 
     let addr = SocketAddr::new(args.bind, args.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -517,6 +518,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             model,
             providers,
             models_path,
+            registry_dir,
             anthropic_key_present,
             zen_key_present,
             boot,

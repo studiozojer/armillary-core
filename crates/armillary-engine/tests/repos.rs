@@ -167,6 +167,7 @@ fn build_app(root: &Path) -> axum::Router {
         model: ModelConfig { model: "claude-sonnet-5".to_string() },
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        registry_dir: tempfile::tempdir().unwrap().keep(),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: None,

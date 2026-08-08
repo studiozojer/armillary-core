@@ -9,6 +9,7 @@
 //! (`/tree`, `/file`, `/composition`) remain exactly what they were; the
 //! loop is the organ that accreted onto them.
 
+pub mod auth;
 pub mod blocking;
 pub mod git;
 pub mod guard;

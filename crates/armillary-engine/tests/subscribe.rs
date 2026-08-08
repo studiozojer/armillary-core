@@ -71,6 +71,7 @@ async fn spawn(data_dir: &std::path::Path) -> (SocketAddr, Arc<Sessions>) {
         model: model_config(),
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        registry_dir: tempfile::tempdir().unwrap().keep(),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: None,
