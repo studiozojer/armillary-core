@@ -1,27 +1,28 @@
-use crate::provider::ModelProvider;
+use crate::provider::ProviderFor;
 use crate::sessions::Sessions;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Which model pilots sessions, and its credential. No provider call exists
-/// yet (Task 10) — this rides in `AppState` now so nothing downstream has to
-/// grow this shape later. `api_key` resolves from, in order, the
-/// `ANTHROPIC_API_KEY` environment variable or the per-machine file
-/// `~/.config/armillary/anthropic-key` (see `main::resolve_api_key` — never a
-/// CLI flag, which would land in shell history and `ps`), and `Debug` below
-/// redacts it so it never lands in a log line by accident either.
+/// The engine's configured model — resolved once at boot, and the fallback
+/// for any instance whose own log names none (`loop_::run_turn`; an
+/// instance's own recorded model, when present, takes precedence over this).
+/// No credential
+/// here: `KeyedProviders` (`provider.rs`) resolves keys per provider now,
+/// not per model, so a copy living here too would be a second thing to leak
+/// (see `provider.rs`'s `KeyedProviders` doc and the commit that deleted
+/// `api_key` from this struct).
+///
+/// `Debug` stays hand-written even though there is nothing to redact today:
+/// this struct may hold a credential again one day, and re-deriving `Debug`
+/// then is exactly how that becomes a leak.
 #[derive(Clone)]
 pub struct ModelConfig {
     pub model: String,
-    pub api_key: Option<String>,
 }
 
 impl std::fmt::Debug for ModelConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ModelConfig")
-            .field("model", &self.model)
-            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
-            .finish()
+        f.debug_struct("ModelConfig").field("model", &self.model).finish()
     }
 }
 
@@ -32,10 +33,21 @@ pub struct AppState {
     /// The one writer per stream (A-4) and the live fanout over it.
     pub sessions: Arc<Sessions>,
     pub model: ModelConfig,
-    /// The model provider the loop (`loop_.rs`) calls for every turn —
-    /// `Arc<dyn ModelProvider>` so tests can swap in `ScriptedProvider` (or a
-    /// recording double) without touching `main.rs`'s wiring.
-    pub provider: Arc<dyn ModelProvider>,
+    /// Which provider pilots a given model — resolved per turn from the
+    /// instance's own recorded model (`loop_::model_for`), not once at
+    /// boot. `Arc<dyn ProviderFor>` so tests can inject a fixed provider
+    /// via `provider::fixed`, exactly as they injected `ScriptedProvider`
+    /// before this seam existed.
+    pub providers: Arc<dyn ProviderFor>,
+    /// Where the host's model catalog lives. A field rather than a call to
+    /// `models::default_path()` inside the route, because a route reading a
+    /// hard-coded `$HOME` path is untestable — and a test that only passes
+    /// on a machine which happens to lack the file is worse than no test.
+    pub models_path: PathBuf,
+    /// Key PRESENCE, never the keys. `GET /models` reports usability from
+    /// these, so that route can never be the place a credential escapes.
+    pub anthropic_key_present: bool,
+    pub zen_key_present: bool,
     /// The router's own boot file, as declared by `[router] boot` — a path
     /// RELATIVE to `root`, deliberately unresolved here so the containment
     /// check happens at one place (`projection::resolve_boot_path`) rather
@@ -47,7 +59,7 @@ pub struct AppState {
     pub boot: Option<String>,
 }
 
-/// Hand-written because `dyn ModelProvider` has no `Debug` impl of its own
+/// Hand-written because `dyn ProviderFor` has no `Debug` impl of its own
 /// (nor should it grow one just to satisfy a derive) — mirrors `Sessions`'
 /// `finish_non_exhaustive` posture for the same reason.
 impl std::fmt::Debug for AppState {

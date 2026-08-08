@@ -16,7 +16,7 @@ use armillary_engine::{
     app,
     log::envelope::{Actor, EventEnvelope, Role},
     log::store::LogStore,
-    provider::KeylessProvider,
+    provider::{self, KeylessProvider},
     sessions::{NewEvent, Sessions},
     state::{AppState, ModelConfig},
 };
@@ -32,7 +32,6 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 fn model_config() -> ModelConfig {
     ModelConfig {
         model: "claude-sonnet-5".to_string(),
-        api_key: None,
     }
 }
 
@@ -69,7 +68,10 @@ async fn spawn(data_dir: &std::path::Path) -> (SocketAddr, Arc<Sessions>) {
         root: root.canonicalize().unwrap(),
         sessions: sessions.clone(),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: None,
     };
 

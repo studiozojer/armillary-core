@@ -11,7 +11,7 @@
 use armillary_engine::{
     app,
     log::store::LogStore,
-    provider::KeylessProvider,
+    provider::{self, KeylessProvider},
     sessions::Sessions,
     state::{AppState, ModelConfig},
 };
@@ -164,8 +164,11 @@ fn build_app(root: &Path) -> axum::Router {
     app(AppState {
         root: root.canonicalize().unwrap(),
         sessions: Arc::new(Sessions::new(store)),
-        model: ModelConfig { model: "claude-sonnet-5".to_string(), api_key: None },
-        provider: Arc::new(KeylessProvider),
+        model: ModelConfig { model: "claude-sonnet-5".to_string() },
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: None,
     })
 }

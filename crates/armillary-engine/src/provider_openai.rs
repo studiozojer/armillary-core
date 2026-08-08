@@ -369,6 +369,10 @@ impl ModelProvider for OpenAiCompatProvider {
             }
         }
     }
+
+    fn describe(&self) -> String {
+        format!("opencode-zen:{}", self.model)
+    }
 }
 
 #[cfg(test)]

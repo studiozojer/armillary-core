@@ -46,7 +46,9 @@ cargo run -p armillary-engine -- --root /path/to/workspace
 curl -s http://127.0.0.1:7778/health
 ```
 
-Set `ANTHROPIC_API_KEY` in the environment (never a flag) and pass `--model` to pilot sessions with the real Anthropic API; without a key the engine still serves the Explorer, and every `send` fails with the named `no_api_key` error instead of the engine refusing to start.
+Set `ANTHROPIC_API_KEY` in the environment, or drop a key at `~/.config/armillary/anthropic-key` (env wins if both are present) — never a flag, so a key never lands in shell history or `ps`. OpenCode Zen models (`zen/<slug>`) work the same way, via `OPENCODE_ZEN_API_KEY` or `~/.config/armillary/zen-key`. Without a key the engine still serves the Explorer, and every `send` on a model whose provider has no key fails with the named `no_api_key` error instead of the engine refusing to start.
+
+`--model` sets the process-wide default only — the model a session pilots with when its instance names none of its own; an instance's own recorded model always wins (`POST /instances`' `model` field, pinned at creation). Absent `--model`, the default comes from `~/.config/armillary/models.toml`'s `default` line, then `claude-sonnet-5`. That same file's `[[model]]` entries — an `id` and optional `label` each — are the host's declared catalog, served (alongside the resolved default and each entry's provider/key-presence) at `GET /models` for a client-side picker; a host with no file still boots and pilots, it just has nothing to list.
 
 Binds loopback by default and **refuses `--bind 0.0.0.0`**: it serves unauthenticated reads of an entire workspace, so it must bind loopback or a specific tailnet address. `.env*` is never listed and never served; `node_modules`, `target`, `build`, `.next` and `.git` are never listed. The engine serves the *disk*, not git, so `.gitignore` filters nothing — the denylist is what stands between a tailnet and a credential file.
 

@@ -14,7 +14,7 @@ use armillary_engine::{
     log::envelope::EventEnvelope,
     log::store::LogStore,
     projection::ModelTurn,
-    provider::{ModelProvider, ProviderError, ScriptedProvider, TurnOutcome},
+    provider::{self, ModelProvider, ProviderError, ScriptedProvider, TurnOutcome},
     sessions::Sessions,
     state::{AppState, ModelConfig},
 };
@@ -30,7 +30,6 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 fn model_config() -> ModelConfig {
     ModelConfig {
         model: "scripted".to_string(),
-        api_key: None,
     }
 }
 
@@ -47,7 +46,10 @@ async fn spawn(data_dir: &Path, provider: Arc<dyn ModelProvider>) -> (SocketAddr
         root: root.canonicalize().unwrap(),
         sessions: sessions.clone(),
         model: model_config(),
-        provider,
+        providers: provider::fixed(provider),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: None,
     };
 
@@ -83,7 +85,10 @@ async fn spawn_with_boot(
         root: root.clone(),
         sessions: sessions.clone(),
         model: model_config(),
-        provider,
+        providers: provider::fixed(provider),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: declared.map(|s| s.to_string()),
     };
 
@@ -94,6 +99,41 @@ async fn spawn_with_boot(
     });
 
     (addr, sessions, root)
+}
+
+/// Like `spawn`, but wires in the REAL `KeyedProviders` with neither
+/// credential present, rather than `provider::fixed`'s single test double —
+/// so provider SELECTION (`choose_provider`, keyed off the model string)
+/// actually runs, and every turn fails with `no_api_key` regardless of which
+/// model an instance asks for. `provider::fixed` ignores the model string
+/// entirely, which would leave this file with no way to prove a turn asked
+/// for the INSTANCE's provider rather than the engine's configured one.
+async fn spawn_keyless(data_dir: &Path) -> (SocketAddr, Arc<Sessions>) {
+    let store = LogStore::open(data_dir).unwrap();
+    let sessions = Arc::new(Sessions::new(store));
+    let root = tempfile::tempdir().unwrap().keep();
+
+    let state = AppState {
+        root: root.canonicalize().unwrap(),
+        sessions: sessions.clone(),
+        model: model_config(),
+        providers: Arc::new(provider::KeyedProviders {
+            anthropic_key: None,
+            zen_key: None,
+        }),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
+        boot: None,
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app(state)).await;
+    });
+
+    (addr, sessions)
 }
 
 /// Splits decoded SSE body text into `(event, data)` frames on the blank
@@ -167,9 +207,22 @@ impl SseClient {
 }
 
 async fn create_instance(client: &reqwest::Client, addr: SocketAddr) -> String {
+    create_instance_with(client, addr, None, None).await
+}
+
+/// Like `create_instance`, but lets a test pin the operator and/or the model
+/// `routes::instances::CreateRequest` accepts at creation — every other test
+/// in this file only ever needed the operator-less default until the model
+/// became a per-instance fact too.
+async fn create_instance_with(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    operator: Option<&str>,
+    model: Option<&str>,
+) -> String {
     let created: serde_json::Value = client
         .post(format!("http://{addr}/instances"))
-        .json(&serde_json::json!({ "operator": null }))
+        .json(&serde_json::json!({ "operator": operator, "model": model }))
         .send()
         .await
         .unwrap()
@@ -619,7 +672,10 @@ async fn a_manifest_edited_mid_session_is_re_derived_before_the_next_turn() {
         root: root.canonicalize().unwrap(),
         sessions: sessions.clone(),
         model: model_config(),
-        provider,
+        providers: provider::fixed(provider),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: None,
     };
     tokio::spawn(async move {
@@ -748,6 +804,44 @@ async fn both_boot_writers_land_on_one_stream_and_the_turn_reads_the_current_fil
 
     let assistant = events.iter().find(|e| e.event_type == "assistant_message").unwrap();
     assert_eq!(assistant.data["interrupted"], false, "the turn completes normally");
+}
+
+// --- the failure event names the INSTANCE's model, not the engine's ---
+
+/// The assertion that catches a resolver wired only halfway: a failure event
+/// must name the model the INSTANCE asked for, not the one the engine booted
+/// with. Without this, a turn that fails under a per-instance model reports
+/// the engine default and the log lies about which pilot failed — the exact
+/// case decision 3 makes routine, since an unpilotable model's whole report
+/// IS its failure event.
+#[tokio::test]
+async fn a_failed_turn_names_the_instances_model_not_the_engines() {
+    // Engine default is "scripted" (see `model_config()`); the instance asks
+    // for something else and has no key for it — real `KeyedProviders`, both
+    // keys absent, so every turn fails with `no_api_key`.
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let (addr, sessions) = spawn_keyless(&data_dir).await;
+    let client = reqwest::Client::new();
+
+    let id = create_instance_with(&client, addr, Some("tycho"), Some("zen/deepseek-v4-flash")).await;
+
+    client
+        .post(format!("http://{addr}/instances/{id}/send"))
+        .json(&serde_json::json!({ "text": "hello", "clientKey": "c1" }))
+        .send()
+        .await
+        .unwrap();
+
+    wait_for_assistant_message(&sessions, &id, 1).await;
+    let events = sessions.store().read_from(&id, 0).unwrap();
+
+    let failure = events
+        .iter()
+        .rev()
+        .find(|e| e.event_type == "assistant_message")
+        .expect("the turn must have produced a failure-shaped assistant_message");
+    assert_eq!(failure.data["error"], "no_api_key");
+    assert_eq!(failure.data["model"], "zen/deepseek-v4-flash");
 }
 
 // --- 404 unknown_instance / unknown_event: every mutating endpoint, both

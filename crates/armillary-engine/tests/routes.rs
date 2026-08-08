@@ -3,13 +3,13 @@
 use armillary_engine::{
     app,
     log::store::LogStore,
-    provider::KeylessProvider,
+    provider::{self, KeylessProvider},
     sessions::Sessions,
     state::{AppState, ModelConfig},
 };
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -18,7 +18,6 @@ const ONE_MIB: usize = 1024 * 1024;
 fn model_config() -> ModelConfig {
     ModelConfig {
         model: "claude-sonnet-5".to_string(),
-        api_key: None,
     }
 }
 
@@ -42,7 +41,10 @@ fn app_over(setup: impl FnOnce(&PathBuf)) -> axum::Router {
         root: root.canonicalize().unwrap(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: None,
     })
 }
@@ -65,7 +67,10 @@ fn app_with_data_dir_under_root(setup: impl FnOnce(&PathBuf)) -> axum::Router {
         root,
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: None,
     })
 }
@@ -93,7 +98,10 @@ fn app_with_boot(boot_rel: &str, contents: &str) -> (axum::Router, PathBuf, Path
         root: root.clone(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: Some(boot_rel.to_string()),
     });
     (router, root, data_dir)
@@ -621,7 +629,10 @@ async fn create_records_the_composition_so_a_session_knows_what_it_was_booted_in
         root: root.canonicalize().unwrap(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: None,
     });
 
@@ -668,7 +679,10 @@ fn app_with_operator_boot() -> (axum::Router, PathBuf, PathBuf) {
         root: root.clone(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: None,
     });
     (router, root, data_dir)
@@ -757,7 +771,10 @@ async fn an_unreadable_boot_source_still_creates_the_instance() {
         root: root.canonicalize().unwrap(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: Some("does-not-exist.md".to_string()),
     });
     let attach = create_and_attach(router).await;
@@ -780,7 +797,10 @@ async fn a_non_utf8_boot_source_is_skipped_not_appended() {
         root: root.canonicalize().unwrap(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: Some("boot.md".to_string()),
     });
     let attach = create_and_attach(router).await;
@@ -803,7 +823,10 @@ async fn a_boot_path_declared_absolute_is_refused_not_relativized() {
         root: root.clone(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: Some(root.join("boot.md").to_string_lossy().to_string()),
     });
     let attach = create_and_attach(router).await;
@@ -833,7 +856,10 @@ async fn a_boot_path_escaping_root_is_skipped_not_honored() {
         root: root.canonicalize().unwrap(),
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: Some(escape_path),
     });
     let attach = create_and_attach(router).await;
@@ -856,7 +882,10 @@ async fn an_instance_records_whether_it_may_write_the_composition() {
         root,
         sessions: Arc::new(Sessions::new(store)),
         model: model_config(),
-        provider: Arc::new(KeylessProvider),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
         boot: None,
     });
 
@@ -886,4 +915,201 @@ async fn an_instance_records_whether_it_may_write_the_composition() {
     let store = LogStore::open(&data_dir).unwrap();
     let plain_events = store.read_from(&plain_id, 0).unwrap();
     assert!(!armillary_engine::loop_::may_write_composition(&plain_events));
+}
+
+#[tokio::test]
+async fn create_records_the_requested_model_and_returns_it() {
+    let router = app_over(|_| {});
+    let (status, created) = post_json(
+        router,
+        "/instances",
+        serde_json::json!({ "operator": "tycho", "model": "zen/deepseek-v4-flash" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["model"], "zen/deepseek-v4-flash");
+}
+
+#[tokio::test]
+async fn create_without_a_model_is_accepted_and_reports_none() {
+    let router = app_over(|_| {});
+    let (status, created) =
+        post_json(router, "/instances", serde_json::json!({ "operator": "tycho" })).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(created["model"].is_null());
+}
+
+/// Fix 4: `{"model": ""}` must not survive into the log as `"model": ""`
+/// while every read reports `null` for the same instance — normalization
+/// happens on the WRITE path, not only in the two readers'
+/// `.filter(|s| !s.is_empty())` guards. Read the raw event back (not just
+/// the create response) so a regression that moved the filter back to a
+/// reader-only guard would still be caught.
+#[tokio::test]
+async fn create_with_an_empty_model_string_is_normalized_to_none_in_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.keep().canonicalize().unwrap();
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let store = LogStore::open(&data_dir).unwrap();
+    let router = armillary_engine::app(AppState {
+        root,
+        sessions: Arc::new(Sessions::new(store)),
+        model: model_config(),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        anthropic_key_present: false,
+        zen_key_present: false,
+        boot: None,
+    });
+
+    let (status, created) = post_json(
+        router,
+        "/instances",
+        serde_json::json!({ "operator": "tycho", "model": "" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(created["model"].is_null());
+
+    let id = created["id"].as_str().unwrap().to_string();
+    let store = LogStore::open(&data_dir).unwrap();
+    let events = store.read_from(&id, 0).unwrap();
+    let instance_created = events
+        .iter()
+        .find(|e| e.event_type == "instance_created")
+        .expect("instance_created must be the first event");
+    assert!(
+        instance_created.data.get("model").unwrap().is_null(),
+        "the log recorded {:?}, not null — write path did not normalize the empty string",
+        instance_created.data.get("model")
+    );
+}
+
+#[tokio::test]
+async fn models_reports_an_empty_catalog_rather_than_failing() {
+    // `app_over` already points `models_path` at `/nonexistent/models.toml` —
+    // a guaranteed-absent path, exactly "no models.toml anywhere".
+    let app = app_over(|_| {});
+
+    let response = app
+        .oneshot(Request::builder().uri("/models").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    // 200 with nothing in it, never a 500: a host that has not written the
+    // file is a working host, and the app's fallback depends on this.
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), ONE_MIB).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["models"].as_array().unwrap().len(), 0);
+}
+
+/// Like `app_over`, but differs only in the three fields Task 4 reads:
+/// `models_path` points at a REAL file (`app_over`'s literal is deliberately
+/// absent), and the two key-presence booleans are set explicitly rather than
+/// always `false` — the only way to exercise `usable` for both a keyed and a
+/// keyless provider in the same request.
+fn app_with_models(root: &Path, models_path: &Path, anthropic: bool, zen: bool) -> axum::Router {
+    let root = root.canonicalize().unwrap();
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let store = LogStore::open(&data_dir).unwrap();
+
+    app(AppState {
+        root,
+        sessions: Arc::new(Sessions::new(store)),
+        model: model_config(),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: models_path.to_path_buf(),
+        anthropic_key_present: anthropic,
+        zen_key_present: zen,
+        boot: None,
+    })
+}
+
+#[tokio::test]
+async fn a_model_whose_provider_has_no_key_is_reported_unusable() {
+    let dir = tempfile::tempdir().unwrap();
+    let models_path = dir.path().join("models.toml");
+    std::fs::write(
+        &models_path,
+        "[[model]]\nid = \"claude-sonnet-5\"\n\n[[model]]\nid = \"zen/deepseek-v4-flash\"\n",
+    )
+    .unwrap();
+    // A host with an Anthropic key and no Zen key.
+    let app = app_with_models(dir.path(), &models_path, true, false);
+
+    let response = app
+        .oneshot(Request::builder().uri("/models").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), ONE_MIB).await.unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(body["models"][0]["provider"], "anthropic");
+    assert_eq!(body["models"][0]["usable"], true);
+    assert_eq!(body["models"][1]["provider"], "zen");
+    assert_eq!(body["models"][1]["usable"], false);
+}
+
+/// Fix 2: `/models`' `default` must be the engine's EFFECTIVE default — what
+/// `AppState.model.model` was resolved to once at boot — not a fresh re-read
+/// of the catalog file's `default` line. Here the two are made to disagree
+/// on purpose (as `--model` overriding the file, or a post-boot edit to the
+/// file, would in real use) so a regression that swaps back to
+/// `catalog.default` fails loudly.
+#[tokio::test]
+async fn models_default_is_the_boot_resolved_value_not_a_fresh_catalog_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let models_path = dir.path().join("models.toml");
+    std::fs::write(&models_path, "default = \"claude-sonnet-5\"\n").unwrap();
+
+    let root = dir.path().canonicalize().unwrap();
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let store = LogStore::open(&data_dir).unwrap();
+    let app = app(AppState {
+        root,
+        sessions: Arc::new(Sessions::new(store)),
+        model: ModelConfig {
+            model: "claude-opus-5".to_string(),
+        },
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path,
+        anthropic_key_present: true,
+        zen_key_present: false,
+        boot: None,
+    });
+
+    let (status, body) = get_json(app, "/models").await;
+    assert_eq!(status, StatusCode::OK);
+    // The boot-resolved value wins, even though the file on disk still says
+    // "claude-sonnet-5" — the endpoint and the resolver agree by construction.
+    assert_eq!(body["default"], "claude-opus-5");
+}
+
+/// Fix 8: the branch's highest-value missing test. `models.rs`'s unit tests
+/// cover the PARSE layer; nothing asserted the SERIALIZED wire shape of the
+/// two fields the app actually reads off `GET /models`. A `skip_serializing_if`
+/// or a field rename would go green on both the parse tests and the
+/// `provider`/`usable` assertions above, and break only against a real app.
+#[tokio::test]
+async fn models_default_and_label_survive_serialization_under_their_wire_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let models_path = dir.path().join("models.toml");
+    std::fs::write(
+        &models_path,
+        "default = \"claude-sonnet-5\"\n\n[[model]]\nid = \"claude-sonnet-5\"\nlabel = \"Sonnet 5\"\n",
+    )
+    .unwrap();
+    let app = app_with_models(dir.path(), &models_path, true, false);
+
+    let (status, body) = get_json(app, "/models").await;
+    assert_eq!(status, StatusCode::OK);
+    // `default` at the top level, `label` on the entry — exact JSON keys, not
+    // just "some truthy field survived".
+    assert_eq!(body["default"], "claude-sonnet-5");
+    assert_eq!(body["models"][0]["label"], "Sonnet 5");
 }
