@@ -546,6 +546,52 @@ async fn listing_instances_without_a_credential_still_works() {
     assert_eq!(status, StatusCode::OK);
 }
 
+// The three tests below use a DELIBERATELY NONEXISTENT instance id
+// (`no-such-instance`) rather than a real one. That makes each one assert
+// something stronger than "auth is required": it asserts auth runs BEFORE
+// the route resolves the instance. A 401 (not 404) proves the `Caller`
+// extractor rejects the request before the handler ever looks the instance
+// up — `send`/`interrupt`/`evict` all 404 on an unknown id once past the
+// gate, so a 404 here would mean extraction is not running first, the
+// ordering a future refactor could quietly invert with nothing else in this
+// file able to notice (nothing here calls `/send`, `/interrupt`, or
+// `/evict` otherwise, and `tests/loop_flow.rs`'s client attaches a
+// credential to every request unconditionally).
+
+#[tokio::test]
+async fn sending_without_a_credential_is_401_before_the_instance_is_resolved() {
+    let router = app_over(|_| {});
+    let (status, _) = post_json(
+        router,
+        "/instances/no-such-instance/send",
+        serde_json::json!({ "text": "hi", "clientKey": "c1" }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn interrupting_without_a_credential_is_401_before_the_instance_is_resolved() {
+    let router = app_over(|_| {});
+    let (status, _) =
+        post_json(router, "/instances/no-such-instance/interrupt", serde_json::json!({}), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn evicting_without_a_credential_is_401_before_the_instance_is_resolved() {
+    let router = app_over(|_| {});
+    let (status, _) = post_json(
+        router,
+        "/instances/no-such-instance/evict",
+        serde_json::json!({ "eventId": "whatever" }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn list_shows_created_instances() {
     let router = app_over(|_| {});
