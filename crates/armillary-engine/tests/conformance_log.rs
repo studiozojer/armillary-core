@@ -241,7 +241,7 @@ async fn every_event_a_scripted_turn_emits_validates_against_the_schema() {
         model: model_config(),
         providers: provider::fixed(Arc::new(ScriptedProvider::new(vec!["Hel", "Hello there"]))),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
-        registry_dir: tempfile::tempdir().unwrap().keep(),
+        registry_dir: std::path::PathBuf::from("/nonexistent/registry"),
         anthropic_key_present: false,
         zen_key_present: false,
         boot: None,
