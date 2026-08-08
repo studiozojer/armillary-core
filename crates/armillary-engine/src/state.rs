@@ -44,6 +44,11 @@ pub struct AppState {
     /// hard-coded `$HOME` path is untestable — and a test that only passes
     /// on a machine which happens to lack the file is worse than no test.
     pub models_path: PathBuf,
+    /// This machine's name, read once at startup. It names WHICH machine spent
+    /// the credential in a `repo_pushed` event, which is the field's only job.
+    /// A field rather than a call inside the route, for the same reason
+    /// `models_path` is one: a route reading the real hostname is untestable.
+    pub hostname: String,
     /// Where this host's principal registry lives. A field rather than a
     /// call to `principals::default_registry_dir()` inside the extractor,
     /// for exactly the reason `models_path` is one: a route reading a

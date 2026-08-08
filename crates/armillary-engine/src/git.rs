@@ -149,6 +149,61 @@ pub async fn newest_commit(repo: &Path, timeout: Duration) -> Result<Option<Stri
     Ok(Some(out.stdout))
 }
 
+/// The full sha HEAD points at, or `None` in a repo with no commits yet.
+///
+/// **Deliberately not `newest_commit`**, which returns a committer DATE
+/// (`%cI`). The two read the same commit and answer different questions, and
+/// the names do not say so loudly enough: `repo_pulled`'s `before`/`after`
+/// are shas everywhere else in this design, and filling them from
+/// `newest_commit` would put an ISO timestamp in a field every reader takes
+/// for a revision — a value whose name promises more than the wire asserts,
+/// which is the exact defect class the previous build corrected ten instances
+/// of.
+///
+/// `--verify --quiet` is what makes an unborn branch `Ok(None)` rather than an
+/// error, matching `log`'s treatment of the same state.
+pub async fn head_sha(repo: &Path, timeout: Duration) -> Result<Option<String>, GitError> {
+    let out = run_git(repo, &["rev-parse", "--verify", "--quiet", "HEAD"], timeout).await?;
+    if !out.ok() || out.stdout.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(out.stdout))
+}
+
+/// `git rev-list --count <before>..<after>` — how many commits the push moved.
+///
+/// Deliberately NOT the ahead-count `status_v2` already holds: that is this
+/// machine's belief BEFORE the push, not what the push moved. Same discipline
+/// as reading the sha range from `--porcelain` — measure the thing, do not
+/// infer it from a neighbouring number that usually agrees.
+///
+/// `before` and `after` originate in git's own output but flow back into an
+/// argument position, so they pass `validate_arg` like any other value.
+///
+/// The `--` goes AFTER the range, not before it: it separates revisions from
+/// pathspecs, so a range placed after it is parsed as a filename and git exits
+/// with a usage dump. (Measured — the first version of this had it the other
+/// way round, following the "`--` before value-shaped arguments" habit that is
+/// correct for paths and backwards for revisions.)
+pub async fn count_range(
+    repo: &Path,
+    before: &str,
+    after: &str,
+    timeout: Duration,
+) -> Result<u32, GitError> {
+    validate_arg(before)?;
+    validate_arg(after)?;
+    let range = format!("{before}..{after}");
+    let out = run_git(repo, &["rev-list", "--count", &range, "--"], timeout).await?;
+    if !out.ok() {
+        return Err(GitError::Failed(out.stderr));
+    }
+    out.stdout
+        .trim()
+        .parse()
+        .map_err(|_| GitError::Failed(format!("unparseable count {:?}", out.stdout)))
+}
+
 /// Where HEAD sits relative to its upstream.
 ///
 /// **An enum over what is KNOWABLE, not over which fact wins.** A single
@@ -1063,6 +1118,53 @@ mod tests {
         assert_eq!(r.reference, None);
         assert_eq!(r.before, None);
         assert_eq!(r.after, None);
+    }
+
+    #[tokio::test]
+    async fn head_sha_is_a_sha_and_not_the_date_newest_commit_returns() {
+        // The two helpers read the same commit and answer different questions.
+        // The plan reached for `newest_commit` to fill `repo_pulled`'s
+        // before/after, which would have written an ISO timestamp into a field
+        // every other part of this design treats as a revision. This pins them
+        // apart so a future edit cannot quietly swap one for the other.
+        let (_remote, clone) = remote_and_clone();
+        let sha = head_sha(&clone, DEFAULT_TIMEOUT).await.unwrap().unwrap();
+        let date = newest_commit(&clone, DEFAULT_TIMEOUT).await.unwrap().unwrap();
+
+        assert_eq!(sha.len(), 40, "a full sha, got {sha}");
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()), "got {sha}");
+        assert!(date.contains('T'), "newest_commit is a date, got {date}");
+        assert_ne!(sha, date);
+    }
+
+    #[tokio::test]
+    async fn head_sha_on_a_repo_with_no_commits_is_none_not_an_error() {
+        let empty = tempfile::tempdir().unwrap().keep();
+        crate::testgit::git_sync(&empty, &["init", "--initial-branch=main", "."]);
+        assert_eq!(head_sha(&empty, DEFAULT_TIMEOUT).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn count_range_counts_what_the_push_moved() {
+        let (_remote, clone) = remote_and_clone();
+        let before = head_sha(&clone, DEFAULT_TIMEOUT).await.unwrap().unwrap();
+        commit(&clone, "one.md", "a");
+        commit(&clone, "two.md", "b");
+        let after = head_sha(&clone, DEFAULT_TIMEOUT).await.unwrap().unwrap();
+
+        let n = count_range(&clone, &before, &after, DEFAULT_TIMEOUT).await.unwrap();
+        assert_eq!(n, 2, "two commits were made, so two moved");
+        // And the empty range is 0, not an error — an up-to-date push.
+        assert_eq!(count_range(&clone, &after, &after, DEFAULT_TIMEOUT).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn count_range_refuses_a_flag_shaped_argument() {
+        let (_remote, clone) = remote_and_clone();
+        assert!(matches!(
+            count_range(&clone, "--upload-pack=evil", "HEAD", DEFAULT_TIMEOUT).await,
+            Err(GitError::InvalidArg(_))
+        ));
     }
 
     #[tokio::test]

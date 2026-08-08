@@ -207,6 +207,7 @@ fn build_app(root: &Path) -> axum::Router {
         model: ModelConfig { model: "claude-sonnet-5".to_string() },
         providers: provider::fixed(Arc::new(KeylessProvider)),
         models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
         registry_dir: full_grant_registry(),
         anthropic_key_present: false,
         zen_key_present: false,
@@ -585,4 +586,165 @@ async fn a_total_fetch_failure_does_not_read_as_success() {
         .unwrap();
     assert!(jianyi["action_error"]["message"].is_string(), "a failed fetch must be on the wire");
     assert_eq!(jianyi["action_error"]["kind"], "transport");
+}
+
+/// One app whose log store outlives the request, so a verb's EFFECT on the
+/// record can be read back.
+///
+/// `build_app` above makes a fresh `data_dir` per call, which is right for
+/// every test that only reads a response body and wrong for these: the claim
+/// here is that driving the real HTTP route appends to the `workspace` stream,
+/// and that claim is unobservable if the store dies with the request.
+fn app_with_durable_store(root: &Path) -> (axum::Router, PathBuf) {
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let store = LogStore::open(&data_dir).unwrap();
+    let router = app(AppState {
+        root: root.canonicalize().unwrap(),
+        sessions: Arc::new(Sessions::new(store)),
+        model: ModelConfig { model: "claude-sonnet-5".to_string() },
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
+        registry_dir: full_grant_registry(),
+        anthropic_key_present: false,
+        zen_key_present: false,
+        boot: None,
+    });
+    (router, data_dir)
+}
+
+async fn post_on(router: &axum::Router, uri: &str) -> u16 {
+    router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+fn workspace_events(data_dir: &Path) -> Vec<serde_json::Value> {
+    LogStore::open(data_dir)
+        .unwrap()
+        .read_from("workspace", 0)
+        .unwrap()
+        .iter()
+        .map(|e| serde_json::to_value(e).unwrap())
+        .collect()
+}
+
+/// The ASSEMBLY, not the pieces.
+///
+/// `repo_events`'s own tests prove the recorders build the right event, and
+/// they would all stay green if no route ever called one — which is the
+/// "pieces are tested and the assembly is not" shape this build kept finding.
+/// This drives the real routes over HTTP and reads the durable record off
+/// disk.
+#[tokio::test]
+async fn every_verb_leaves_a_durable_event_naming_its_requester() {
+    let (root, remote) = live_workspace_with_sync();
+    grant_push(&root);
+    let (router, data_dir) = app_with_durable_store(&root);
+
+    assert_eq!(post_on(&router, "/repos/jianyi/fetch").await, 200);
+    assert_eq!(post_on(&router, "/repos/jianyi/pull").await, 200);
+    commit(&root.join("repos").join("jianyi"), "mine.md", "local work");
+    assert_eq!(post_on(&router, "/repos/jianyi/push").await, 200);
+
+    let evs = workspace_events(&data_dir);
+    let types: Vec<&str> = evs.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        types,
+        vec!["repo_fetched", "repo_pulled", "repo_pushed"],
+        "each verb records exactly one event, in order"
+    );
+    for e in &evs {
+        assert_eq!(e["actor"]["role"], "machine", "the engine performed it");
+        assert_eq!(
+            e["actor"]["principal"]["name"], "test-client",
+            "and the device that asked is named: {e}"
+        );
+        assert_eq!(e["data"]["repo"], "jianyi");
+    }
+
+    // Push, and only push, names the credential it spent.
+    let pushed = &evs[2];
+    assert_eq!(pushed["data"]["executed_as"]["host"], "test-host");
+    assert_eq!(pushed["data"]["executed_as"]["credential"], "host-user-git");
+    assert!(evs[0]["data"].get("executed_as").is_none(), "a fetch spends nothing");
+    assert!(evs[1]["data"].get("executed_as").is_none(), "a pull spends nothing");
+
+    // The sha range is the REMOTE's account, so it must agree with what the
+    // remote actually holds — read from a third checkout, never from the
+    // pusher's own refs.
+    let verify = tempfile::tempdir().unwrap().keep();
+    git_sync(&verify, &["clone", remote.to_str().unwrap(), verify.to_str().unwrap()]);
+    let remote_head = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&verify)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap();
+    let after = pushed["data"]["after"].as_str().expect("a real push reports an after");
+    assert!(remote_head.starts_with(after), "{remote_head} does not begin with {after}");
+    assert_eq!(pushed["data"]["commits"], 1, "one commit moved");
+    assert_eq!(pushed["data"]["result"], "ok");
+}
+
+/// A failed verb is recorded, because "no event" must never be the way a
+/// failure is expressed — the `last_fetch` conflation, in the log this time.
+#[tokio::test]
+async fn a_failed_verb_is_recorded_rather_than_omitted() {
+    let (root, _remote) = live_workspace_with_sync();
+    grant_push(&root);
+    // Point the clone at a remote that is not there.
+    let module = root.join("repos").join("jianyi");
+    git_sync(&module, &["remote", "set-url", "origin", "/nonexistent/gone.git"]);
+
+    let (router, data_dir) = app_with_durable_store(&root);
+    assert_eq!(post_on(&router, "/repos/jianyi/fetch").await, 200);
+
+    let evs = workspace_events(&data_dir);
+    assert_eq!(evs.len(), 1, "the attempt is on the record even though it failed");
+    assert_eq!(evs[0]["type"], "repo_fetched");
+    assert_eq!(evs[0]["data"]["result"]["error"]["kind"], "transport");
+}
+
+/// A group fetch records one event per repo, not one for the sweep — the
+/// response already promises "twenty-three good answers and one failure", and
+/// a log that flattens that promise records something the response does not.
+#[tokio::test]
+async fn a_group_fetch_records_one_event_per_repo() {
+    let (root, _remote) = live_workspace_with_sync();
+    let (router, data_dir) = app_with_durable_store(&root);
+
+    assert_eq!(post_on(&router, "/repos/fetch").await, 200);
+
+    // Two modules, because `declared_modules` counts the router root itself
+    // as `armillary` — and the root has no remote, so this sweep is one
+    // success beside one failure. That is the useful case, not a nuisance:
+    // the promise being checked is that each repo's own outcome survives into
+    // the record rather than being collapsed into a verdict for the sweep.
+    let evs = workspace_events(&data_dir);
+    let mut by_repo: Vec<(&str, bool)> = evs
+        .iter()
+        .map(|e| {
+            assert_eq!(e["type"], "repo_fetched");
+            (e["data"]["repo"].as_str().unwrap(), e["data"]["result"] == "ok")
+        })
+        .collect();
+    by_repo.sort();
+    assert_eq!(
+        by_repo,
+        vec![("armillary", false), ("jianyi", true)],
+        "each module records its own outcome: {evs:?}"
+    );
 }

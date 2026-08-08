@@ -423,6 +423,7 @@ pub async fn fetch_one(
     let abs = root.join(&module.path);
     let action_error =
         git::fetch(&abs, git::DEFAULT_TIMEOUT).await.err().map(repos::fetch_action_error);
+    crate::repo_events::record_fetch(&state.sessions, &caller, &name, action_error.as_ref());
 
     // Read LAST, after the fetch landed (or failed to) — the caller must
     // never render a row it just acted on from state computed before acting.
@@ -459,11 +460,34 @@ pub async fn pull(
     }
 
     let abs = root.join(&module.path);
-    let pull_error = locked_dirty_check_then_pull(&abs).await;
+    let Pulled { error: pull_error, before, after } = locked_dirty_check_then_pull(&abs).await;
+    crate::repo_events::record_pull(
+        &state.sessions,
+        &caller,
+        &name,
+        before.as_deref(),
+        after.as_deref(),
+        pull_error.as_ref(),
+    );
 
     let mut new_state = repos::read_one(&root, &module, true).await;
     new_state.action_error = pull_error;
     Ok(Json(new_state))
+}
+
+/// What one pull attempt did: its outcome and the shas it moved between.
+///
+/// `before` and `after` are `head_sha`, never `newest_commit` — the latter is
+/// a committer DATE, and a date in a field every reader takes for a revision
+/// is the "name promises more than the wire asserts" defect this build is
+/// meant to stop shipping.
+///
+/// On a refusal `after == before`: the attempt is recorded and it moved
+/// nothing, which is a different and more honest statement than no event.
+struct Pulled {
+    error: Option<repos::ActionError>,
+    before: Option<String>,
+    after: Option<String>,
 }
 
 /// The dirty check and the merge, under the process write lock.
@@ -474,16 +498,25 @@ pub async fn pull(
 /// cross-session hazard the lock was built for, previously unextended here.
 /// The guard spans only check+merge: `read_one` after it is a read and must
 /// not serialize against writes.
-async fn locked_dirty_check_then_pull(abs: &std::path::Path) -> Option<repos::ActionError> {
+///
+/// **The HEAD reads are inside the lock too**, and that is not incidental
+/// tidiness. `before` read outside it would be a sha another writer could
+/// invalidate before the merge ran, so the event would name a transition that
+/// never happened — the same "this machine's belief, reported as the remote's
+/// account" error `--porcelain` exists to avoid, one layer down.
+async fn locked_dirty_check_then_pull(abs: &std::path::Path) -> Pulled {
     let _write_guard = crate::write::write_lock_async().await;
-    match git::is_dirty(abs, git::DEFAULT_TIMEOUT).await {
+    let before = git::head_sha(abs, git::DEFAULT_TIMEOUT).await.ok().flatten();
+    let error = match git::is_dirty(abs, git::DEFAULT_TIMEOUT).await {
         Ok(true) => Some(repos::ActionError {
             kind: "dirty",
             message: "refusing to pull: the working tree has uncommitted changes".to_string(),
         }),
         Ok(false) => git::pull_ff(abs, git::DEFAULT_TIMEOUT).await.err().map(pull_action_error),
         Err(e) => Some(dirty_check_action_error(e)),
-    }
+    };
+    let after = git::head_sha(abs, git::DEFAULT_TIMEOUT).await.ok().flatten();
+    Pulled { error, before, after }
 }
 
 /// `POST /repos/{name}/push` — `git push` on one repo, returning its state
@@ -508,6 +541,25 @@ pub async fn push(
     let outcome = git::push(&abs, git::DEFAULT_TIMEOUT).await;
     let push_error = outcome.as_ref().err().cloned().map(push_action_error);
 
+    // `commits` only where there is a range to count. A new branch and an
+    // up-to-date push both report no shas, and a count derived from anything
+    // else — the ahead-count `status_v2` holds, say — would be this machine's
+    // belief before the push rather than what the push moved.
+    let report = outcome.as_ref().ok();
+    let commits = match report.and_then(|r| r.before.as_ref().zip(r.after.as_ref())) {
+        Some((b, a)) => git::count_range(&abs, b, a, git::DEFAULT_TIMEOUT).await.ok(),
+        None => None,
+    };
+    crate::repo_events::record_push(
+        &state.sessions,
+        &caller,
+        &name,
+        report,
+        commits,
+        &state.hostname,
+        push_error.as_ref(),
+    );
+
     let mut new_state = repos::read_one(&root, &module, true).await;
     new_state.action_error = push_error;
     Ok(Json(new_state))
@@ -530,7 +582,16 @@ pub async fn fetch_all(
     if !repos::gate_enabled(&snap.composition) {
         return Err(sync_gate_denied());
     }
-    Ok(Json(repos::fetch_all(&root, &snap.composition).await))
+    let states = repos::fetch_all(&root, &snap.composition).await;
+    // One event per repo, not one for the sweep. A group fetch is twenty-five
+    // fetches that each succeeded or failed on their own — the promise this
+    // route already makes in its response ("twenty-three good answers and one
+    // failure") has to hold in the record too, or the log flattens exactly the
+    // distinction the response preserves.
+    for s in &states {
+        crate::repo_events::record_fetch(&state.sessions, &caller, &s.name, s.action_error.as_ref());
+    }
+    Ok(Json(states))
 }
 
 #[cfg(test)]
@@ -635,7 +696,15 @@ mod tests {
 
         drop(guard);
         let outcome = locked_dirty_check_then_pull(&clone).await;
-        assert!(outcome.is_none(), "an up-to-date clone pulls clean: {outcome:?}");
+        assert!(
+            outcome.error.is_none(),
+            "an up-to-date clone pulls clean: {:?}",
+            outcome.error
+        );
+        // And an up-to-date pull moved nothing, which the shas must say rather
+        // than the event's absence saying it for them.
+        assert_eq!(outcome.before, outcome.after, "nothing to fast-forward");
+        assert!(outcome.before.is_some(), "a cloned repo has a HEAD");
     }
 
     #[test]
@@ -734,6 +803,7 @@ mod tests {
             model: crate::state::ModelConfig { model: "claude-sonnet-5".to_string() },
             providers: crate::provider::fixed(std::sync::Arc::new(crate::provider::KeylessProvider)),
             models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
             registry_dir: registry_dir.to_path_buf(),
             anthropic_key_present: false,
             zen_key_present: false,
