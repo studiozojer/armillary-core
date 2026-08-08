@@ -24,18 +24,22 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// The two authorities a principal can hold, mirroring the manifest keys
+/// The three authorities a principal can hold, mirroring the manifest keys
 /// that bound them.
 ///
 /// **Exact, with no inheritance.** `Push` does not imply `Sync`. D7 split
 /// the manifest keys for a reason — fetching is "make this host talk to a
 /// remote", publishing is "spend this host's credential with no undo" — and
 /// collapsing them here would quietly re-merge what that decision separated.
+/// Committing is "author a change to this working tree's history under the
+/// host identity" — local until pushed, and separate because authorship is
+/// a different act from publication.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Grant {
     Sync,
     Push,
+    Commit,
 }
 
 impl Grant {
@@ -43,6 +47,7 @@ impl Grant {
         match self {
             Grant::Sync => "sync",
             Grant::Push => "push",
+            Grant::Commit => "commit",
         }
     }
 
@@ -50,6 +55,7 @@ impl Grant {
         match s {
             "sync" => Some(Grant::Sync),
             "push" => Some(Grant::Push),
+            "commit" => Some(Grant::Commit),
             _ => None,
         }
     }
@@ -309,6 +315,23 @@ mod tests {
         let laptop = reg.names().into_iter().find(|p| p.name == "laptop").unwrap();
         assert!(laptop.holds(Grant::Push));
         assert!(!laptop.holds(Grant::Sync));
+    }
+
+    #[test]
+    fn commit_grant_parses_and_prints_symmetrically() {
+        assert_eq!(Grant::parse("commit"), Some(Grant::Commit));
+        assert_eq!(Grant::Commit.as_str(), "commit");
+    }
+
+    #[test]
+    fn commit_is_not_implied_by_push_or_sync() {
+        let p = Principal {
+            name: "t".into(),
+            token_hash: "sha256:x".into(),
+            grants: vec![Grant::Sync, Grant::Push],
+            minted: "2026-08-08T00:00:00Z".into(),
+        };
+        assert!(!p.holds(Grant::Commit));
     }
 
     #[test]

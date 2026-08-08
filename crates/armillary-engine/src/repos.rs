@@ -303,6 +303,21 @@ pub fn push_enabled(composition: &Composition) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether this workspace has granted the engine authority to COMMIT.
+///
+/// Separate from `push_enabled` in both directions (design D2): push without
+/// commit is today's world — publish what already exists; commit without push
+/// is a device that authors locally but cannot publish. Same fail-closed
+/// posture — absent, misspelled, non-boolean or unparseable all mean disabled.
+pub fn commit_enabled(composition: &Composition) -> bool {
+    composition
+        .router
+        .extra
+        .get("commit")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// Every composed repo's state, manifest order, no network call.
 pub async fn list(root: &Path, composition: &Composition) -> Vec<RepoState> {
     let mut out = Vec::new();
@@ -598,6 +613,18 @@ mod tests {
             std::fs::write(root.join("modules.local.toml"), body).unwrap();
             assert!(!push_enabled(&comp(&root)), "must fail closed on {body:?}");
         }
+    }
+
+    #[test]
+    fn commit_gate_defaults_closed_and_reads_true() {
+        let root = workspace();
+        assert!(!commit_enabled(&comp(&root)), "absent must fail closed");
+
+        std::fs::write(root.join("modules.local.toml"), "[router]\ncommit = true\n").unwrap();
+        assert!(commit_enabled(&comp(&root)));
+
+        std::fs::write(root.join("modules.local.toml"), "[router]\ncommit = \"yes\"\n").unwrap();
+        assert!(!commit_enabled(&comp(&root)), "non-boolean must fail closed");
     }
 
     use crate::testgit::{commit, git_sync, remote_and_clone};
