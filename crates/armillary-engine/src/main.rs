@@ -123,6 +123,23 @@ fn enroll(dir: &Path, name: &str, grants: &[String]) -> Result<String, String> {
     Ok(token)
 }
 
+/// Remove principal `name` from the registry at `dir`.
+///
+/// Needs no restart to take effect: the registry is read fresh on every
+/// request (see the module doc on `principals`), the same property David
+/// named as valuable at the grant site — deleting the file revokes the
+/// principal immediately, on the very next request, not on the next
+/// restart.
+///
+/// Takes `dir` as a parameter for the same reason `enroll` does: so a test
+/// can point it at a tempdir and observe the claim that actually matters —
+/// that the revoked principal's token no longer authenticates — rather than
+/// only that a file disappeared. `run_command` below passes the real path.
+fn revoke(dir: &Path, name: &str) -> Result<(), String> {
+    let path = dir.join(format!("{name}.toml"));
+    std::fs::remove_file(&path).map_err(|e| format!("could not revoke {name}: {e} ({})", path.display()))
+}
+
 /// Registry management, run instead of serving.
 ///
 /// `Enroll` prints the token exactly once, here, because `write_principal`
@@ -141,9 +158,7 @@ fn run_command(cmd: &Command) -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Command::Revoke { name } => {
-            let path = dir.join(format!("{name}.toml"));
-            std::fs::remove_file(&path)
-                .map_err(|e| format!("could not revoke {name}: {e} ({})", path.display()))?;
+            revoke(&dir, name)?;
             println!("revoked {name} — effective on the next request, no restart needed");
         }
         Command::Principals => {
@@ -798,5 +813,28 @@ mod tests {
         assert!(p.holds(Grant::Sync));
         assert!(!p.holds(Grant::Push));
         assert_eq!(reg.authenticate(&token).unwrap().name, "iphone");
+    }
+
+    #[test]
+    fn revoking_a_principal_removes_it_and_its_token_no_longer_authenticates() {
+        // File-gone is the mechanism; cannot-authenticate is the claim that
+        // actually matters — a mutation that skipped the removal while
+        // still returning Ok would leave a caller told "revoked" while the
+        // token still works, and only the second assertion below can see
+        // that.
+        let dir = tempfile::tempdir().unwrap();
+        let token = enroll(dir.path(), "iphone", &["sync".to_string()]).unwrap();
+        assert!(
+            Registry::load(dir.path()).authenticate(&token).is_some(),
+            "sanity: the freshly enrolled token authenticates before revoke"
+        );
+
+        revoke(dir.path(), "iphone").unwrap();
+
+        assert!(!dir.path().join("iphone.toml").exists(), "the principal file must be gone");
+        assert!(
+            Registry::load(dir.path()).authenticate(&token).is_none(),
+            "a revoked token must no longer authenticate"
+        );
     }
 }
