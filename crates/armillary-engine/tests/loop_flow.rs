@@ -624,6 +624,7 @@ async fn a_drifted_boot_event_is_rerecorded_fresh_before_the_turn_runs() {
                 actor: armillary_engine::log::envelope::Actor {
                     role: armillary_engine::log::envelope::Role::System,
                     instance: None,
+                    principal: None,
                 },
                 event_type: "boot".to_string(),
                 data: serde_json::json!({ "path": "boot.md", "sha256": "0".repeat(64) }),

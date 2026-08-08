@@ -31,13 +31,34 @@ pub const DURABLE_TYPES: &[&str] = &[
     "file_changed",
 ];
 
-/// `{role, instance}` — I-2 requires actor be structured, never a free
-/// string, so a summarizing model can't blur "who did this" into prose.
+/// Who REQUESTED an action, when that differs from what performed it.
+///
+/// Deliberately a *different* type from `principals::Principal` and
+/// deliberately smaller: that one carries a token hash and a grant list,
+/// neither of which belongs in a durable event. A log records identity, not
+/// credentials — and a struct that could serialize a hash into a stream is
+/// one refactor away from doing it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorPrincipal {
+    pub name: String,
+}
+
+/// `{role, instance, principal}` — I-2 requires actor be structured, never a
+/// free string, so a summarizing model can't blur "who did this" into prose.
+///
+/// `principal` extends that argument rather than departing from it: for an
+/// action a device requested and the engine performed, "who did this" has
+/// two honest answers, and burying the requester in each event type's `data`
+/// would have every type invent its own shape for it. Optional and skipped
+/// when absent, so every event recorded before this field existed serializes
+/// and replays byte-identically.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Actor {
     pub role: Role,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<ActorPrincipal>,
 }
 
 /// The closed set of actor roles the schema enumerates.
@@ -84,4 +105,40 @@ pub struct EventEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost: Option<Cost>,
     pub data: serde_json::Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_actor_without_a_principal_serializes_exactly_as_before() {
+        // The compatibility claim this whole decision rests on. Every event
+        // in every existing stream has no principal; if this shape changes,
+        // the conformance fixtures and every stored log drift at once.
+        let a = Actor { role: Role::User, instance: None, principal: None };
+        assert_eq!(serde_json::to_string(&a).unwrap(), r#"{"role":"user"}"#);
+    }
+
+    #[test]
+    fn an_actor_with_a_principal_names_it_in_one_place() {
+        let a = Actor {
+            role: Role::Machine,
+            instance: None,
+            principal: Some(ActorPrincipal { name: "iphone".to_string() }),
+        };
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            r#"{"role":"machine","principal":{"name":"iphone"}}"#
+        );
+    }
+
+    #[test]
+    fn an_actor_recorded_before_this_field_existed_still_deserializes() {
+        // Replay of a stored log must not break. This is the read half of
+        // the same compatibility claim.
+        let a: Actor = serde_json::from_str(r#"{"role":"operator","instance":"s1"}"#).unwrap();
+        assert_eq!(a.role, Role::Operator);
+        assert!(a.principal.is_none());
+    }
 }

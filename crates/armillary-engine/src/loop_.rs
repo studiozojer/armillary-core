@@ -136,6 +136,7 @@ fn assistant_actor(operator: &str) -> Actor {
     Actor {
         role: Role::Operator,
         instance: Some(operator.to_string()),
+        principal: None,
     }
 }
 
@@ -281,6 +282,7 @@ async fn rerecord_boot(
         actor: Actor {
             role: Role::System,
             instance: None,
+            principal: None,
         },
         event_type: "boot".to_string(),
         data: serde_json::json!({ "files": files }),
@@ -470,7 +472,7 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
         // produced", not the reverse.
         if outcome.stopped {
             let ev = NewEvent {
-                actor: Actor { role: Role::User, instance: None },
+                actor: Actor { role: Role::User, instance: None, principal: None },
                 event_type: "interrupt".to_string(),
                 data: serde_json::json!({}),
             };
@@ -586,7 +588,7 @@ pub async fn run_turn(state: SharedState, stream: String, generation: String, ca
                             crate::tools::Effect::FileChanged { path, op, before, after } => NewEvent {
                                 // `Role::Tool`, matching `tool_result` — the
                                 // model asked, the tool answered.
-                                actor: Actor { role: Role::Tool, instance: None },
+                                actor: Actor { role: Role::Tool, instance: None, principal: None },
                                 event_type: "file_changed".to_string(),
                                 data: serde_json::json!({
                                     "path": path, "op": op, "before": before, "after": after,
@@ -681,7 +683,7 @@ async fn append_tool_result(
             // actor — would make the log assert the model produced its own
             // tool results, which is false and undercuts the whole point of a
             // status the model cannot overwrite.
-            actor: Actor { role: Role::Tool, instance: None },
+            actor: Actor { role: Role::Tool, instance: None, principal: None },
             event_type: "tool_result".to_string(),
             data: serde_json::json!({
                 "toolUseId": tool_use_id,
@@ -719,7 +721,7 @@ async fn record_interrupt(
     model: &str,
 ) {
     let ev = NewEvent {
-        actor: Actor { role: Role::User, instance: None },
+        actor: Actor { role: Role::User, instance: None, principal: None },
         event_type: "interrupt".to_string(),
         data: serde_json::json!({}),
     };
@@ -858,6 +860,7 @@ mod tests {
             actor: Actor {
                 role: Role::System,
                 instance: None,
+                principal: None,
             },
             event_type: event_type.to_string(),
             thread: None,
@@ -929,6 +932,7 @@ mod tests {
                     actor: Actor {
                         role: Role::System,
                         instance: None,
+                        principal: None,
                     },
                     event_type: "instance_created".to_string(),
                     data: serde_json::json!({ "operator": operator, "startedAt": now_rfc3339() }),
@@ -942,6 +946,7 @@ mod tests {
                     actor: Actor {
                         role: Role::User,
                         instance: None,
+                        principal: None,
                     },
                     event_type: "user_message".to_string(),
                     data: serde_json::json!({ "text": "hi", "clientKey": "c1" }),

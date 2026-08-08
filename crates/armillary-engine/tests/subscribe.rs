@@ -39,6 +39,7 @@ fn actor() -> Actor {
     Actor {
         role: Role::User,
         instance: None,
+        principal: None,
     }
 }
 

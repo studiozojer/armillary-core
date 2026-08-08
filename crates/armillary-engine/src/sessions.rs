@@ -307,6 +307,7 @@ mod tests {
         Actor {
             role: Role::User,
             instance: None,
+            principal: None,
         }
     }
 
