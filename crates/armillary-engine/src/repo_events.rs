@@ -37,7 +37,14 @@ pub const WORKSPACE_STREAM: &str = "workspace";
 
 /// `{role: machine, principal: <who asked>}` — the performer and the
 /// requester, in the one place I-2 says "who did this" must live.
-fn actor(caller: &Caller) -> Actor {
+///
+/// The actor is now a PARAMETER of every `record_*` below rather than derived
+/// inside them, because a verb has two callers with different performers: a
+/// device's own POST is this — a machine acting at a device's request — and a
+/// model tool inside a turn is `Role::Tool`, named by the operator that ran it
+/// (`loop_`'s `RepoActed` arm builds that one). One emission site either way:
+/// the event's shape is not the caller's to choose, only its attribution is.
+pub fn device_actor(caller: &Caller) -> Actor {
     Actor {
         role: Role::Machine,
         instance: None,
@@ -76,21 +83,21 @@ fn insert_if_known(data: &mut serde_json::Value, key: &str, value: Option<&str>)
 
 pub fn record_fetch(
     sessions: &Sessions,
-    caller: &Caller,
+    actor: Actor,
     repo: &str,
     err: Option<&repos::ActionError>,
 ) {
     emit(
         sessions,
         "repo_fetched",
-        actor(caller),
+        actor,
         json!({ "repo": repo, "result": result(err) }),
     );
 }
 
 pub fn record_pull(
     sessions: &Sessions,
-    caller: &Caller,
+    actor: Actor,
     repo: &str,
     before: Option<&str>,
     after: Option<&str>,
@@ -99,12 +106,12 @@ pub fn record_pull(
     let mut data = json!({ "repo": repo, "result": result(err) });
     insert_if_known(&mut data, "before", before);
     insert_if_known(&mut data, "after", after);
-    emit(sessions, "repo_pulled", actor(caller), data);
+    emit(sessions, "repo_pulled", actor, data);
 }
 
 pub fn record_push(
     sessions: &Sessions,
-    caller: &Caller,
+    actor: Actor,
     repo: &str,
     report: Option<&PushReport>,
     commits: Option<u32>,
@@ -129,7 +136,7 @@ pub fn record_push(
     if let Some(n) = commits {
         data["commits"] = json!(n);
     }
-    emit(sessions, "repo_pushed", actor(caller), data);
+    emit(sessions, "repo_pushed", actor, data);
 }
 
 /// A commit's record. No `executed_as`: nothing leaves the machine
@@ -137,7 +144,7 @@ pub fn record_push(
 /// message's first line — the full message lives in git; the event indexes it.
 pub fn record_commit(
     sessions: &Sessions,
-    caller: &Caller,
+    actor: Actor,
     repo: &str,
     before: Option<&str>,
     after: Option<&str>,
@@ -155,7 +162,7 @@ pub fn record_commit(
     if let Some(n) = files {
         data["files"] = json!(n);
     }
-    emit(sessions, "repo_committed", actor(caller), data);
+    emit(sessions, "repo_committed", actor, data);
 }
 
 #[cfg(test)]
@@ -183,7 +190,7 @@ mod tests {
         let (s, _d) = sessions();
         record_push(
             &s,
-            &caller(),
+            device_actor(&caller()),
             "kairos-engine",
             Some(&PushReport {
                 reference: Some("refs/heads/main".to_string()),
@@ -225,7 +232,7 @@ mod tests {
             kind: "not-fast-forwardable",
             message: "rejected".to_string(),
         };
-        record_push(&s, &caller(), "kairos-engine", None, None, "benatky", Some(&err));
+        record_push(&s, device_actor(&caller()), "kairos-engine", None, None, "benatky", Some(&err));
 
         let evs = s.store().read_from(WORKSPACE_STREAM, 0).unwrap();
         assert_eq!(evs.len(), 1, "a failure is recorded, not skipped");
@@ -239,7 +246,7 @@ mod tests {
         let (s, _d) = sessions();
         record_push(
             &s,
-            &caller(),
+            device_actor(&caller()),
             "zhouyi",
             Some(&PushReport {
                 reference: Some("refs/heads/feature/x".to_string()),
@@ -263,7 +270,7 @@ mod tests {
         // every verb would make the record claim a credential was spent when
         // none was.
         let (s, _d) = sessions();
-        record_fetch(&s, &caller(), "daoUI", None);
+        record_fetch(&s, device_actor(&caller()), "daoUI", None);
         let ev = &s.store().read_from(WORKSPACE_STREAM, 0).unwrap()[0];
         assert_eq!(ev.event_type, "repo_fetched");
         assert!(ev.data.get("executed_as").is_none());
@@ -273,7 +280,7 @@ mod tests {
     #[test]
     fn a_pull_records_the_shas_it_moved_between_and_no_credential() {
         let (s, _d) = sessions();
-        record_pull(&s, &caller(), "daoUI", Some("aaaaaaa"), Some("bbbbbbb"), None);
+        record_pull(&s, device_actor(&caller()), "daoUI", Some("aaaaaaa"), Some("bbbbbbb"), None);
         let ev = &s.store().read_from(WORKSPACE_STREAM, 0).unwrap()[0];
         assert_eq!(ev.event_type, "repo_pulled");
         assert_eq!(ev.data["before"], "aaaaaaa");
@@ -287,7 +294,7 @@ mod tests {
         // says "we do not know"; a null would say "we looked and there was
         // nothing", which is a different claim about a different world.
         let (s, _d) = sessions();
-        record_pull(&s, &caller(), "fresh", None, None, None);
+        record_pull(&s, device_actor(&caller()), "fresh", None, None, None);
         let ev = &s.store().read_from(WORKSPACE_STREAM, 0).unwrap()[0];
         assert!(ev.data.get("before").is_none());
         assert!(ev.data.get("after").is_none());
@@ -303,9 +310,9 @@ mod tests {
         // One stream, not one per repo — and the seq ordering is what makes
         // "what did this device do today" a single read.
         let (s, _d) = sessions();
-        record_fetch(&s, &caller(), "a", None);
-        record_pull(&s, &caller(), "b", None, None, None);
-        record_push(&s, &caller(), "c", None, None, "benatky", None);
+        record_fetch(&s, device_actor(&caller()), "a", None);
+        record_pull(&s, device_actor(&caller()), "b", None, None, None);
+        record_push(&s, device_actor(&caller()), "c", None, None, "benatky", None);
 
         let evs = s.store().read_from(WORKSPACE_STREAM, 0).unwrap();
         let types: Vec<&str> = evs.iter().map(|e| e.event_type.as_str()).collect();
@@ -321,7 +328,7 @@ mod tests {
         let (s, _d) = sessions();
         record_commit(
             &s,
-            &caller(),
+            device_actor(&caller()),
             "zojercommons",
             Some("aaa"),
             Some("bbb"),
@@ -345,7 +352,7 @@ mod tests {
     fn record_commit_failure_emits_too_with_absent_optionals() {
         let (s, _d) = sessions();
         let err = repos::ActionError { kind: "nothing-to-commit", message: "clean".into() };
-        record_commit(&s, &caller(), "r", Some("aaa"), Some("aaa"), None, Some(0), Some(&err));
+        record_commit(&s, device_actor(&caller()), "r", Some("aaa"), Some("aaa"), None, Some(0), Some(&err));
 
         let ev = &s.store().read_from(WORKSPACE_STREAM, 0).unwrap()[0];
         assert_eq!(ev.data["result"]["error"]["kind"], "nothing-to-commit");

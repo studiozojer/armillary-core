@@ -627,6 +627,21 @@ pub async fn run_turn(
             let ctx = crate::tools::ToolCtx {
                 root: state.root.clone(),
                 may_write_composition: write_grant,
+                // Resolved once per turn above, threaded rather than
+                // re-derived: `commit_repo`'s trailer names all three, and a
+                // tool body holds no log handle to read them from.
+                turn: crate::tools::TurnIdentity {
+                    // No device to name means the turn was asked for on the
+                    // host itself; the host's own name is the honest answer,
+                    // and a trailer line cannot be absent the way an event
+                    // field can.
+                    device: principal
+                        .as_ref()
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| state.hostname.clone()),
+                    operator: operator.clone(),
+                    model: model.clone(),
+                },
             };
             let (n, i) = (name.clone(), input.clone());
             let executed = tokio::task::spawn_blocking(move || crate::tools::dispatch(&n, &i, &ctx))
@@ -636,38 +651,116 @@ pub async fn run_turn(
             let (status, content, is_error) = match executed {
                 Ok(out) => {
                     for effect in &out.effects {
-                        // A `match`, not a `let`-destructure: when the git
-                        // verbs add a second variant, a missing case must be a
-                        // compile error rather than a silently dropped event.
-                        let ev = match effect {
-                            crate::tools::Effect::FileChanged { path, op, before, after } => NewEvent {
-                                // `Role::Tool`, matching `tool_result` — the
-                                // model asked, the tool answered.
-                                actor: Actor {
+                        // A `match`, not a `let`-destructure: a missing case
+                        // must be a compile error rather than a silently
+                        // dropped event.
+                        match effect {
+                            crate::tools::Effect::FileChanged { path, op, before, after } => {
+                                let ev = NewEvent {
+                                    // `Role::Tool`, matching `tool_result` — the
+                                    // model asked, the tool answered.
+                                    actor: Actor {
+                                        role: Role::Tool,
+                                        instance: None,
+                                        principal: principal.clone(),
+                                    },
+                                    event_type: "file_changed".to_string(),
+                                    data: serde_json::json!({
+                                        "path": path, "op": op, "before": before, "after": after,
+                                    }),
+                                };
+                                // Appended BEFORE the tool_result below: the
+                                // effect preceded the report of it, and a
+                                // replay should read that way.
+                                if let Err(e) = append_child(&state, &stream, &assistant_id, ev).await {
+                                    // I-5: a failed log write surfaces to its
+                                    // writer. Deliberately NOT a `return` like
+                                    // the tool_use failure above — the file is
+                                    // already on disk, so this is a record we
+                                    // failed to keep, not a mutation we failed
+                                    // to make, and abandoning the turn would
+                                    // leave the model with no tool_result for a
+                                    // write that actually happened.
+                                    eprintln!(
+                                        "log_write_failed appending file_changed for stream {stream:?}: {e:?}"
+                                    );
+                                }
+                            }
+                            // The git verbs' own record — the same four events
+                            // a device's own POST writes, on the same
+                            // `workspace` stream, through the same
+                            // `repo_events` functions. A host-level fact
+                            // belongs where host-level facts live, not in this
+                            // instance's log.
+                            //
+                            // Attribution is `file_changed`'s, one arm over,
+                            // PLUS the instance label: the model asked and the
+                            // tool answered (`Role::Tool`), at the device that
+                            // asked for this turn (`principal`) — and because
+                            // `workspace` carries nothing else that says which
+                            // session acted, the operator is named too rather
+                            // than left as the `None` an instance-stream event
+                            // can afford.
+                            crate::tools::Effect::RepoActed {
+                                verb, repo, before, after, subject, files, reference, commits, error,
+                            } => {
+                                let actor = Actor {
                                     role: Role::Tool,
-                                    instance: None,
+                                    instance: Some(operator.clone()),
                                     principal: principal.clone(),
-                                },
-                                event_type: "file_changed".to_string(),
-                                data: serde_json::json!({
-                                    "path": path, "op": op, "before": before, "after": after,
-                                }),
-                            },
-                        };
-                        // Appended BEFORE the tool_result below: the effect
-                        // preceded the report of it, and a replay should read
-                        // that way.
-                        if let Err(e) = append_child(&state, &stream, &assistant_id, ev).await {
-                            // I-5: a failed log write surfaces to its writer.
-                            // Deliberately NOT a `return` like the tool_use
-                            // failure above — the file is already on disk, so
-                            // this is a record we failed to keep, not a
-                            // mutation we failed to make, and abandoning the
-                            // turn would leave the model with no tool_result
-                            // for a write that actually happened.
-                            eprintln!(
-                                "log_write_failed appending file_changed for stream {stream:?}: {e:?}"
-                            );
+                                };
+                                let sessions = state.sessions.clone();
+                                let host = state.hostname.clone();
+                                let (verb, repo) = (*verb, repo.clone());
+                                let (before, after) = (before.clone(), after.clone());
+                                let (subject, files) = (subject.clone(), *files);
+                                let (reference, commits) = (reference.clone(), *commits);
+                                let error = error.clone();
+                                // Appended on a thread that is allowed to
+                                // block, the discipline `append_child` follows
+                                // for this stream's own events one stream over.
+                                let recorded = tokio::task::spawn_blocking(move || {
+                                    let e = error.as_ref();
+                                    match verb {
+                                        crate::tools::RepoVerb::Fetch => {
+                                            crate::repo_events::record_fetch(&sessions, actor, &repo, e)
+                                        }
+                                        crate::tools::RepoVerb::Pull => crate::repo_events::record_pull(
+                                            &sessions, actor, &repo, before.as_deref(), after.as_deref(), e,
+                                        ),
+                                        crate::tools::RepoVerb::Push => crate::repo_events::record_push(
+                                            &sessions,
+                                            actor,
+                                            &repo,
+                                            Some(&crate::git::PushReport { reference, before, after }),
+                                            commits,
+                                            &host,
+                                            e,
+                                        ),
+                                        crate::tools::RepoVerb::Commit => crate::repo_events::record_commit(
+                                            &sessions,
+                                            actor,
+                                            &repo,
+                                            before.as_deref(),
+                                            after.as_deref(),
+                                            subject.as_deref(),
+                                            files,
+                                            e,
+                                        ),
+                                    }
+                                })
+                                .await;
+                                if recorded.is_err() {
+                                    // I-5, and the same judgment the write
+                                    // above makes: the git verb already ran, so
+                                    // this is a record we failed to keep rather
+                                    // than a mutation we failed to make.
+                                    eprintln!(
+                                        "log_write_failed recording a repo verb for stream {stream:?}: \
+                                         the appending task panicked"
+                                    );
+                                }
+                            }
                         }
                     }
                     produced_content |= !out.text.is_empty();
@@ -1243,6 +1336,60 @@ mod tests {
         // And the field is omitted from the wire, not serialized as null.
         let wire = serde_json::to_value(changed).unwrap();
         assert!(wire["actor"].get("principal").is_none(), "{wire}");
+    }
+
+    #[tokio::test]
+    async fn a_commit_through_a_real_turn_records_repo_committed_as_the_tool() {
+        // MUTATION-CHECKED. The unit tests stop at `dispatch` and prove the
+        // verb produces a `RepoActed`; nothing else proves the LOOP turns that
+        // into the durable event a device's own POST would have written. An
+        // effect nobody records is worth nothing — and here the record lands on
+        // a DIFFERENT stream (`workspace`), so the instance's own log would
+        // look complete either way.
+        //
+        // Attribution is `file_changed`'s, one arm over, plus the instance
+        // label: the `workspace` stream carries nothing else that says which
+        // session acted, so `Role::Tool` alone would leave "which operator" and
+        // "at whose request" unanswerable from the record.
+        let data_dir = tempfile::tempdir().unwrap();
+        let (root, _remote, repo) = crate::testgit::workspace_with_repo("jianyi");
+        std::fs::write(repo.join("note.md"), "written by a turn\n").unwrap();
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance_as(&sessions, Some("tycho"), Some("iphone")).await;
+
+        let provider = std::sync::Arc::new(RoundScript::new(vec![
+            calls_with(
+                "toolu_c1",
+                "commit_repo",
+                serde_json::json!({ "name": "jianyi", "message": "notes: from a turn" }),
+            ),
+            says("done"),
+        ]));
+        let state = state_with(provider, sessions.clone(), &root).await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
+
+        let host_events = sessions
+            .store()
+            .read_from(crate::repo_events::WORKSPACE_STREAM, 0)
+            .expect("the verb must have opened the workspace stream");
+        let ev = host_events
+            .iter()
+            .find(|e| e.event_type == "repo_committed")
+            .expect("a tool commit must leave the same record a device's does");
+
+        assert_eq!(ev.data["repo"], "jianyi");
+        assert_eq!(ev.data["subject"], "notes: from a turn");
+        assert_eq!(ev.data["result"], "ok");
+        assert_eq!(ev.actor.role, Role::Tool, "the tool performed it");
+        assert_eq!(ev.actor.instance.as_deref(), Some("tycho"), "inside this operator");
+        assert_eq!(
+            ev.actor.principal.as_ref().map(|p| p.name.as_str()),
+            Some("iphone"),
+            "at the device's request"
+        );
     }
 
     #[tokio::test]

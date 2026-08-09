@@ -34,13 +34,19 @@
 //! the per-repo verbs make it too, reusing the same field rather than
 //! inventing a second one `RepoState` would need to carry for no reader that
 //! needs to tell them apart).
+//!
+//! **The act steps themselves live in `repo_verbs.rs`** (2026-08-09), not
+//! here: a model tool is now their second caller, and the lock discipline and
+//! refusal vocabulary must be one implementation. What stays here is what is
+//! genuinely about a REQUEST — the extractor, the two gates, the status codes,
+//! and reading the state back afterwards.
 
 use crate::auth::Caller;
 use crate::git::{self, GitError};
 use crate::principals::Grant;
 use crate::repo_verbs::{
-    locked_dirty_check_then_pull, locked_status_then_commit, push_action_error, with_trailer,
-    Pulled,
+    locked_dirty_check_then_pull, locked_status_then_commit, push_action_error, validate_message,
+    with_trailer, Pulled,
 };
 use crate::repos;
 use crate::state::SharedState;
@@ -335,7 +341,12 @@ pub async fn fetch_one(
     let abs = root.join(&module.path);
     let action_error =
         git::fetch(&abs, git::DEFAULT_TIMEOUT).await.err().map(repos::fetch_action_error);
-    crate::repo_events::record_fetch(&state.sessions, &caller, &name, action_error.as_ref());
+    crate::repo_events::record_fetch(
+        &state.sessions,
+        crate::repo_events::device_actor(&caller),
+        &name,
+        action_error.as_ref(),
+    );
 
     // Read LAST, after the fetch landed (or failed to) — the caller must
     // never render a row it just acted on from state computed before acting.
@@ -375,7 +386,7 @@ pub async fn pull(
     let Pulled { error: pull_error, before, after } = locked_dirty_check_then_pull(&abs).await;
     crate::repo_events::record_pull(
         &state.sessions,
-        &caller,
+        crate::repo_events::device_actor(&caller),
         &name,
         before.as_deref(),
         after.as_deref(),
@@ -420,7 +431,7 @@ pub async fn push(
     };
     crate::repo_events::record_push(
         &state.sessions,
-        &caller,
+        crate::repo_events::device_actor(&caller),
         &name,
         report,
         commits,
@@ -433,35 +444,9 @@ pub async fn push(
     Ok(Json(new_state))
 }
 
-/// Cap chosen in the design (§ 6): far above any honest message, far below
-/// anything that could stress the log or the stdin pipe.
-const MAX_MESSAGE_BYTES: usize = 8 * 1024;
-
 #[derive(serde::Deserialize)]
 pub struct CommitRequest {
     pub message: String,
-}
-
-/// Reject before anything runs. Control characters other than newline and tab
-/// have no place in a commit message; NUL in particular would truncate what
-/// git records vs what the event records.
-fn validate_message(message: &str) -> Result<(), (StatusCode, String)> {
-    if message.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "invalid_message: empty commit message".to_string()));
-    }
-    if message.len() > MAX_MESSAGE_BYTES {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("invalid_message: message exceeds {MAX_MESSAGE_BYTES} bytes"),
-        ));
-    }
-    if message.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "invalid_message: control characters are not allowed".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 /// 403 for a missing `[router] commit = true` grant — same reasoning as its
@@ -494,14 +479,17 @@ pub async fn commit(
     if !repos::commit_enabled(&snap.composition) {
         return Err(commit_gate_denied());
     }
-    validate_message(&body.message)?;
+    // The reason, worn as this route's 400. `repo_verbs` owns the rules —
+    // a message a device may not send is not one a model may send either.
+    validate_message(&body.message)
+        .map_err(|why| (StatusCode::BAD_REQUEST, format!("invalid_message: {why}")))?;
 
     let abs = root.join(&module.path);
     let full_message = with_trailer(&body.message, &caller.0.name);
     let done = locked_status_then_commit(&abs, &full_message).await;
     crate::repo_events::record_commit(
         &state.sessions,
-        &caller,
+        crate::repo_events::device_actor(&caller),
         &name,
         done.before.as_deref(),
         done.after.as_deref(),
@@ -539,7 +527,12 @@ pub async fn fetch_all(
     // failure") has to hold in the record too, or the log flattens exactly the
     // distinction the response preserves.
     for s in &states {
-        crate::repo_events::record_fetch(&state.sessions, &caller, &s.name, s.action_error.as_ref());
+        crate::repo_events::record_fetch(
+            &state.sessions,
+            crate::repo_events::device_actor(&caller),
+            &s.name,
+            s.action_error.as_ref(),
+        );
     }
     Ok(Json(states))
 }

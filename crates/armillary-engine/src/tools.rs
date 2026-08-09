@@ -144,7 +144,10 @@ pub struct Tool {
 /// the prompt, ahead of the system prompt and messages, so a set that
 /// reorders between requests invalidates the whole cached prefix.
 /// E-4: new entries APPEND — the seven below keep their positions, and the
-/// git verbs land after `edit_file`, never interleaved.
+/// git verbs land after `edit_file`, never interleaved. Those three live in
+/// `repo_tools()` rather than here, because they are offered per turn or not
+/// at all; concatenated in that order, this slice's prefix stays cached
+/// whether or not a given turn is granted them.
 pub fn registry() -> &'static [Tool] {
     static REGISTRY: std::sync::OnceLock<Vec<Tool>> = std::sync::OnceLock::new();
     REGISTRY.get_or_init(|| {
@@ -412,6 +415,118 @@ pub fn registry() -> &'static [Tool] {
     })
 }
 
+/// The git verbs — built, dispatchable, and deliberately NOT offered by
+/// default.
+///
+/// A separate slice from `registry()` rather than three more rows in it, for
+/// two reasons that both cut the same way. The offered set is what every turn
+/// pays for in its cached prefix and what every model can reach; a mutating
+/// verb must be there because a device's consent, that device's grants and the
+/// workspace manifest all said so for THAT turn, never because it was compiled
+/// in. And `registry()`'s order is the cached prompt prefix (E-4) — leaving it
+/// untouched is free.
+///
+/// **Unoffered is not unreachable, yet.** `dispatch` searches both slices, so
+/// a call the loop offered still resolves — and until the gate lands, so would
+/// one it did not. That is the interim state this task ships on purpose: the
+/// verbs exist and are exercised, the conjunction that decides who may hold
+/// them is the next task's, and until then nothing offers them at all.
+pub fn repo_tools() -> &'static [Tool] {
+    static REPO_TOOLS: std::sync::OnceLock<Vec<Tool>> = std::sync::OnceLock::new();
+    REPO_TOOLS.get_or_init(|| {
+        vec![
+            Tool {
+                def: ToolDef {
+                    name: "commit_repo",
+                    description: "Commit everything currently changed in one composed repo, \
+                                  on the branch it is already on. `name` is the repo's \
+                                  MANIFEST name — call `get_composition` if you are not sure \
+                                  what is composed. Stages every change including untracked \
+                                  files and commits once: there is no partial staging, no \
+                                  amend, and no way to commit somewhere other than the \
+                                  current branch. Refused without committing when the \
+                                  working tree is clean or HEAD is detached. The engine \
+                                  appends the trailer lines naming the device, the operator \
+                                  and the model — write the message, not the trailer."
+                        .to_string(),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "The repo's manifest name, e.g. \"zojercommons\".",
+                            },
+                            "message": {
+                                "type": "string",
+                                "description": "The commit message. The first line is its subject.",
+                            },
+                        },
+                        "required": ["name", "message"],
+                    }),
+                },
+                run: |input, ctx| {
+                    crate::repo_verbs::commit_repo(
+                        ctx,
+                        required_str(input, "name", "commit_repo")?,
+                        required_str(input, "message", "commit_repo")?,
+                    )
+                },
+            },
+            Tool {
+                def: ToolDef {
+                    name: "sync_repo",
+                    description: "Bring one composed repo up to date with its remote: fetch, \
+                                  then fast-forward the current branch. It never merges and \
+                                  never rebases — a branch that has diverged is left exactly \
+                                  where it is and the refusal says so. Refused before the \
+                                  fast-forward when the working tree has uncommitted changes: \
+                                  commit them with `commit_repo` first, or leave them alone. \
+                                  `name` is the repo's manifest name."
+                        .to_string(),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "The repo's manifest name, e.g. \"zojercommons\".",
+                            },
+                        },
+                        "required": ["name"],
+                    }),
+                },
+                run: |input, ctx| {
+                    crate::repo_verbs::sync_repo(ctx, required_str(input, "name", "sync_repo")?)
+                },
+            },
+            Tool {
+                def: ToolDef {
+                    name: "push_repo",
+                    description: "Publish one composed repo's committed work to its remote, \
+                                  under this host's own git credential. The current branch \
+                                  only, no force, and no undo once it lands. A remote holding \
+                                  commits this checkout does not is refused rather than \
+                                  overwritten — `sync_repo` first, then push. `name` is the \
+                                  repo's manifest name."
+                        .to_string(),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "The repo's manifest name, e.g. \"zojercommons\".",
+                            },
+                        },
+                        "required": ["name"],
+                    }),
+                },
+                run: |input, ctx| {
+                    crate::repo_verbs::push_repo(ctx, required_str(input, "name", "push_repo")?)
+                },
+            },
+        ]
+    })
+}
+
 /// What a tool body is allowed to know about the session it runs in.
 ///
 /// Replaces the bare `&Path`. Tool bodies stay pure functions of their inputs
@@ -425,6 +540,32 @@ pub struct ToolCtx {
     /// the per-session grant that decides whether *this* session is the one
     /// doing it.
     pub may_write_composition: bool,
+    /// Who this turn is, for the one verb that writes an identity down.
+    pub turn: TurnIdentity,
+}
+
+/// The acting identity of the turn a tool body runs inside.
+///
+/// Three facts the loop already resolves once per turn from the instance's
+/// own first event — the operator it was created with, the model piloting it,
+/// and the device that asked. They ride on the context rather than being
+/// re-derived here because a tool body holds no log handle and could not read
+/// them if it wanted to; `commit_repo` is the one verb that needs them, and it
+/// needs all three at once (D6: a git-only reader must be able to tell a
+/// consent-gated commit from a tap).
+///
+/// `Default` (three empty strings) is for the read verbs' tests, which never
+/// touch it — no tool consults this except the commit trailer.
+#[derive(Debug, Clone, Default)]
+pub struct TurnIdentity {
+    /// The device that asked for the turn — the principal recorded at
+    /// instance creation, or this host's own name when there is no device to
+    /// name (an instance created on the host path).
+    pub device: String,
+    /// The composed operator this instance is, or `"dispatcher"`.
+    pub operator: String,
+    /// The model piloting that operator this turn.
+    pub model: String,
 }
 
 /// A tool's rendered text, plus the durable facts its execution produced.
@@ -450,12 +591,26 @@ impl ToolOutcome {
     }
 }
 
+/// Which git verb one `Effect::RepoActed` reports.
+///
+/// A closed enum rather than the `&'static str` the rest of this module uses
+/// for `op`-shaped values, because the loop **fans out on it** — one arm per
+/// `repo_events::record_*` — and a string there would give a mistyped or newly
+/// added verb a silent `_ =>` arm instead of a compile error. `op` has no such
+/// fan-out: it is copied into the event verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoVerb {
+    Fetch,
+    Pull,
+    Push,
+    Commit,
+}
+
 /// A durable fact produced by executing a tool, for the loop to append.
 ///
-/// An enum with one variant today, and deliberately so: the parallel window's
-/// git verbs can add their own without touching this seam again, and the loop's
-/// `match` over it means a new variant is a compile error rather than a
-/// silently dropped event.
+/// Two variants, and the loop's `match` over them means a third is a compile
+/// error rather than a silently dropped event. `RepoActed` is what the git
+/// verbs (2026-08-09) produce; it was the case that comment was written for.
 #[derive(Debug)]
 pub enum Effect {
     FileChanged {
@@ -476,6 +631,44 @@ pub enum Effect {
         before: Option<String>,
         after: String,
     },
+    /// One git verb ran against one composed repo.
+    ///
+    /// **Emitted on a refusal too, error and all.** `repo_events`'s own header
+    /// states the rule this obeys: `result` is a FIELD of the event, never the
+    /// event's existence, or an absent event would mean both "nothing
+    /// happened" and "it failed". So a body reports what it attempted whether
+    /// or not it landed, and the loop records it either way.
+    ///
+    /// The fields are the union of what the four `repo_events::record_*`
+    /// functions take, and each is `None` where its verb has nothing to say:
+    /// a fetch moves no shas, only a commit counts entries, only a push has a
+    /// ref. `insert_if_known` at the far end turns each `None` into an ABSENT
+    /// key rather than a null — "we do not know" and "we measured nothing"
+    /// stay different claims.
+    RepoActed {
+        verb: RepoVerb,
+        /// The MANIFEST name, which is what resolved the repo in the first
+        /// place — never a path, for the same reason `repos::resolve` takes a
+        /// name: a path in this field would be a second spelling of a thing
+        /// the manifest already names once.
+        repo: String,
+        /// `head_sha` before and after the attempt. Equal on a refusal: the
+        /// attempt is recorded and it moved nothing, which is a different and
+        /// more honest statement than no event.
+        before: Option<String>,
+        after: Option<String>,
+        /// Commit only: the message's first line. The full message lives in
+        /// git; the event indexes it.
+        subject: Option<String>,
+        /// Commit only: dirty ENTRIES at status time, not files committed.
+        files: Option<u32>,
+        /// Push only: the ref git itself reported moving.
+        reference: Option<String>,
+        /// Push only: commits in the range the push moved, where there was a
+        /// range to count.
+        commits: Option<u32>,
+        error: Option<crate::repos::ActionError>,
+    },
 }
 
 /// Execute one tool call.
@@ -485,12 +678,16 @@ pub enum Effect {
 /// dangle, and they are right for a reason measured here: a `tool_use` with no
 /// `tool_result` is a 400 that kills every later turn. A stale or misspelled
 /// name must come back as a refusal the model can read.
+///
+/// Searches `repo_tools()` as well as `registry()`: a verb that WAS offered
+/// this turn has to resolve, and which of the two slices a name came from is
+/// the offer's question, not this switch's.
 pub fn dispatch(
     name: &str,
     input: &serde_json::Value,
     ctx: &ToolCtx,
 ) -> Result<ToolOutcome, ToolError> {
-    match registry().iter().find(|t| t.def.name == name) {
+    match registry().iter().chain(repo_tools()).find(|t| t.def.name == name) {
         Some(tool) => (tool.run)(input, ctx),
         None => Err(ToolError::new(
             "unknown_tool",
@@ -1065,6 +1262,7 @@ mod tests {
         ToolCtx {
             root: root.to_path_buf(),
             may_write_composition: false,
+            turn: TurnIdentity::default(),
         }
     }
 
@@ -1735,6 +1933,273 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.status, "invalid_input", "{name}");
             assert!(err.detail.contains(key), "{name}: {}", err.detail);
+        }
+    }
+
+    // ---- the three git verbs, through dispatch ----
+
+    /// A context carrying a real turn identity, so the trailer the commit
+    /// verb writes has three actual names to put in it.
+    fn turn_ctx(root: &Path) -> ToolCtx {
+        ToolCtx {
+            root: root.to_path_buf(),
+            may_write_composition: false,
+            turn: TurnIdentity {
+                device: "iphone".to_string(),
+                operator: "tycho".to_string(),
+                model: "zen/deepseek-v4-flash".to_string(),
+            },
+        }
+    }
+
+    /// `dispatch` on a thread that is allowed to block — which is the only
+    /// place it ever runs (`loop_` calls it inside `spawn_blocking`).
+    ///
+    /// Not a convenience: a git verb's body blocks on the runtime for its
+    /// subprocesses, and blocking on a runtime from inside an async context
+    /// panics. Calling `dispatch` straight from a `#[tokio::test]` body would
+    /// therefore fail in a way production cannot, and passing it a fake would
+    /// prove nothing about the assembly.
+    async fn call_blocking(
+        name: &str,
+        input: serde_json::Value,
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || dispatch(&name, &input, &ctx))
+            .await
+            .unwrap()
+    }
+
+    /// The one `RepoActed` an outcome carries at `index`.
+    fn acted(out: &ToolOutcome, index: usize) -> &Effect {
+        out.effects.get(index).unwrap_or_else(|| {
+            panic!("expected an effect at {index}, got {:?}", out.effects)
+        })
+    }
+
+    #[tokio::test]
+    async fn commit_repo_commits_a_dirty_repo_and_names_what_it_moved() {
+        let (root, _remote, repo) = crate::testgit::workspace_with_repo("jianyi");
+        fs::write(repo.join("note.md"), "written by a turn\n").unwrap();
+
+        let out = call_blocking(
+            "commit_repo",
+            serde_json::json!({ "name": "jianyi", "message": "notes: a line the model wrote" }),
+            turn_ctx(&root),
+        )
+        .await
+        .unwrap();
+
+        let Effect::RepoActed { verb, repo: named, before, after, subject, files, error, .. } =
+            acted(&out, 0)
+        else {
+            panic!("a commit must produce a RepoActed: {:?}", out.effects);
+        };
+        assert_eq!(*verb, RepoVerb::Commit);
+        assert_eq!(named, "jianyi", "the effect names the MANIFEST name");
+        assert!(error.is_none(), "a dirty repo commits clean: {error:?}");
+        assert_ne!(before, after, "a landed commit must move HEAD");
+        assert_eq!(subject.as_deref(), Some("notes: a line the model wrote"));
+        assert_eq!(*files, Some(1));
+
+        // The model is told what moved, in terms it can quote back.
+        let after = after.as_ref().unwrap();
+        assert!(out.text.contains(&after[..7]), "the sha range: {}", out.text);
+        assert!(out.text.contains("notes: a line the model wrote"), "{}", out.text);
+        // And it is a real commit, not a described one.
+        assert!(
+            crate::testgit::last_message(&repo).contains("notes: a line the model wrote"),
+            "the commit must exist in git"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_commit_writes_both_trailer_lines_last() {
+        // D6. David's thumb writes one trailer line; an operator's turn writes
+        // two, so a git-only reader — someone running `git log` months later
+        // with no access to the event log — can tell consent-gated autonomy
+        // from a tap.
+        let (root, _remote, repo) = crate::testgit::workspace_with_repo("jianyi");
+        fs::write(repo.join("note.md"), "written by a turn\n").unwrap();
+
+        call_blocking(
+            "commit_repo",
+            serde_json::json!({ "name": "jianyi", "message": "notes: a line" }),
+            turn_ctx(&root),
+        )
+        .await
+        .unwrap();
+
+        let message = crate::testgit::last_message(&repo);
+        let lines: Vec<&str> = message.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            &lines[lines.len() - 2..],
+            ["Committed-from: iphone", "Committed-by: tycho/zen/deepseek-v4-flash"],
+            "both trailer lines, in order, last: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_repo_refuses_a_clean_repo_and_still_reports_the_attempt() {
+        // `repo_events`'s own rule, reached by the second caller: the result
+        // is a FIELD of the record, never the record's existence — so a
+        // refusal produces an effect carrying its error rather than nothing.
+        let (root, _remote, repo) = crate::testgit::workspace_with_repo("jianyi");
+        let before_head = crate::testgit::last_message(&repo);
+
+        let out = call_blocking(
+            "commit_repo",
+            serde_json::json!({ "name": "jianyi", "message": "nothing to say" }),
+            turn_ctx(&root),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            out.text.contains("nothing-to-commit"),
+            "the model must be told which refusal it hit: {}",
+            out.text
+        );
+        let Effect::RepoActed { error, before, after, .. } = acted(&out, 0) else {
+            panic!("a refusal is still a record: {:?}", out.effects);
+        };
+        assert_eq!(error.as_ref().unwrap().kind, "nothing-to-commit");
+        assert_eq!(before, after, "a refusal moved nothing");
+        assert_eq!(crate::testgit::last_message(&repo), before_head, "no commit landed");
+    }
+
+    #[tokio::test]
+    async fn sync_repo_refuses_the_pull_half_of_a_dirty_repo() {
+        // The existing dirty guard, now reachable by a second caller. `pull_ff`
+        // alone would sail an uncommitted edit forward under a commit that
+        // never saw it; the explicit check is what closes that, and it must
+        // close it for the model exactly as it does for a device.
+        let (root, remote, repo) = crate::testgit::workspace_with_repo("jianyi");
+        crate::testgit::advance_remote(&remote);
+        fs::write(repo.join("seed.md"), "an uncommitted edit\n").unwrap();
+
+        let out = call_blocking("sync_repo", serde_json::json!({ "name": "jianyi" }), turn_ctx(&root))
+            .await
+            .unwrap();
+
+        assert_eq!(out.effects.len(), 2, "a sync is a fetch and a pull, each recorded");
+        let Effect::RepoActed { verb, error, .. } = acted(&out, 0) else { panic!() };
+        assert_eq!(*verb, RepoVerb::Fetch);
+        assert!(error.is_none(), "a dirty tree does not stop the fetch: {error:?}");
+
+        let Effect::RepoActed { verb, error, before, after, .. } = acted(&out, 1) else { panic!() };
+        assert_eq!(*verb, RepoVerb::Pull);
+        assert_eq!(error.as_ref().unwrap().kind, "dirty");
+        assert_eq!(before, after, "a refused pull moved nothing");
+        assert!(out.text.contains("dirty"), "{}", out.text);
+        assert_eq!(
+            fs::read_to_string(repo.join("seed.md")).unwrap(),
+            "an uncommitted edit\n",
+            "the refusal must leave the edit alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_repo_fast_forwards_a_clean_repo_the_remote_moved_ahead_of() {
+        // The other half. A verb tested only where it refuses would pass
+        // identically if it refused always.
+        let (root, remote, repo) = crate::testgit::workspace_with_repo("jianyi");
+        crate::testgit::advance_remote(&remote);
+
+        let out = call_blocking("sync_repo", serde_json::json!({ "name": "jianyi" }), turn_ctx(&root))
+            .await
+            .unwrap();
+
+        let Effect::RepoActed { verb, error, before, after, .. } = acted(&out, 1) else { panic!() };
+        assert_eq!(*verb, RepoVerb::Pull);
+        assert!(error.is_none(), "a clean clone fast-forwards: {error:?}");
+        assert_ne!(before, after, "the fast-forward must move HEAD");
+        assert!(repo.join("from-elsewhere.md").exists(), "the remote's file arrived");
+    }
+
+    #[tokio::test]
+    async fn push_repo_publishes_and_reports_the_range_it_moved() {
+        let (root, remote, repo) = crate::testgit::workspace_with_repo("jianyi");
+        crate::testgit::commit(&repo, "mine.md", "local work");
+
+        let out = call_blocking("push_repo", serde_json::json!({ "name": "jianyi" }), turn_ctx(&root))
+            .await
+            .unwrap();
+
+        let Effect::RepoActed { verb, error, reference, commits, before, after, .. } =
+            acted(&out, 0)
+        else {
+            panic!("a push must produce a RepoActed: {:?}", out.effects);
+        };
+        assert_eq!(*verb, RepoVerb::Push);
+        assert!(error.is_none(), "an ordinary push succeeds: {error:?}");
+        assert_eq!(reference.as_deref(), Some("refs/heads/main"));
+        assert_eq!(*commits, Some(1), "one commit was published");
+        assert_ne!(before, after);
+        // The remote actually moved — a report is not a push.
+        assert!(
+            crate::testgit::last_message(&remote).contains("mine.md"),
+            "the remote must hold the commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_git_verb_naming_an_uncomposed_repo_is_refused_before_any_path_is_built() {
+        // `repos::resolve`'s rule reaching the tool surface: a name is a KEY
+        // into the manifest, never a path fragment.
+        let (root, _remote, _repo) = crate::testgit::workspace_with_repo("jianyi");
+        for name in ["../../../etc", "repos/jianyi", "ghost"] {
+            let err = call_blocking(
+                "sync_repo",
+                serde_json::json!({ "name": name }),
+                turn_ctx(&root),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, "unknown_repo", "{name}");
+            // D6′: name the recovery, not only the fact.
+            assert!(err.detail.contains("jianyi"), "{name}: {}", err.detail);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_git_verb_missing_its_required_argument_is_an_error_not_a_panic() {
+        let (root, _remote, _repo) = crate::testgit::workspace_with_repo("jianyi");
+        for (name, input, key) in [
+            ("sync_repo", serde_json::json!({}), "name"),
+            ("push_repo", serde_json::json!({}), "name"),
+            // Its `name` is present: the argument this one is missing is the
+            // second, which no other git verb has.
+            ("commit_repo", serde_json::json!({ "name": "jianyi" }), "message"),
+        ] {
+            let err = call_blocking(name, input, turn_ctx(&root)).await.unwrap_err();
+            assert_eq!(err.status, "invalid_input", "{name}");
+            assert!(err.detail.contains(key), "{name}: {}", err.detail);
+        }
+    }
+
+    #[test]
+    fn the_git_verbs_are_built_and_deliberately_unoffered() {
+        // "Built but unoffered": the bodies exist and dispatch reaches them,
+        // and the DEFAULT offering — what every turn is handed — does not
+        // include them. A mutating verb reaches a model because a device's
+        // consent, that device's grants and the manifest all said so for that
+        // turn, never because it was compiled into the base set.
+        let offered: Vec<&str> = registry().iter().map(|t| t.def.name).collect();
+        let gated: Vec<&str> = repo_tools().iter().map(|t| t.def.name).collect();
+
+        assert_eq!(gated, ["commit_repo", "sync_repo", "push_repo"]);
+        for name in gated {
+            assert!(!offered.contains(&name), "{name} must not be offered by default");
+        }
+        for t in repo_tools() {
+            assert_eq!(t.def.schema["type"], "object");
+            assert!(
+                t.def.description.len() > 40,
+                "the description is what decides whether a model calls it: {}",
+                t.def.name
+            );
         }
     }
 

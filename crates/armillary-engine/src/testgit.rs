@@ -90,6 +90,49 @@ pub fn remote_and_clone() -> (PathBuf, PathBuf) {
     (remote, clone)
 }
 
+/// A workspace root declaring exactly one repo, which is a REAL clone of a
+/// bare remote: `(root, remote, repo)`.
+///
+/// The fixture the git TOOLS need and `remote_and_clone` alone cannot give
+/// them: a tool resolves its target through `repos::resolve`, so the clone has
+/// to sit at a manifest-declared path under a root, not in a tempdir of its
+/// own. The manifest grants all three `[router]` keys — this fixture exists to
+/// exercise the verbs, and the ceiling is tested where the ceiling lives.
+pub fn workspace_with_repo(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let root = tempfile::tempdir().unwrap().keep();
+    let (remote, _seed) = remote_and_clone();
+
+    let rel = format!("repos/{name}");
+    std::fs::create_dir_all(root.join("repos")).unwrap();
+    let repo = root.join(&rel);
+    git_sync(
+        &root,
+        &["clone", remote.to_str().unwrap(), repo.to_str().unwrap()],
+    );
+
+    std::fs::write(
+        root.join("modules.toml"),
+        format!(
+            "[router]\nsync = true\npush = true\ncommit = true\n\n\
+             [[repos]]\nname = \"{name}\"\npath = \"{rel}\"\n"
+        ),
+    )
+    .unwrap();
+    (root, remote, repo)
+}
+
+/// `git log -1 --format=%B` — the newest commit's whole message, trailers
+/// included, which is the only place a trailer can be checked honestly.
+pub fn last_message(repo: &Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["log", "-1", "--format=%B"])
+        .output()
+        .expect("git must be on PATH for these tests");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
 /// Corrupt the loose object HEAD currently points to, in place.
 ///
 /// Used to prove a genuine read failure (a damaged object) is told apart

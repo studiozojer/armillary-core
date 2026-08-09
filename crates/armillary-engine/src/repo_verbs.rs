@@ -235,6 +235,268 @@ pub(crate) async fn locked_status_then_commit(abs: &std::path::Path, full_messag
     Committed { error, before, after, files }
 }
 
+use crate::tools::{Effect, RepoVerb, ToolCtx, ToolError, ToolOutcome};
+
+/// Cap chosen in the design (§ 6): far above any honest message, far below
+/// anything that could stress the log or the stdin pipe.
+pub(crate) const MAX_MESSAGE_BYTES: usize = 8 * 1024;
+
+/// Reject before anything runs. Control characters other than newline and tab
+/// have no place in a commit message; NUL in particular would truncate what
+/// git records vs what the event records.
+///
+/// Returns the REASON, not a response: the route wears it as a 400 body under
+/// its `invalid_message:` prefix and the tool wears it as a `ToolError`
+/// detail, and neither spelling is this function's business. One set of rules
+/// either way — a message a device may not send is not one a model may send.
+pub(crate) fn validate_message(message: &str) -> Result<(), String> {
+    if message.trim().is_empty() {
+        return Err("empty commit message".to_string());
+    }
+    if message.len() > MAX_MESSAGE_BYTES {
+        return Err(format!("message exceeds {MAX_MESSAGE_BYTES} bytes"));
+    }
+    if message.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+        return Err("control characters are not allowed".to_string());
+    }
+    Ok(())
+}
+
+/// David's thumb writes one trailer line; an operator's turn writes two.
+/// `Committed-by` names the acting operator and the model piloting it, so a
+/// git-only reader can tell consent-gated autonomy from a tap (D6).
+fn with_tool_trailer(message: &str, device: &str, operator: &str, model: &str) -> String {
+    format!("{}\n\nCommitted-from: {}\nCommitted-by: {}/{}\n", message.trim_end(), device, operator, model)
+}
+
+/// Reach one verb's async act step from a tool body.
+///
+/// Tool bodies are sync by design (`tools::RunFn`) and already run on a thread
+/// that is allowed to block — `dispatch` is called inside `spawn_blocking`.
+/// The verbs are `async` because every git call is a supervised subprocess
+/// with a timeout, so blocking this thread on the runtime that spawned it is
+/// the one honest way across, and blocking is exactly what that thread is for.
+/// Panics if there is no runtime, which cannot happen: the only caller is
+/// `dispatch`, and its only caller is the loop.
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::runtime::Handle::current().block_on(fut)
+}
+
+/// The absolute path of one composed repo, or a refusal naming what IS
+/// composed.
+///
+/// `repos::resolve` is the security boundary and it is called first, exactly
+/// as every route calls it first: a manifest name is a KEY into the declared
+/// set, never a path fragment, so `../../../etc` is not sanitised — it simply
+/// is not a key, and the miss happens before any path is built. The second
+/// enumeration is on the MISS path only, and it earns its cost: a model told
+/// only "no" cannot recover, and a model told which names exist can (D6').
+fn resolve_repo(ctx: &ToolCtx, name: &str) -> Result<std::path::PathBuf, ToolError> {
+    let snap = crate::snapshot::WorkspaceSnapshot::load(&ctx.root).unwrap_or_default();
+    if let Some(module) = repos::resolve(&ctx.root, &snap.composition, name) {
+        return Ok(ctx.root.join(&module.path));
+    }
+    let declared = repos::declared_modules(&ctx.root, &snap.composition);
+    let names: Vec<&str> = declared.iter().map(|m| m.name.as_str()).collect();
+    Err(ToolError::new(
+        "unknown_repo",
+        if names.is_empty() {
+            format!("no composed repo named `{name}` — this workspace composes no repos at all")
+        } else {
+            format!(
+                "no composed repo named `{name}`. This workspace composes: {}",
+                names.join(", ")
+            )
+        },
+    ))
+}
+
+/// The first seven characters of a sha — enough to identify a commit, short
+/// enough to read.
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(7)]
+}
+
+/// `short`, where an unborn branch means there is no sha at all. Named rather
+/// than empty: a blank where a revision belongs reads as a rendering bug.
+fn short_or_none(sha: Option<&String>) -> &str {
+    sha.map(|s| short(s)).unwrap_or("(none)")
+}
+
+/// A failed act step in the words a model can act on: what stopped it, and
+/// the machine kind — the same word the event and the HTTP response carry, so
+/// a refusal read in a transcript can be grepped in the log (D6').
+fn refused(e: &repos::ActionError) -> String {
+    format!("{} ({})", e.message, e.kind)
+}
+
+/// `commit_repo` — stage everything and commit once, on the branch the repo is
+/// already on.
+///
+/// **A refusal is an `Ok` carrying its record, not an `Err`.** Two reasons,
+/// both structural. `repo_events`'s own rule is that a result is a FIELD of the
+/// event and never the event's existence — and an `Err` carries no effects, so
+/// every refused verb would vanish from the host record and absence would
+/// again mean both "nothing happened" and "it failed". And the loop drops a
+/// tool that returned `Err` from the offered set for the rest of the turn: one
+/// `nothing-to-commit` would take committing away from a turn that had just
+/// learned it needed to write something first. An argument this verb cannot
+/// act on at all is still an `Err` — nothing ran, so there is nothing to
+/// record.
+pub(crate) fn commit_repo(ctx: &ToolCtx, name: &str, message: &str) -> Result<ToolOutcome, ToolError> {
+    validate_message(message).map_err(|why| ToolError::new("invalid_input", why))?;
+    let abs = resolve_repo(ctx, name)?;
+
+    let full_message =
+        with_tool_trailer(message, &ctx.turn.device, &ctx.turn.operator, &ctx.turn.model);
+    let done = block_on(locked_status_then_commit(&abs, &full_message));
+    let subject = message.lines().next().map(str::to_string);
+
+    let text = match &done.error {
+        Some(e) => format!("commit refused for {name}: {}\n", refused(e)),
+        None => format!(
+            "committed {}..{} in {name}: {} ({} staged)\n",
+            short_or_none(done.before.as_ref()),
+            short_or_none(done.after.as_ref()),
+            subject.as_deref().unwrap_or(""),
+            done.files.unwrap_or(0),
+        ),
+    };
+
+    Ok(ToolOutcome {
+        text,
+        effects: vec![Effect::RepoActed {
+            verb: RepoVerb::Commit,
+            repo: name.to_string(),
+            before: done.before,
+            after: done.after,
+            subject,
+            files: done.files,
+            reference: None,
+            commits: None,
+            error: done.error,
+        }],
+    })
+}
+
+/// `sync_repo` — fetch, then fast-forward. Two verbs, two records.
+///
+/// The pull runs whether or not the fetch reached the remote: a failed fetch
+/// leaves whatever refs were already on disk, and fast-forwarding onto those
+/// is still the right thing. Each half carries its own outcome, so "fetched
+/// but could not merge" and "could not reach the remote" stay different facts
+/// in the record rather than collapsing into one verdict — the same
+/// twenty-three-good-answers reasoning `fetch_all` makes across repos, made
+/// here across the two halves of one sync.
+pub(crate) fn sync_repo(ctx: &ToolCtx, name: &str) -> Result<ToolOutcome, ToolError> {
+    let abs = resolve_repo(ctx, name)?;
+
+    let fetch_error = block_on(git::fetch(&abs, git::DEFAULT_TIMEOUT))
+        .err()
+        .map(repos::fetch_action_error);
+    let pulled = block_on(locked_dirty_check_then_pull(&abs));
+
+    let fetched = match &fetch_error {
+        None => "fetched".to_string(),
+        Some(e) => format!("fetch failed: {}", refused(e)),
+    };
+    let merged = match &pulled.error {
+        Some(e) => format!("pull refused: {}", refused(e)),
+        None if pulled.before == pulled.after => "already up to date".to_string(),
+        None => format!(
+            "fast-forwarded {}..{}",
+            short_or_none(pulled.before.as_ref()),
+            short_or_none(pulled.after.as_ref())
+        ),
+    };
+
+    Ok(ToolOutcome {
+        text: format!("{name}: {fetched}; {merged}\n"),
+        effects: vec![
+            Effect::RepoActed {
+                verb: RepoVerb::Fetch,
+                repo: name.to_string(),
+                // A fetch moves no branch this repo owns, so it has no
+                // before/after to report — `repo_fetched` has never carried
+                // them, and inventing a pair here would claim a transition.
+                before: None,
+                after: None,
+                subject: None,
+                files: None,
+                reference: None,
+                commits: None,
+                error: fetch_error,
+            },
+            Effect::RepoActed {
+                verb: RepoVerb::Pull,
+                repo: name.to_string(),
+                before: pulled.before,
+                after: pulled.after,
+                subject: None,
+                files: None,
+                reference: None,
+                commits: None,
+                error: pulled.error,
+            },
+        ],
+    })
+}
+
+/// `push_repo` — publish the current branch under the host user's own
+/// credential.
+pub(crate) fn push_repo(ctx: &ToolCtx, name: &str) -> Result<ToolOutcome, ToolError> {
+    let abs = resolve_repo(ctx, name)?;
+
+    let outcome = block_on(git::push(&abs, git::DEFAULT_TIMEOUT));
+    let error = outcome.as_ref().err().cloned().map(push_action_error);
+    let report = outcome.as_ref().ok();
+
+    // `commits` only where there is a range to count. A new branch and an
+    // up-to-date push both report no shas, and a count derived from anything
+    // else — the ahead-count `status_v2` holds, say — would be this machine's
+    // belief before the push rather than what the push moved.
+    let commits = match report.and_then(|r| r.before.as_ref().zip(r.after.as_ref())) {
+        Some((b, a)) => block_on(git::count_range(&abs, b, a, git::DEFAULT_TIMEOUT)).ok(),
+        None => None,
+    };
+    let (reference, before, after) = match report {
+        Some(r) => (r.reference.clone(), r.before.clone(), r.after.clone()),
+        None => (None, None, None),
+    };
+
+    let text = match (&error, &before, &after) {
+        (Some(e), _, _) => format!("push refused for {name}: {}\n", refused(e)),
+        (None, Some(b), Some(a)) => format!(
+            "pushed {name} {}: {}..{} ({} commits)\n",
+            reference.as_deref().unwrap_or("the current branch"),
+            short(b),
+            short(a),
+            commits.unwrap_or(0),
+        ),
+        // A new branch and an up-to-date push both land here: git reported no
+        // range, and saying which of the two it was would be a guess.
+        (None, _, _) => format!(
+            "pushed {name} {}: no commit range to report — a new branch, or already up to date\n",
+            reference.as_deref().unwrap_or("the current branch"),
+        ),
+    };
+
+    Ok(ToolOutcome {
+        text,
+        effects: vec![Effect::RepoActed {
+            verb: RepoVerb::Push,
+            repo: name.to_string(),
+            before,
+            after,
+            subject: None,
+            files: None,
+            reference,
+            commits,
+            error,
+        }],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +617,25 @@ mod tests {
         // than the event's absence saying it for them.
         assert_ne!(outcome.before, outcome.after, "a landed commit must move HEAD");
         assert!(outcome.before.is_some(), "a cloned repo has a HEAD");
+    }
+
+    #[test]
+    fn the_tool_trailer_is_two_lines_and_names_the_model_piloting_the_operator() {
+        // D6. One line is a tap; two is a turn. The `Committed-by` half is the
+        // one that carries the new fact — which operator acted, and which
+        // model was piloting it when it did.
+        let out = with_tool_trailer(
+            "notes: a line\n",
+            "iphone",
+            "tycho",
+            "zen/deepseek-v4-flash",
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            &lines[lines.len() - 2..],
+            ["Committed-from: iphone", "Committed-by: tycho/zen/deepseek-v4-flash"],
+            "{out}"
+        );
+        assert!(out.starts_with("notes: a line\n\n"), "one blank line, no more: {out}");
     }
 }
