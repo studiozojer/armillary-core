@@ -1,4 +1,5 @@
 pub mod composition;
+pub mod features;
 pub mod file;
 pub mod health;
 pub mod instances;

@@ -45,6 +45,7 @@ pub fn app(state: AppState) -> Router {
     let shared: SharedState = Arc::new(state);
     Router::new()
         .route("/health", get(routes::health::health))
+        .route("/features", get(routes::features::features))
         .route("/whoami", get(routes::whoami::whoami))
         .route("/composition", get(routes::composition::composition))
         .route("/models", get(routes::models::models))
