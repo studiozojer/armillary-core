@@ -896,7 +896,15 @@ pub async fn run_git_stdin(
 ) -> Result<GitOutput, GitError> {
     use tokio::io::AsyncWriteExt;
     let mut cmd = git_command(repo, args);
-    cmd.stdin(Stdio::piped());
+    // `run_git`'s `.output()` pipes stdout/stderr automatically; a manual
+    // `spawn` + `wait_with_output` does not default to that — without these,
+    // the child's stdout/stderr are inherited from this process (so a
+    // pre-commit hook's stderr would print to the ENGINE's own terminal
+    // instead of being captured) and `GitOutput` reads as empty on every
+    // call, degrading `require_ok`'s message to the generic "exited N" even
+    // when the process actually said something. Found running this task's
+    // own `a_declining_pre_commit_hook_lands_in_action_error_with_head_unmoved`.
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let fut = async {
         let mut child = cmd.spawn().map_err(|e| GitError::Failed(e.to_string()))?;
         let mut stdin = child.stdin.take().expect("stdin was piped two lines up");

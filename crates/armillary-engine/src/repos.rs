@@ -169,8 +169,14 @@ use crate::git::{self, GitError, Position};
 /// remote WAS reached, so it isn't `"transport"`, and pulling first will not
 /// help, so it isn't `"not-fast-forwardable"`; see
 /// `routes::repos::push_action_error`), `"transport"` (the remote could not
-/// be reached), `"timeout"` (the invocation exceeded its cap). `message` is
-/// the human-readable detail for display; `kind` is what code branches on.
+/// be reached), `"timeout"` (the invocation exceeded its cap), `"detached"`
+/// (a commit was refused because HEAD is detached — it would belong to no
+/// branch), `"nothing-to-commit"` (a commit was refused because the working
+/// tree is clean), `"commit-failed"` (`git add`/`git commit` itself failed —
+/// a declining pre-commit hook, most commonly, whose own text becomes
+/// `message` since git gives it no stable locale-pinned marker the way
+/// `"[rejected]"` marks a push). `message` is the human-readable detail for
+/// display; `kind` is what code branches on.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ActionError {
     pub kind: &'static str,

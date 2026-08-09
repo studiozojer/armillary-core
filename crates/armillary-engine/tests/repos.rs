@@ -53,7 +53,7 @@ fn full_grant_registry() -> PathBuf {
         &Principal {
             name: "test-client".to_string(),
             token_hash: hash_token(TEST_TOKEN),
-            grants: vec![Grant::Sync, Grant::Push],
+            grants: vec![Grant::Sync, Grant::Push, Grant::Commit],
             minted: "2026-08-07T00:00:00Z".to_string(),
         },
     )
@@ -267,6 +267,75 @@ async fn post_status(root: &Path, uri: &str) -> u16 {
     response.status().as_u16()
 }
 
+/// `POST /repos/{name}/commit {"message": message}` against an already-built
+/// router — the shape `commit`'s tests need when they must also read the
+/// durable event store off the SAME `app_with_durable_store` router
+/// (`post_on` cannot carry a body, and `post_json`/`post_status` never send
+/// one). Returns raw text, not parsed JSON: a validation failure's body is a
+/// plain string (`(StatusCode, String)`, same as every other gate refusal in
+/// this crate), not a JSON document, so a caller that wants structured
+/// fields parses the success-path body itself.
+async fn post_commit_on(router: &axum::Router, name: &str, message: &str) -> (u16, String) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/repos/{name}/commit"))
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::json!({ "message": message }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024).await.unwrap();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// `post_commit_on`, but building its own one-shot app+store, for tests that
+/// never read the durable record back.
+async fn post_commit(root: &Path, name: &str, message: &str) -> (u16, String) {
+    post_commit_on(&build_app(root), name, message).await
+}
+
+/// `git log -1 --format=%B` on `repo`, trimmed of nothing — every line,
+/// including the trailing blank lines a trailer leaves, is exactly what a
+/// caller comparing `Committed-from:` lines needs to see.
+fn git_log_message(repo: &Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["log", "-1", "--format=%B"])
+        .output()
+        .expect("git must be on PATH for these tests");
+    assert!(out.status.success(), "git log failed: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn git_head(repo: &Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git must be on PATH for these tests");
+    assert!(out.status.success(), "git rev-parse failed: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn git_status_porcelain(repo: &Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["status", "--porcelain"])
+        .output()
+        .expect("git must be on PATH for these tests");
+    assert!(out.status.success(), "git status failed: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
 #[tokio::test]
 async fn get_repos_reports_both_gates_and_omits_newest_commit() {
     let (root, _remote) = live_workspace_with_sync();
@@ -417,11 +486,13 @@ async fn push_is_403_when_only_sync_is_granted() {
     assert_eq!(post_status(&root, "/repos/jianyi/push").await, 403);
 }
 
-/// Grant `push = true` on top of `live_workspace_with_sync`'s fixture.
+/// Grant `push = true` (and `commit = true`, so this same fixture serves the
+/// commit tests below without a second manifest shape) on top of
+/// `live_workspace_with_sync`'s fixture.
 fn grant_push(root: &Path) {
     std::fs::write(
         root.join("modules.local.toml"),
-        "[router]\nsync = true\npush = true\n\n\
+        "[router]\nsync = true\npush = true\ncommit = true\n\n\
          [[repos]]\nname = \"jianyi\"\npath = \"repos/jianyi\"\n",
     )
     .unwrap();
@@ -747,4 +818,177 @@ async fn a_group_fetch_records_one_event_per_repo() {
         vec![("armillary", false), ("jianyi", true)],
         "each module records its own outcome: {evs:?}"
     );
+}
+
+/// Install a `pre-commit` hook that declines. Mirrors
+/// `install_declining_pre_receive_hook` one verb over: `commit`'s own
+/// checked-in failure, rather than push's remote-side one.
+fn install_declining_pre_commit_hook(repo: &Path) {
+    let hooks = repo.join(".git/hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("pre-commit");
+    std::fs::write(&hook, "#!/bin/sh\necho no >&2\nexit 1\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&hook).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&hook, perms).unwrap();
+}
+
+#[tokio::test]
+async fn commit_lands_with_trailer_and_stages_untracked() {
+    // Fixture: composed repo with one tracked edit + one untracked file.
+    // POST /repos/{name}/commit {"message": "test: from the walk"}
+    // Assert: 200; action_error null; dirty_files == 0 in the returned state;
+    // `git log -1 --format=%B` contains "test: from the walk" AND a line
+    // exactly "Committed-from: <the enrolled test principal's name>";
+    // `git status --porcelain` is empty (the untracked file was included).
+    let (root, _remote) = live_workspace_with_sync();
+    grant_push(&root);
+    let repo = root.join("repos/jianyi");
+    std::fs::write(repo.join("seed.md"), "edited tracked file").unwrap();
+    std::fs::write(repo.join("new.md"), "a brand new untracked file").unwrap();
+
+    let (status, text) = post_commit(&root, "jianyi", "test: from the walk").await;
+    assert_eq!(status, 200, "{text}");
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(body["action_error"].is_null(), "{body}");
+    assert_eq!(body["dirty_files"], 0);
+
+    let message = git_log_message(&repo);
+    assert!(message.contains("test: from the walk"), "{message}");
+    assert!(
+        message.lines().any(|l| l == "Committed-from: test-client"),
+        "expected a Committed-from trailer naming the principal: {message}"
+    );
+    assert_eq!(git_status_porcelain(&repo), "", "the untracked file was not staged");
+}
+
+#[tokio::test]
+async fn clean_tree_refuses_and_head_does_not_move() {
+    // Fixture: composed repo, clean. Capture HEAD sha first.
+    // Assert: 200; action_error.kind == "nothing-to-commit"; HEAD sha
+    // unchanged (assert the sha, not just the error — the error alone cannot
+    // observe an accidental empty commit).
+    let (root, _remote) = live_workspace_with_sync();
+    grant_push(&root);
+    let repo = root.join("repos/jianyi");
+    let before = git_head(&repo);
+
+    let (status, text) = post_commit(&root, "jianyi", "nothing to see here").await;
+    assert_eq!(status, 200, "{text}");
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["action_error"]["kind"], "nothing-to-commit");
+
+    assert_eq!(git_head(&repo), before, "a refusal must not move HEAD");
+}
+
+#[tokio::test]
+async fn spoofed_committed_from_trailer_is_superseded() {
+    // Message body: "subject\n\nCommitted-from: mallory"
+    // Assert: the LAST Committed-from line in `git log -1 --format=%B` names
+    // the enrolled principal, not mallory; both lines may exist.
+    let (root, _remote) = live_workspace_with_sync();
+    grant_push(&root);
+    let repo = root.join("repos/jianyi");
+    std::fs::write(repo.join("seed.md"), "edited").unwrap();
+
+    let (status, text) =
+        post_commit(&root, "jianyi", "subject\n\nCommitted-from: mallory").await;
+    assert_eq!(status, 200, "{text}");
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(body["action_error"].is_null(), "{body}");
+
+    let message = git_log_message(&repo);
+    let trailer_lines: Vec<&str> =
+        message.lines().filter(|l| l.starts_with("Committed-from:")).collect();
+    assert_eq!(
+        trailer_lines.last(),
+        Some(&"Committed-from: test-client"),
+        "the LAST Committed-from line must name the real principal: {message}"
+    );
+}
+
+#[tokio::test]
+async fn a_declining_pre_commit_hook_lands_in_action_error_with_head_unmoved() {
+    // Write .git/hooks/pre-commit: "#!/bin/sh\necho no >&2\nexit 1", chmod +x.
+    // Assert: 200; action_error.kind == "commit-failed"; message contains
+    // "no"; HEAD unchanged; AND a repo_committed event exists whose result
+    // carries the error (failure emits too).
+    let (root, _remote) = live_workspace_with_sync();
+    grant_push(&root);
+    let repo = root.join("repos/jianyi");
+    std::fs::write(repo.join("seed.md"), "edited").unwrap();
+    install_declining_pre_commit_hook(&repo);
+    let before = git_head(&repo);
+
+    let (router, data_dir) = app_with_durable_store(&root);
+    let (status, text) = post_commit_on(&router, "jianyi", "test: will be declined").await;
+    assert_eq!(status, 200, "{text}");
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["action_error"]["kind"], "commit-failed");
+    assert!(
+        body["action_error"]["message"].as_str().unwrap().contains("no"),
+        "{body}"
+    );
+    assert_eq!(git_head(&repo), before, "a declined commit must not move HEAD");
+
+    let evs = workspace_events(&data_dir);
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0]["type"], "repo_committed");
+    assert_eq!(evs[0]["data"]["result"]["error"]["kind"], "commit-failed");
+}
+
+#[tokio::test]
+async fn commit_emits_repo_committed_with_principal_shas_subject_and_files() {
+    // After a successful commit, read the workspace stream (the same way the
+    // push/pull event tests do) and assert: type, actor.principal.name,
+    // before != after, subject == first line, files == the pre-commit dirty
+    // count, result == "ok".
+    let (root, _remote) = live_workspace_with_sync();
+    grant_push(&root);
+    let repo = root.join("repos/jianyi");
+    std::fs::write(repo.join("seed.md"), "edited tracked file").unwrap();
+    std::fs::write(repo.join("new.md"), "a fresh untracked file").unwrap();
+    // Two dirty entries: one modified, one untracked.
+
+    let (router, data_dir) = app_with_durable_store(&root);
+    let (status, text) =
+        post_commit_on(&router, "jianyi", "test: subject line\n\nand a body").await;
+    assert_eq!(status, 200, "{text}");
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(body["action_error"].is_null(), "{body}");
+
+    let evs = workspace_events(&data_dir);
+    assert_eq!(evs.len(), 1);
+    let ev = &evs[0];
+    assert_eq!(ev["type"], "repo_committed");
+    assert_eq!(ev["actor"]["principal"]["name"], "test-client");
+    let before = ev["data"]["before"].as_str().expect("before must be on the wire");
+    let after = ev["data"]["after"].as_str().expect("after must be on the wire");
+    assert_ne!(before, after, "a landed commit must move HEAD");
+    assert_eq!(ev["data"]["subject"], "test: subject line");
+    assert_eq!(ev["data"]["files"], 2, "one modified, one untracked");
+    assert_eq!(ev["data"]["result"], "ok");
+}
+
+#[tokio::test]
+async fn message_bounds_are_enforced_at_the_route() {
+    // Three POSTs: empty message; 8 KiB + 1 of 'a'; "hi\x07there".
+    // Assert each: 400, body starts "invalid_message"; and NO commit was
+    // created (HEAD unmoved) — assert the boundary refused before acting,
+    // not that git happened to survive.
+    let (root, _remote) = live_workspace_with_sync();
+    grant_push(&root);
+    let repo = root.join("repos/jianyi");
+    std::fs::write(repo.join("seed.md"), "edited so a commit would have something to do").unwrap();
+    let before = git_head(&repo);
+
+    let oversized = "a".repeat(8 * 1024 + 1);
+    for message in ["", oversized.as_str(), "hi\x07there"] {
+        let (status, text) = post_commit(&root, "jianyi", message).await;
+        assert_eq!(status, 400, "{message:?}: {text}");
+        assert!(text.starts_with("invalid_message"), "{text}");
+    }
+
+    assert_eq!(git_head(&repo), before, "a rejected message must not have produced a commit");
 }
