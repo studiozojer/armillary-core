@@ -14,7 +14,7 @@ use armillary_engine::{
     log::envelope::EventEnvelope,
     log::store::LogStore,
     principals::{hash_token, write_principal, Grant, Principal},
-    projection::ModelTurn,
+    projection::{ContentBlock, ModelTurn},
     provider::{self, ModelProvider, ProviderError, ScriptedProvider, TurnOutcome},
     sessions::Sessions,
     state::{AppState, ModelConfig},
@@ -68,10 +68,17 @@ fn full_grant_registry() -> PathBuf {
 /// sites, is the same shape Task 7 used for `tests/repos.rs`'s shared POST
 /// helpers: one place carries the credential, no assertion anywhere changes.
 fn authed_client() -> reqwest::Client {
+    client_presenting(TEST_TOKEN)
+}
+
+/// `authed_client`, for some token other than this file's default — the two
+/// enrolled devices the gate tests need are two tokens, not two clients built
+/// two different ways.
+fn client_presenting(token: &str) -> reqwest::Client {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::AUTHORIZATION,
-        reqwest::header::HeaderValue::from_str(&format!("Bearer {TEST_TOKEN}")).unwrap(),
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
     );
     reqwest::Client::builder().default_headers(headers).build().unwrap()
 }
@@ -366,6 +373,44 @@ async fn send_returns_the_user_events_id_and_seq() {
     assert_eq!(user_ev.id, receipt["id"]);
     assert_eq!(user_ev.seq, receipt["seq"].as_u64().unwrap());
     assert_eq!(user_ev.data["clientKey"], "c1");
+}
+
+// --- Task 2: `agentTools` on the wire ---
+
+/// (a) A valid `agentTools` list is accepted and the 200-path is unchanged
+/// otherwise: same 201, same receipt shape, same seq numbering as the plain
+/// send above. And — the point of routing consent through the spawned
+/// turn's own arguments rather than the append — the durable `user_message`
+/// carries `text`/`clientKey` only; consent never reaches the log.
+#[tokio::test]
+async fn send_with_a_valid_agent_tools_list_is_accepted_and_the_200_path_is_unchanged() {
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let provider = Arc::new(ScriptedProvider::new(vec!["hi"]));
+    let (addr, sessions) = spawn(&data_dir, provider).await;
+    let client = authed_client();
+    let id = create_instance(&client, addr).await;
+
+    let response = client
+        .post(format!("http://{addr}/instances/{id}/send"))
+        .json(&serde_json::json!({ "text": "hello", "clientKey": "c1", "agentTools": ["commit"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let receipt: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(receipt["seq"], 3);
+    assert!(receipt["id"].as_str().is_some_and(|s| !s.is_empty()));
+
+    let events = sessions.store().read_from(&id, 0).unwrap();
+    let user_ev = events.iter().find(|e| e.event_type == "user_message").unwrap();
+    assert_eq!(user_ev.data["clientKey"], "c1");
+    // Consent is per-request state, never a durable fact (brief, Task 2):
+    // the append this route owns must not gain a new key just because the
+    // request carried one.
+    let keys = user_ev.data.as_object().unwrap();
+    assert_eq!(keys.len(), 2, "{:?}", user_ev.data);
+    assert!(!keys.contains_key("agentTools"), "{:?}", user_ev.data);
+    assert!(!keys.contains_key("agent_tools"), "{:?}", user_ev.data);
 }
 
 // --- (b) echo -> >=2 transient snapshots -> durable assistant_message ---
@@ -952,6 +997,430 @@ async fn evict_on_an_unknown_instance_is_404_unknown_instance() {
 
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
     assert_eq!(response.text().await.unwrap(), "unknown_instance");
+}
+
+// --- Task 4: the gate, at the door. `offered = the base seven + (agent_tools
+// ∩ caller-grants ∩ manifest)`, resolved fresh per turn. These four drive the
+// WHOLE path a phone drives — `agentTools` over the wire, a principal recorded
+// at creation, a registry and a manifest on disk — and assert on the tool
+// definitions that actually reached the provider, which is the only place the
+// offer is observable from outside the loop. ---
+
+/// The base set every turn is handed regardless of consent — `tools::registry()`
+/// in its offer order. Spelled out rather than counted so a test failure names
+/// which one went missing, and so a new base tool has to be admitted here on
+/// purpose.
+const BASE_TOOLS: [&str; 7] = [
+    "get_composition",
+    "list_directory",
+    "read_file",
+    "find_files",
+    "search",
+    "write_file",
+    "edit_file",
+];
+
+/// A registry directory holding one principal — the same `test-client` every
+/// request in this file authenticates as — with exactly `grants`. The whole
+/// point of the gate is that this set and the manifest disagree sometimes, so
+/// unlike `full_grant_registry` this one is a knob.
+fn registry_granting(grants: Vec<Grant>) -> PathBuf {
+    let dir = tempfile::tempdir().unwrap().keep();
+    write_principal(
+        &dir,
+        &Principal {
+            name: "test-client".to_string(),
+            token_hash: hash_token(TEST_TOKEN),
+            grants,
+            minted: "2026-08-09T00:00:00Z".to_string(),
+        },
+    )
+    .unwrap();
+    dir
+}
+
+/// `spawn`, with the two things the gate reads made explicit: the registry the
+/// caller's grants come from, and a workspace manifest whose `[router]` keys
+/// are the ceiling.
+async fn spawn_gated(
+    data_dir: &Path,
+    provider: Arc<dyn ModelProvider>,
+    registry_dir: PathBuf,
+    manifest: &str,
+) -> (SocketAddr, Arc<Sessions>) {
+    let store = LogStore::open(data_dir).unwrap();
+    let sessions = Arc::new(Sessions::new(store));
+    let root = tempfile::tempdir().unwrap().keep();
+    std::fs::write(root.join("modules.toml"), manifest).unwrap();
+
+    let state = AppState {
+        root: root.canonicalize().unwrap(),
+        sessions: sessions.clone(),
+        model: model_config(),
+        providers: provider::fixed(provider),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
+        registry_dir,
+        anthropic_key_present: false,
+        zen_key_present: false,
+        boot: None,
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app(state)).await;
+    });
+
+    (addr, sessions)
+}
+
+/// Records the tool NAMES each round was offered, then answers with prose so
+/// the turn ends in one round. `RecordingProvider` above captures the turn;
+/// this captures the other half of the same `TurnRequest` — what the model was
+/// allowed to reach for.
+struct OfferProbe {
+    offered: Mutex<Vec<Vec<String>>>,
+}
+
+impl OfferProbe {
+    fn new() -> Arc<Self> {
+        Arc::new(OfferProbe {
+            offered: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// The first round's offer — the one assembled from the send's own
+    /// consent.
+    fn first_round(&self) -> Vec<String> {
+        self.offered
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("the provider was never called")
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for OfferProbe {
+    async fn run_turn(
+        &self,
+        req: armillary_engine::provider::TurnRequest,
+        _sink: mpsc::Sender<String>,
+        _cancel: watch::Receiver<bool>,
+    ) -> Result<TurnOutcome, ProviderError> {
+        self.offered
+            .lock()
+            .unwrap()
+            .push(req.tools.iter().map(|t| t.name.to_string()).collect());
+        Ok(TurnOutcome {
+            text: "noted".to_string(),
+            blocks: vec![ContentBlock::text("noted")],
+            stop_reason: Some("end_turn".to_string()),
+            stopped: false,
+            model: "offer-probe".to_string(),
+        })
+    }
+}
+
+/// One send carrying `agent_tools`, run to completion; returns what the first
+/// round was offered.
+async fn offered_for(registry_dir: PathBuf, manifest: &str, agent_tools: serde_json::Value) -> Vec<String> {
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let probe = OfferProbe::new();
+    let (addr, sessions) = spawn_gated(&data_dir, probe.clone(), registry_dir, manifest).await;
+    let client = authed_client();
+    let id = create_instance(&client, addr).await;
+
+    client
+        .post(format!("http://{addr}/instances/{id}/send"))
+        .json(&serde_json::json!({ "text": "commit that for me", "clientKey": "c1", "agentTools": agent_tools }))
+        .send()
+        .await
+        .unwrap();
+    wait_for_assistant_message(&sessions, &id, 1).await;
+
+    probe.first_round()
+}
+
+const ALL_THREE_GRANTED: &str = "[router]\nsync = true\npush = true\ncommit = true\n";
+
+#[tokio::test]
+async fn consent_a_grant_and_the_manifest_agreeing_puts_the_verb_on_the_turn() {
+    // (a) The whole law in its permitting direction: the device consented to
+    // `commit`, its principal holds `commit`, and the workspace grants it — so
+    // the turn is offered `commit_repo`. And ONLY that one: consent is an
+    // intersection, not a switch, so the two verbs the send never named stay
+    // off even though grant and manifest would both have allowed them.
+    let offered = offered_for(
+        registry_granting(vec![Grant::Sync, Grant::Push, Grant::Commit]),
+        ALL_THREE_GRANTED,
+        serde_json::json!(["commit"]),
+    )
+    .await;
+
+    assert!(offered.contains(&"commit_repo".to_string()), "{offered:?}");
+    assert!(!offered.contains(&"sync_repo".to_string()), "{offered:?}");
+    assert!(!offered.contains(&"push_repo".to_string()), "{offered:?}");
+    for base in BASE_TOOLS {
+        assert!(offered.contains(&base.to_string()), "{base} left the base set: {offered:?}");
+    }
+    // E-4: the git verb lands AFTER the base seven, never interleaved, so the
+    // cached prompt prefix is the same bytes whether or not a turn is granted.
+    assert_eq!(offered[..7], BASE_TOOLS.map(str::to_string), "{offered:?}");
+}
+
+#[tokio::test]
+async fn a_device_consenting_to_what_it_was_never_granted_is_offered_nothing() {
+    // (b) The client can narrow itself and never widen itself (D3). This send
+    // asks for `commit` with a principal holding only sync and push — an
+    // inflated consent, which is what a stale or lying client sends.
+    let offered = offered_for(
+        registry_granting(vec![Grant::Sync, Grant::Push]),
+        ALL_THREE_GRANTED,
+        serde_json::json!(["commit"]),
+    )
+    .await;
+
+    assert!(!offered.contains(&"commit_repo".to_string()), "{offered:?}");
+    assert_eq!(offered, BASE_TOOLS.map(str::to_string), "{offered:?}");
+}
+
+#[tokio::test]
+async fn a_manifest_that_withholds_commit_withholds_it_from_a_fully_granted_device() {
+    // (c) The ceiling, one edit away from denying — the property that keeps
+    // the manifest keys from being decorative (`routes::repos`'s own argument
+    // for them). Consent and grant both say yes; the workspace says no.
+    let offered = offered_for(
+        registry_granting(vec![Grant::Sync, Grant::Push, Grant::Commit]),
+        "[router]\nsync = true\npush = true\ncommit = false\n",
+        serde_json::json!(["commit"]),
+    )
+    .await;
+
+    assert!(!offered.contains(&"commit_repo".to_string()), "{offered:?}");
+    assert_eq!(offered, BASE_TOOLS.map(str::to_string), "{offered:?}");
+}
+
+#[tokio::test]
+async fn consenting_to_sync_puts_sync_repo_on_the_turn_and_neither_of_the_others() {
+    // The rows themselves, pinned. Every other test here consents to `commit`
+    // and asks after `commit_repo` — so `sync` and `push` were only ever
+    // observed being WITHHELD, and a table that swapped their two rows
+    // (`sync_repo → Push`, `push_repo → Sync`) passed the lot. A grant that
+    // opens the wrong verb is not a smaller defect than a grant that opens
+    // nothing.
+    //
+    // Sync-only in all three terms, so the two verbs left off are left off by
+    // the grant and by the consent both.
+    let offered = offered_for(
+        registry_granting(vec![Grant::Sync]),
+        ALL_THREE_GRANTED,
+        serde_json::json!(["sync"]),
+    )
+    .await;
+
+    assert!(offered.contains(&"sync_repo".to_string()), "{offered:?}");
+    assert!(!offered.contains(&"push_repo".to_string()), "{offered:?}");
+    assert!(!offered.contains(&"commit_repo".to_string()), "{offered:?}");
+}
+
+#[tokio::test]
+async fn a_send_carrying_no_consent_is_offered_none_of_the_three() {
+    // (d) Fail-closed, and the case every OTHER test in this file exercises
+    // by accident: absent consent is not "whatever the device could do", it is
+    // nothing. A grant and a manifest that both permit all three still put no
+    // verb on a turn nobody consented to.
+    let offered = offered_for(
+        registry_granting(vec![Grant::Sync, Grant::Push, Grant::Commit]),
+        ALL_THREE_GRANTED,
+        serde_json::Value::Null,
+    )
+    .await;
+
+    assert_eq!(offered, BASE_TOOLS.map(str::to_string), "{offered:?}");
+}
+
+// --- The gate spends the SENDER's authority. Nothing scopes an instance to
+// the device that created it — every enrolled device can send into every
+// window — so which device the gate looks up is the whole of whether consent
+// means anything. These two drive it over the wire with two real tokens. ---
+
+const TOKEN_A: &str = "test-token-device-a-loop-flow-rs-2026-08-09";
+const TOKEN_B: &str = "test-token-device-b-loop-flow-rs-2026-08-09";
+
+/// A registry holding two enrolled devices with different tokens and
+/// different grants. `registry_granting`'s single principal cannot express
+/// "one device opened the window, another one sent into it", which is the
+/// only shape these two tests are about.
+fn registry_of_two(device_a: Vec<Grant>, device_b: Vec<Grant>) -> PathBuf {
+    let dir = tempfile::tempdir().unwrap().keep();
+    for (name, token, grants) in [
+        ("device-a", TOKEN_A, device_a),
+        ("device-b", TOKEN_B, device_b),
+    ] {
+        write_principal(
+            &dir,
+            &Principal {
+                name: name.to_string(),
+                token_hash: hash_token(token),
+                grants,
+                minted: "2026-08-09T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+    }
+    dir
+}
+
+/// Calls `write_file` once, then speaks. The smallest turn that produces a
+/// `file_changed` — the one effect event observable from here without a git
+/// fixture, and the one that carries the acting principal.
+struct WriteThenSpeak {
+    calls: Mutex<usize>,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for WriteThenSpeak {
+    async fn run_turn(
+        &self,
+        _req: armillary_engine::provider::TurnRequest,
+        _sink: mpsc::Sender<String>,
+        _cancel: watch::Receiver<bool>,
+    ) -> Result<TurnOutcome, ProviderError> {
+        let round = {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        if round == 1 {
+            return Ok(TurnOutcome {
+                text: String::new(),
+                blocks: vec![ContentBlock::ToolUse {
+                    id: "toolu_w1".to_string(),
+                    name: "write_file".to_string(),
+                    input: serde_json::json!({
+                        "path": "notes.md",
+                        "content": "from the sending device\n",
+                    }),
+                }],
+                stop_reason: Some("tool_use".to_string()),
+                stopped: false,
+                model: "write-then-speak".to_string(),
+            });
+        }
+        Ok(TurnOutcome {
+            text: "done".to_string(),
+            blocks: vec![ContentBlock::text("done")],
+            stop_reason: Some("end_turn".to_string()),
+            stopped: false,
+            model: "write-then-speak".to_string(),
+        })
+    }
+}
+
+async fn send_consenting(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    id: &str,
+    agent_tools: serde_json::Value,
+) {
+    client
+        .post(format!("http://{addr}/instances/{id}/send"))
+        .json(&serde_json::json!({
+            "text": "commit that for me",
+            "clientKey": "c1",
+            "agentTools": agent_tools,
+        }))
+        .send()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn the_gate_looks_up_the_sending_device_not_the_one_that_created_the_instance() {
+    // device-a holds `commit` and opens the window; device-b holds nothing and
+    // sends `agentTools: ["commit"]` into it. If the gate read the CREATOR's
+    // grants, that send would be handed `commit_repo` — a device granted
+    // nothing spending a device granted everything, by picking the right
+    // window to shout into.
+    //
+    // The second send is the control, and it is what makes the first
+    // assertion mean anything: the SAME instance, the SAME manifest, the SAME
+    // consent, from the device that actually holds the grant — and there the
+    // verb does land on the turn. Without it, "offered nothing" would be
+    // satisfied by a fixture that could never offer anything.
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let probe = OfferProbe::new();
+    let (addr, sessions) = spawn_gated(
+        &data_dir,
+        probe.clone(),
+        registry_of_two(vec![Grant::Commit], Vec::new()),
+        ALL_THREE_GRANTED,
+    )
+    .await;
+
+    let device_a = client_presenting(TOKEN_A);
+    let device_b = client_presenting(TOKEN_B);
+    let id = create_instance(&device_a, addr).await;
+
+    send_consenting(&device_b, addr, &id, serde_json::json!(["commit"])).await;
+    wait_for_assistant_message(&sessions, &id, 1).await;
+
+    send_consenting(&device_a, addr, &id, serde_json::json!(["commit"])).await;
+    wait_for_assistant_message(&sessions, &id, 2).await;
+
+    let offers = probe.offered.lock().unwrap();
+    assert_eq!(
+        offers[0],
+        BASE_TOOLS.map(str::to_string),
+        "a zero-grant sender is offered the base set and nothing else: {:?}",
+        offers[0]
+    );
+    assert!(
+        offers[1].contains(&"commit_repo".to_string()),
+        "the granted device's own send must still be offered it: {:?}",
+        offers[1]
+    );
+}
+
+#[tokio::test]
+async fn an_effect_names_the_device_that_sent_the_turn_not_the_one_that_created_the_instance() {
+    // Attribution follows the same name the gate does, and it has to: a record
+    // naming the creator would credit the authority to a device that spent
+    // none of it. `write_file` needs no consent at all, so this isolates the
+    // attribution half — nothing here is gated, and the name still has to be
+    // the sender's.
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let provider = Arc::new(WriteThenSpeak {
+        calls: Mutex::new(0),
+    });
+    let (addr, sessions) = spawn_gated(
+        &data_dir,
+        provider,
+        registry_of_two(vec![Grant::Commit], vec![Grant::Commit]),
+        ALL_THREE_GRANTED,
+    )
+    .await;
+
+    let device_a = client_presenting(TOKEN_A);
+    let device_b = client_presenting(TOKEN_B);
+    let id = create_instance(&device_a, addr).await;
+
+    send_consenting(&device_b, addr, &id, serde_json::Value::Null).await;
+    wait_for_assistant_message(&sessions, &id, 2).await;
+
+    let events = sessions.store().read_from(&id, 0).unwrap();
+    let changed = events
+        .iter()
+        .find(|e| e.event_type == "file_changed")
+        .expect("the write must have been recorded");
+    assert_eq!(
+        changed.actor.principal.as_ref().map(|p| p.name.as_str()),
+        Some("device-b"),
+        "the effect names whoever sent the turn that produced it"
+    );
 }
 
 #[tokio::test]

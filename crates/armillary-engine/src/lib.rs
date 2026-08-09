@@ -22,6 +22,7 @@ pub mod projection;
 pub mod provider;
 pub mod provider_openai;
 pub mod repo_events;
+pub mod repo_verbs;
 pub mod repos;
 pub mod routes;
 mod search;
@@ -44,6 +45,7 @@ pub fn app(state: AppState) -> Router {
     let shared: SharedState = Arc::new(state);
     Router::new()
         .route("/health", get(routes::health::health))
+        .route("/whoami", get(routes::whoami::whoami))
         .route("/composition", get(routes::composition::composition))
         .route("/models", get(routes::models::models))
         .route("/tree", get(routes::tree::tree))

@@ -444,6 +444,7 @@ mod tests {
         ToolCtx {
             root: dir.path().to_path_buf(),
             may_write_composition,
+            turn: crate::tools::TurnIdentity::default(),
         }
     }
 
@@ -484,12 +485,9 @@ mod tests {
         let out = write_file(&ctx(&dir, false), "notes/existing.md", "replaced\n").unwrap();
 
         assert_eq!(out.effects.len(), 1);
-        let Effect::FileChanged {
-            path,
-            op,
-            before,
-            after,
-        } = &out.effects[0];
+        let Effect::FileChanged { path, op, before, after } = &out.effects[0] else {
+            panic!("a write records a FileChanged: {:?}", out.effects);
+        };
         assert_eq!(path, "notes/existing.md");
         assert_eq!(*op, "modified");
         assert_eq!(
@@ -504,7 +502,9 @@ mod tests {
         let dir = ws();
         let out = write_file(&ctx(&dir, false), "notes/fresh.md", "hi\n").unwrap();
 
-        let Effect::FileChanged { op, before, .. } = &out.effects[0];
+        let Effect::FileChanged { op, before, .. } = &out.effects[0] else {
+            panic!("a write records a FileChanged: {:?}", out.effects);
+        };
         assert_eq!(*op, "created");
         assert!(before.is_none(), "there was no prior content to hash");
     }
@@ -517,7 +517,9 @@ mod tests {
         let dir = ws();
         let out = write_file(&ctx(&dir, false), "notes/existing.md", "original\n").unwrap();
 
-        let Effect::FileChanged { before, after, .. } = &out.effects[0];
+        let Effect::FileChanged { before, after, .. } = &out.effects[0] else {
+            panic!("a write records a FileChanged: {:?}", out.effects);
+        };
         assert_eq!(before.as_deref(), Some(after.as_str()));
     }
 
@@ -758,9 +760,9 @@ mod tests {
             fs::read_to_string(dir.path().join("notes/e.md")).unwrap(),
             "alpha\nBETA\ngamma\n"
         );
-        let Effect::FileChanged {
-            op, before, after, ..
-        } = &out.effects[0];
+        let Effect::FileChanged { op, before, after, .. } = &out.effects[0] else {
+            panic!("an edit records a FileChanged: {:?}", out.effects);
+        };
         assert_eq!(*op, "modified", "an edit never creates");
         assert_eq!(
             before.as_deref(),
@@ -944,7 +946,9 @@ mod tests {
 
         let out = write_file(&ctx(&dir, false), "BOARD.md", "# board, edited\n").unwrap();
 
-        let Effect::FileChanged { path, .. } = &out.effects[0];
+        let Effect::FileChanged { path, .. } = &out.effects[0] else {
+            panic!("a write records a FileChanged: {:?}", out.effects);
+        };
         assert_eq!(path, "commons/board.md", "the request spelling was recorded");
         assert!(!path.starts_with('/'), "never absolute: {path}");
     }

@@ -13,6 +13,7 @@ use crate::blocking;
 use crate::loop_;
 use crate::log::envelope::{Actor, Role};
 use crate::log::store::LogStore;
+use crate::principals::Grant;
 use crate::sessions::{NewEvent, SessionError, Sessions, TurnHandle};
 use crate::state::SharedState;
 use axum::{
@@ -28,6 +29,34 @@ use tokio::sync::watch;
 pub struct SendRequest {
     pub text: String,
     pub client_key: String,
+    /// The device's consent for THIS turn: which git verbs the operator may
+    /// hold as tools. Absent = none — fail-closed like every other gate.
+    /// Validated against Grant::parse; consent can only narrow, never widen,
+    /// because the loop intersects it with the registry and the manifest.
+    #[serde(default)]
+    pub agent_tools: Option<Vec<String>>,
+}
+
+/// First bad word wins, named in the error — refused before the instance is
+/// even looked up (same "structural checks before existence checks" order
+/// `Caller` extraction already enforces on this route). `None` becomes an
+/// empty `Vec`, not an error: absent consent is valid input, it just grants
+/// nothing (fail-closed, per `SendRequest::agent_tools`'s own doc).
+fn validate_agent_tools(raw: &Option<Vec<String>>) -> Result<Vec<Grant>, (StatusCode, String)> {
+    match raw {
+        None => Ok(Vec::new()),
+        Some(words) => words
+            .iter()
+            .map(|w| {
+                Grant::parse(w).ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid_agent_tools: unknown grant {w:?} — expected sync, push or commit"),
+                    )
+                })
+            })
+            .collect(),
+    }
 }
 
 #[derive(Serialize)]
@@ -81,10 +110,11 @@ async fn require_known_instance(state: &SharedState, id: &str) -> Result<(), (St
 ///    independently of this request, which has already gotten its answer.
 pub async fn send(
     State(state): State<SharedState>,
-    _caller: Caller,
+    caller: Caller,
     Path(id): Path<String>,
     Json(body): Json<SendRequest>,
 ) -> Result<(StatusCode, Json<SendReceipt>), (StatusCode, String)> {
+    let agent_tools = validate_agent_tools(&body.agent_tools)?;
     require_known_instance(&state, &id).await?;
 
     let generation = uuid::Uuid::new_v4().to_string();
@@ -135,7 +165,22 @@ pub async fn send(
         seq: user_event.seq,
     };
 
-    tokio::spawn(loop_::run_turn(state.clone(), id, generation, cancel_rx));
+    // The turn is handed WHO ASKED, not merely what they consented to. The
+    // gate is `agentTools ∩ caller-grants ∩ manifest`, and the caller in that
+    // phrase is this authenticated sender — every enrolled device can reach
+    // every instance on this route, so keying the grant lookup off the
+    // instance's CREATOR would let a zero-grant device spend a better-granted
+    // device's authority by sending into its instance. Attribution follows
+    // the same name for the same reason: the record answers "who asked for
+    // THIS turn", not "who opened this window".
+    tokio::spawn(loop_::run_turn(
+        state.clone(),
+        id,
+        generation,
+        cancel_rx,
+        Some(caller.0.name),
+        agent_tools,
+    ));
 
     Ok((StatusCode::CREATED, Json(receipt)))
 }
@@ -209,4 +254,49 @@ pub async fn evict(
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- (a) a known grant word validates, unchanged ---
+
+    #[test]
+    fn a_known_grant_word_validates_to_its_grant() {
+        let raw = Some(vec!["commit".to_string()]);
+        assert_eq!(validate_agent_tools(&raw), Ok(vec![Grant::Commit]));
+    }
+
+    #[test]
+    fn every_known_word_validates_in_order() {
+        let raw = Some(vec!["sync".to_string(), "push".to_string(), "commit".to_string()]);
+        assert_eq!(validate_agent_tools(&raw), Ok(vec![Grant::Sync, Grant::Push, Grant::Commit]));
+    }
+
+    // --- (b) an unknown word is 400, naming it, per the brief's exact format ---
+
+    #[test]
+    fn an_unknown_word_is_400_naming_it() {
+        let raw = Some(vec!["comit".to_string()]);
+        let (status, body) = validate_agent_tools(&raw).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "invalid_agent_tools: unknown grant \"comit\" — expected sync, push or commit");
+    }
+
+    #[test]
+    fn the_first_bad_word_wins_when_several_are_bad() {
+        // A good word before it must not mask the failure; validation is not
+        // "any word failed", it's "first failure, named."
+        let raw = Some(vec!["sync".to_string(), "comit".to_string(), "psh".to_string()]);
+        let (_, body) = validate_agent_tools(&raw).unwrap_err();
+        assert!(body.contains("\"comit\""), "{body}");
+    }
+
+    // --- (c) absent means none, fail-closed, not an error ---
+
+    #[test]
+    fn absent_agent_tools_validates_to_an_empty_list() {
+        assert_eq!(validate_agent_tools(&None), Ok(Vec::new()));
+    }
 }
