@@ -1204,6 +1204,29 @@ async fn a_manifest_that_withholds_commit_withholds_it_from_a_fully_granted_devi
 }
 
 #[tokio::test]
+async fn consenting_to_sync_puts_sync_repo_on_the_turn_and_neither_of_the_others() {
+    // The rows themselves, pinned. Every other test here consents to `commit`
+    // and asks after `commit_repo` — so `sync` and `push` were only ever
+    // observed being WITHHELD, and a table that swapped their two rows
+    // (`sync_repo → Push`, `push_repo → Sync`) passed the lot. A grant that
+    // opens the wrong verb is not a smaller defect than a grant that opens
+    // nothing.
+    //
+    // Sync-only in all three terms, so the two verbs left off are left off by
+    // the grant and by the consent both.
+    let offered = offered_for(
+        registry_granting(vec![Grant::Sync]),
+        ALL_THREE_GRANTED,
+        serde_json::json!(["sync"]),
+    )
+    .await;
+
+    assert!(offered.contains(&"sync_repo".to_string()), "{offered:?}");
+    assert!(!offered.contains(&"push_repo".to_string()), "{offered:?}");
+    assert!(!offered.contains(&"commit_repo".to_string()), "{offered:?}");
+}
+
+#[tokio::test]
 async fn a_send_carrying_no_consent_is_offered_none_of_the_three() {
     // (d) Fail-closed, and the case every OTHER test in this file exercises
     // by accident: absent consent is not "whatever the device could do", it is
