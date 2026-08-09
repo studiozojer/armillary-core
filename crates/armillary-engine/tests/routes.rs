@@ -248,6 +248,35 @@ async fn get_json_auth(router: axum::Router, uri: &str, bearer: &str) -> (Status
     (status, json)
 }
 
+/// Like `post_json`, but reads the body back as raw text rather than parsed
+/// JSON — needed wherever the assertion is about an error body's exact
+/// wording (`post_json` collapses anything that doesn't parse as JSON to
+/// `Null`, which is fine for status-only checks but useless for asserting
+/// the `invalid_agent_tools: …` message itself). Mirrors `get_text` below.
+async fn post_text(
+    router: axum::Router,
+    uri: &str,
+    body: serde_json::Value,
+    bearer: Option<&str>,
+) -> (StatusCode, String) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(token) = bearer {
+        builder = builder.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let response = router
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 8 * ONE_MIB)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
 async fn get_text(router: axum::Router, uri: &str) -> (StatusCode, String) {
     let response = router
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -594,6 +623,25 @@ async fn sending_without_a_credential_is_401_before_the_instance_is_resolved() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// Below: field validation is likewise a "structural check before existence
+// check" — an unknown `agentTools` word 400s even against an instance id
+// that was never created, proving the check runs at the top of the
+// handler, not after `require_known_instance`.
+
+#[tokio::test]
+async fn sending_an_unknown_agent_tools_word_is_400_naming_it_even_for_an_unknown_instance() {
+    let router = app_over(|_| {});
+    let (status, body) = post_text(
+        router,
+        "/instances/no-such-instance/send",
+        serde_json::json!({ "text": "hi", "clientKey": "c1", "agentTools": ["comit"] }),
+        Some(TEST_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, "invalid_agent_tools: unknown grant \"comit\" — expected sync, push or commit");
 }
 
 #[tokio::test]

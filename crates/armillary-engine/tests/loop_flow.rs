@@ -368,6 +368,44 @@ async fn send_returns_the_user_events_id_and_seq() {
     assert_eq!(user_ev.data["clientKey"], "c1");
 }
 
+// --- Task 2: `agentTools` on the wire ---
+
+/// (a) A valid `agentTools` list is accepted and the 200-path is unchanged
+/// otherwise: same 201, same receipt shape, same seq numbering as the plain
+/// send above. And — the point of routing consent through the spawned
+/// turn's own arguments rather than the append — the durable `user_message`
+/// carries `text`/`clientKey` only; consent never reaches the log.
+#[tokio::test]
+async fn send_with_a_valid_agent_tools_list_is_accepted_and_the_200_path_is_unchanged() {
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let provider = Arc::new(ScriptedProvider::new(vec!["hi"]));
+    let (addr, sessions) = spawn(&data_dir, provider).await;
+    let client = authed_client();
+    let id = create_instance(&client, addr).await;
+
+    let response = client
+        .post(format!("http://{addr}/instances/{id}/send"))
+        .json(&serde_json::json!({ "text": "hello", "clientKey": "c1", "agentTools": ["commit"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let receipt: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(receipt["seq"], 3);
+    assert!(receipt["id"].as_str().is_some_and(|s| !s.is_empty()));
+
+    let events = sessions.store().read_from(&id, 0).unwrap();
+    let user_ev = events.iter().find(|e| e.event_type == "user_message").unwrap();
+    assert_eq!(user_ev.data["clientKey"], "c1");
+    // Consent is per-request state, never a durable fact (brief, Task 2):
+    // the append this route owns must not gain a new key just because the
+    // request carried one.
+    let keys = user_ev.data.as_object().unwrap();
+    assert_eq!(keys.len(), 2, "{:?}", user_ev.data);
+    assert!(!keys.contains_key("agentTools"), "{:?}", user_ev.data);
+    assert!(!keys.contains_key("agent_tools"), "{:?}", user_ev.data);
+}
+
 // --- (b) echo -> >=2 transient snapshots -> durable assistant_message ---
 
 #[tokio::test]

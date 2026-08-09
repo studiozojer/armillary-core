@@ -357,7 +357,21 @@ fn declared_boot_paths(events: &[crate::log::envelope::EventEnvelope]) -> Vec<St
 /// `watch` channel that route installed into `Sessions` before spawning
 /// this, so `interrupt` (racing this task from another request) and this
 /// task's own read of `cancel` are the same channel throughout.
-pub async fn run_turn(state: SharedState, stream: String, generation: String, cancel_rx: watch::Receiver<bool>) {
+///
+/// `agent_tools` is the device's consent for this one turn, already
+/// validated (`Grant::parse`) by `send` — carried here on the spawned
+/// turn's own arguments rather than appended to the durable log, because
+/// consent is per-request state, never a durable fact about the instance.
+/// Not read yet: offer assembly and the dispatch re-check are a later
+/// task's job, so this travels unconsumed for now, the same way a value
+/// can sit in an event untouched until something downstream looks at it.
+pub async fn run_turn(
+    state: SharedState,
+    stream: String,
+    generation: String,
+    cancel_rx: watch::Receiver<bool>,
+    #[allow(unused_variables)] agent_tools: Vec<crate::principals::Grant>,
+) {
     let _end_turn_guard = EndTurnGuard {
         sessions: state.sessions.clone(),
         stream: stream.clone(),
@@ -1184,7 +1198,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let changed = events.iter().find(|e| e.event_type == "file_changed").unwrap();
@@ -1221,7 +1235,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let changed = events.iter().find(|e| e.event_type == "file_changed").unwrap();
@@ -1260,7 +1274,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
 
         // The write is real, on the real disk.
         assert_eq!(
@@ -1341,7 +1355,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let with_thinking: Vec<_> = events
@@ -1387,7 +1401,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
 
         assert!(!root.path().join("secrets.json").exists());
 
@@ -1421,7 +1435,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -1501,7 +1515,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let results: Vec<&EventEnvelope> = events
@@ -1551,7 +1565,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let result = events.iter().find(|e| e.event_type == "tool_result").unwrap();
@@ -1583,7 +1597,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let rounds = events.iter().filter(|e| e.event_type == "tool_use").count();
@@ -1626,7 +1640,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let last = events.last().unwrap();
@@ -1690,7 +1704,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let heal = events
@@ -1735,7 +1749,7 @@ mod tests {
 
         let generation = uuid::Uuid::new_v4().to_string();
         let (_cancel_tx, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), generation.clone(), cancel_rx).await;
+        run_turn(state, id.clone(), generation.clone(), cancel_rx, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let last = events.last().unwrap();
@@ -1775,7 +1789,7 @@ mod tests {
 
         let generation = uuid::Uuid::new_v4().to_string();
         let (_cancel_tx, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), generation, cancel_rx).await;
+        run_turn(state, id.clone(), generation, cancel_rx, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let last = events.last().unwrap();
