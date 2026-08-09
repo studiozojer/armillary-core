@@ -372,6 +372,32 @@ fn grant_required(tool: &str) -> Option<crate::principals::Grant> {
     }
 }
 
+/// Whether one tool call is refused before it runs.
+///
+/// `needed` is what `grant_required` prices this call at; `in_repo_tools` is
+/// whether `tools::repo_tools()` carries a body for it. **Two hand-kept lists
+/// in two modules, and this is where they are made to agree.** Today they do —
+/// `every_repo_tool_is_priced_by_the_authority_table` pins it — but a fourth
+/// verb added to `repo_tools()` without a row in the table would be a mutating
+/// verb with no price, and the fail-closed reading of that is refusal. The
+/// offer side already skips an unpriced verb (a `None` price matches no
+/// permitted grant); this is the same answer at the till, where the previous
+/// shape read "unpriced, therefore free."
+///
+/// `permitted` is a thunk rather than a slice because resolving it costs a
+/// registry read and a manifest read on every call (design D2, deliberately
+/// uncached) — and a call that is no git verb at all must pay neither.
+fn call_refused(
+    needed: Option<crate::principals::Grant>,
+    in_repo_tools: bool,
+    permitted: impl FnOnce() -> Vec<crate::principals::Grant>,
+) -> bool {
+    match needed {
+        Some(g) => !permitted().contains(&g),
+        None => in_repo_tools,
+    }
+}
+
 /// **The gate.** `agent_tools ∩ caller-grants ∩ manifest` — the device's
 /// consent for this one turn, that device's own enrolled grants, and the
 /// workspace's `[router]` ceiling, all three of which must name a verb before
@@ -761,14 +787,17 @@ pub async fn run_turn(
             // CALL rather than on the offer, and re-reading the registry and
             // the manifest rather than trusting the answer the offer got:
             // revocation beats the advertisement (design D2).
-            let refused = grant_required(name).is_some_and(|needed| {
-                !permitted_grants(
-                    &state,
-                    &agent_tools,
-                    principal.as_ref().map(|p| p.name.as_str()),
-                )
-                .contains(&needed)
-            });
+            let refused = call_refused(
+                grant_required(name),
+                crate::tools::repo_tools().iter().any(|t| t.def.name == name),
+                || {
+                    permitted_grants(
+                        &state,
+                        &agent_tools,
+                        principal.as_ref().map(|p| p.name.as_str()),
+                    )
+                },
+            );
             let executed = if refused {
                 // A typed refusal the model reads as a tool result and the turn
                 // survives — the write-refusal precedent, not an aborted turn.
@@ -1255,6 +1284,61 @@ mod tests {
             serde_json::json!({ "operator": "tycho" }),
         )];
         assert_eq!(principal_for(&without), None);
+    }
+
+    // --- the two hand-kept lists, and what happens where they disagree ---
+
+    #[test]
+    fn every_repo_tool_is_priced_by_the_authority_table() {
+        // `tools::repo_tools()` and `grant_required`'s table are maintained by
+        // hand in two modules, and a verb in the first with no row in the
+        // second is a mutating verb with no price. This is the guard that a
+        // fourth verb cannot be added on one side alone.
+        for t in crate::tools::repo_tools() {
+            assert!(
+                grant_required(t.def.name).is_some(),
+                "`{}` is offered as a git verb and the authority table does not \
+                 say what it costs",
+                t.def.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_repo_tool_the_table_never_priced_is_refused_rather_than_waved_through() {
+        // The disagreement the guard above forbids, asked of the till directly
+        // — because the guard can only fail AFTER someone has already written
+        // the fourth verb, and this decides what the engine does in the
+        // meantime. Every grant in the workspace is permitted here: the
+        // refusal is not "you lack the grant", it is "nobody said what this
+        // costs", and the fail-closed reading of that is no.
+        use crate::principals::Grant;
+        assert!(call_refused(None, true, || vec![
+            Grant::Sync,
+            Grant::Push,
+            Grant::Commit
+        ]));
+    }
+
+    #[test]
+    fn an_ordinary_tool_is_neither_priced_nor_refused_and_costs_no_resolution() {
+        // `read_file` and its seven siblings are in neither list. The panicking
+        // thunk is the assertion: resolving the gate is a registry read and a
+        // manifest read (D2, uncached), and a base tool must pay for neither.
+        assert!(!call_refused(None, false, || panic!(
+            "the gate must not be resolved for a tool that is not a git verb"
+        )));
+    }
+
+    #[test]
+    fn a_priced_verb_is_refused_exactly_when_the_gate_withholds_its_grant() {
+        use crate::principals::Grant;
+        assert!(!call_refused(Some(Grant::Commit), true, || vec![Grant::Commit]));
+        assert!(call_refused(Some(Grant::Commit), true, || vec![
+            Grant::Sync,
+            Grant::Push
+        ]));
+        assert!(call_refused(Some(Grant::Commit), true, Vec::new));
     }
 
     fn model_config() -> ModelConfig {
