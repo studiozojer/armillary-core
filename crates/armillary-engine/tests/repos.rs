@@ -337,11 +337,22 @@ fn git_status_porcelain(repo: &Path) -> String {
 }
 
 #[tokio::test]
-async fn get_repos_reports_both_gates_and_omits_newest_commit() {
+async fn get_repos_reports_all_three_gates_and_omits_newest_commit() {
     let (root, _remote) = live_workspace_with_sync();
+    // Push stays undeclared (false, `live_workspace_with_sync`'s own
+    // posture); commit is declared true on top of it. The two must read
+    // DIFFERENT values here — a bug that filled `commit_enabled` from
+    // `push_enabled` would still pass this test if both fixture gates agreed.
+    std::fs::write(
+        root.join("modules.local.toml"),
+        "[router]\nsync = true\ncommit = true\n\n\
+         [[repos]]\nname = \"jianyi\"\npath = \"repos/jianyi\"\n",
+    )
+    .unwrap();
     let body = get_json(&root, "/repos").await;
     assert_eq!(body["enabled"], true);
     assert_eq!(body["push_enabled"], false);
+    assert_eq!(body["commit_enabled"], true);
     // The router root itself has no commits in this fixture, so its own
     // `newest_commit` would read `None` either way — checking `jianyi`
     // specifically is what actually discriminates `with_commit: false` from
@@ -969,6 +980,51 @@ async fn commit_emits_repo_committed_with_principal_shas_subject_and_files() {
     assert_eq!(ev["data"]["subject"], "test: subject line");
     assert_eq!(ev["data"]["files"], 2, "one modified, one untracked");
     assert_eq!(ev["data"]["result"], "ok");
+}
+
+#[tokio::test]
+async fn commit_on_an_unborn_branch_is_the_first_commit() {
+    // A fresh `git init` with no commits yet and one untracked file — the
+    // probe the final review ran directly against this fixture shape.
+    // Pinning known-good behavior: 200, action_error null, the trailer
+    // lands, and the repo_committed event has NO `before` key (never
+    // born — absent, not null) but a real sha `after`.
+    let root = tempfile::tempdir().unwrap().keep();
+    let repo = root.join("repos").join("newborn");
+    std::fs::create_dir_all(&repo).unwrap();
+    git_sync(&repo, &["init", "--initial-branch=main", "."]);
+    std::fs::write(repo.join("new.md"), "the first file this repo will ever see").unwrap();
+
+    std::fs::write(
+        root.join("modules.local.toml"),
+        "[router]\ncommit = true\n\n\
+         [[repos]]\nname = \"newborn\"\npath = \"repos/newborn\"\n",
+    )
+    .unwrap();
+
+    let (router, data_dir) = app_with_durable_store(&root);
+    let (status, text) = post_commit_on(&router, "newborn", "test: the first commit").await;
+    assert_eq!(status, 200, "{text}");
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(body["action_error"].is_null(), "{body}");
+
+    let message = git_log_message(&repo);
+    assert!(message.contains("test: the first commit"), "{message}");
+    assert!(
+        message.lines().any(|l| l == "Committed-from: test-client"),
+        "expected a Committed-from trailer naming the principal: {message}"
+    );
+
+    let evs = workspace_events(&data_dir);
+    assert_eq!(evs.len(), 1);
+    let ev = &evs[0];
+    assert_eq!(ev["type"], "repo_committed");
+    assert!(
+        ev["data"].get("before").is_none(),
+        "unborn: absent, never a null or a zeroed sha: {ev}"
+    );
+    let after = ev["data"]["after"].as_str().expect("after must be a sha on the wire");
+    assert_eq!(after.len(), 40, "a real sha: {after}");
 }
 
 #[tokio::test]

@@ -227,6 +227,10 @@ pub struct ReposResponse {
     /// single-repo read, so the client can hide the Push action on its own
     /// without a round trip per repo.
     push_enabled: bool,
+    /// Whether this workspace has additionally granted COMMIT authority
+    /// (`commit_enabled`) — reported alongside the others so the client can
+    /// gate the commit affordance without a per-repo round trip.
+    commit_enabled: bool,
     repos: Vec<repos::RepoState>,
     /// Git checkouts on disk that no manifest declares (see
     /// `repos::undeclared_checkouts`) — surfaced, never swept.
@@ -253,6 +257,7 @@ pub async fn list(State(state): State<SharedState>) -> Json<ReposResponse> {
     Json(ReposResponse {
         enabled: repos::gate_enabled(&snap.composition),
         push_enabled: repos::push_enabled(&snap.composition),
+        commit_enabled: repos::commit_enabled(&snap.composition),
         repos: repos::list(&root, &snap.composition).await,
         not_composed,
     })
@@ -862,6 +867,38 @@ mod tests {
         // And an up-to-date pull moved nothing, which the shas must say rather
         // than the event's absence saying it for them.
         assert_eq!(outcome.before, outcome.after, "nothing to fast-forward");
+        assert!(outcome.before.is_some(), "a cloned repo has a HEAD");
+    }
+
+    #[tokio::test]
+    async fn the_commit_path_waits_on_a_held_write_lock() {
+        // Same discriminator as the pull path's own test above, one verb
+        // over: with the guard removed from `locked_status_then_commit`, the
+        // timeout branch completes and this fails. 100ms is the safe
+        // direction — a false PASS would need status+add+commit to outrun
+        // the timeout while unblocked, against a local tempdir clone.
+        let (_remote, clone) = crate::testgit::remote_and_clone();
+        std::fs::write(clone.join("dirty.md"), "uncommitted").unwrap();
+        let message = "test: from the wait\n\nCommitted-from: test\n";
+
+        let guard = crate::write::write_lock_async().await;
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            locked_status_then_commit(&clone, message),
+        )
+        .await;
+        assert!(blocked.is_err(), "commit must wait while the write lock is held");
+
+        drop(guard);
+        let outcome = locked_status_then_commit(&clone, message).await;
+        assert!(
+            outcome.error.is_none(),
+            "a dirty clone with an untracked file commits clean: {:?}",
+            outcome.error
+        );
+        // And a landed commit moved HEAD, which the shas must say rather
+        // than the event's absence saying it for them.
+        assert_ne!(outcome.before, outcome.after, "a landed commit must move HEAD");
         assert!(outcome.before.is_some(), "a cloned repo has a HEAD");
     }
 

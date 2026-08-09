@@ -142,6 +142,9 @@ pub fn record_commit(
     before: Option<&str>,
     after: Option<&str>,
     subject: Option<&str>,
+    // Dirty ENTRIES at status time, not files committed — a new directory
+    // staged whole by `git add --all` is one entry here, however many files
+    // it holds.
     files: Option<u32>,
     err: Option<&repos::ActionError>,
 ) {
