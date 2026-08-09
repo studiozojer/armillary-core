@@ -351,6 +351,84 @@ fn declared_boot_paths(events: &[crate::log::envelope::EventEnvelope]) -> Vec<St
         .unwrap_or_default()
 }
 
+/// Which grant a git verb costs — `None` for every tool that is not one of the
+/// three, which is every tool in `tools::registry()`.
+///
+/// One table, two readers: the offer and the dispatch re-check both key off it,
+/// so the door and the till cannot disagree about what a verb costs. A `match`
+/// on the name rather than a field on `Tool`, because the mapping is
+/// authority's, not the registry's: `tools.rs` knows how to run a verb and
+/// deliberately knows nothing about who may.
+fn grant_required(tool: &str) -> Option<crate::principals::Grant> {
+    use crate::principals::Grant;
+    match tool {
+        "sync_repo" => Some(Grant::Sync),
+        "push_repo" => Some(Grant::Push),
+        "commit_repo" => Some(Grant::Commit),
+        _ => None,
+    }
+}
+
+/// **The gate.** `agent_tools ∩ caller-grants ∩ manifest` — the device's
+/// consent for this one turn, that device's own enrolled grants, and the
+/// workspace's `[router]` ceiling, all three of which must name a verb before
+/// this turn may hold it.
+///
+/// **Resolved fresh at every call, never cached, and called at BOTH doorways**
+/// (design D2). `Registry::load` and `WorkspaceSnapshot::load` are per-request
+/// reads everywhere else in this engine for one reason each module states in
+/// its own words: a cache would make `revoke` mean "revoked after a restart"
+/// and a manifest edit mean "in effect next boot". Between the offer and the
+/// model's call there is a real window — a toggle flipped on the phone, a
+/// `revoke` run on the host — and re-reading is the only thing that closes it.
+/// Two small TOML parses and a `read_dir`, on the same async path
+/// `routes::repos` already pays them on, once per request.
+///
+/// **Fail-closed at every step**, each of which is a real state: no consent
+/// (the overwhelmingly common case, and the one that costs no read at all), no
+/// principal on the turn (an instance created on the host path, with no device
+/// to name), a principal the registry no longer holds, a grant it never held,
+/// a manifest key the workspace never declared.
+fn permitted_grants(
+    state: &SharedState,
+    agent_tools: &[crate::principals::Grant],
+    principal: Option<&str>,
+) -> Vec<crate::principals::Grant> {
+    use crate::principals::Grant;
+
+    // Nothing consented to, nothing to intersect — and no reason to read a
+    // registry or a manifest to learn that the empty set is empty.
+    if agent_tools.is_empty() {
+        return Vec::new();
+    }
+    // An instance created by the host CLI names no device. Absent is not
+    // "trusted": a turn nobody asked for holds no device's authority.
+    let Some(name) = principal else {
+        return Vec::new();
+    };
+    let registry = crate::principals::Registry::load(&state.registry_dir);
+    let Some(held) = registry
+        .names()
+        .into_iter()
+        .find(|p| p.name == name)
+        .map(|p| p.grants.clone())
+    else {
+        return Vec::new();
+    };
+    let ceiling = crate::snapshot::WorkspaceSnapshot::load(&state.root).unwrap_or_default();
+
+    agent_tools
+        .iter()
+        .copied()
+        .filter(|g| held.contains(g))
+        .filter(|g| match g {
+            Grant::Sync => crate::repos::gate_enabled(&ceiling.composition),
+            Grant::Push => crate::repos::push_enabled(&ceiling.composition),
+            Grant::Commit => crate::repos::commit_enabled(&ceiling.composition),
+        })
+        .collect()
+}
+
 /// Runs one turn to completion (or interruption, or failure), then clears
 /// the `TurnHandle` — always, via `EndTurnGuard`. Spawned by
 /// `routes::session_ops::send`; `cancel_rx` is the receiver half of the
@@ -362,15 +440,15 @@ fn declared_boot_paths(events: &[crate::log::envelope::EventEnvelope]) -> Vec<St
 /// validated (`Grant::parse`) by `send` — carried here on the spawned
 /// turn's own arguments rather than appended to the durable log, because
 /// consent is per-request state, never a durable fact about the instance.
-/// Not read yet: offer assembly and the dispatch re-check are a later
-/// task's job, so this travels unconsumed for now, the same way a value
-/// can sit in an event untouched until something downstream looks at it.
+/// It is the first term of `permitted_grants`, which this turn resolves
+/// afresh at each of the two doorways: assembling the offer, and re-checking
+/// the call that comes back.
 pub async fn run_turn(
     state: SharedState,
     stream: String,
     generation: String,
     cancel_rx: watch::Receiver<bool>,
-    #[allow(unused_variables)] agent_tools: Vec<crate::principals::Grant>,
+    agent_tools: Vec<crate::principals::Grant>,
 ) {
     let _end_turn_guard = EndTurnGuard {
         sessions: state.sessions.clone(),
@@ -438,8 +516,24 @@ pub async fn run_turn(
         let offered: Vec<crate::tools::ToolDef> = if at_bound {
             Vec::new()
         } else {
+            // The first doorway. The base set is unconditional; each git verb
+            // is on this turn only while consent, grant and manifest all name
+            // it — resolved again for THIS round, so a revocation between
+            // rounds takes the verb off the next one.
+            //
+            // Appended after `registry()`, never interleaved (E-4, and
+            // `repo_tools`'s own argument for being a second slice): the cached
+            // prompt prefix is the same bytes whether or not a turn is granted.
+            let permitted = permitted_grants(
+                &state,
+                &agent_tools,
+                principal.as_ref().map(|p| p.name.as_str()),
+            );
             crate::tools::registry()
                 .iter()
+                .chain(crate::tools::repo_tools().iter().filter(|t| {
+                    grant_required(t.def.name).is_some_and(|g| permitted.contains(&g))
+                }))
                 .filter(|t| !failed_tools.contains(t.def.name))
                 .map(|t| t.def.clone())
                 .collect()
@@ -643,10 +737,42 @@ pub async fn run_turn(
                     model: model.clone(),
                 },
             };
-            let (n, i) = (name.clone(), input.clone());
-            let executed = tokio::task::spawn_blocking(move || crate::tools::dispatch(&n, &i, &ctx))
-                .await
-                .unwrap_or_else(|_| Err(crate::tools::ToolError { status: "tool_panicked", detail: String::new() }));
+            // The second doorway, and the one that has to hold on its own.
+            // `dispatch` searches `repo_tools()` too, so a git verb resolves
+            // whether or not this turn offered it — a revocation that landed
+            // mid-turn, or a call the model simply invented, would otherwise
+            // run under the host identity with nothing consulted. Keyed on the
+            // CALL rather than on the offer, and re-reading the registry and
+            // the manifest rather than trusting the answer the offer got:
+            // revocation beats the advertisement (design D2).
+            let refused = grant_required(name).is_some_and(|needed| {
+                !permitted_grants(
+                    &state,
+                    &agent_tools,
+                    principal.as_ref().map(|p| p.name.as_str()),
+                )
+                .contains(&needed)
+            });
+            let executed = if refused {
+                // A typed refusal the model reads as a tool result and the turn
+                // survives — the write-refusal precedent, not an aborted turn.
+                // Which of the three fences closed is deliberately not named:
+                // the answer is "not right now", and a per-fence message would
+                // turn this into an oracle for what the workspace grants.
+                Err(crate::tools::ToolError::new(
+                    "tool_not_permitted",
+                    format!(
+                        "{name} is not permitted on this turn. A git verb is held only while the \
+                         device's consent, that device's own grant, and this workspace's manifest \
+                         all allow it — one of them does not. Say so plainly rather than retrying."
+                    ),
+                ))
+            } else {
+                let (n, i) = (name.clone(), input.clone());
+                tokio::task::spawn_blocking(move || crate::tools::dispatch(&n, &i, &ctx))
+                    .await
+                    .unwrap_or_else(|_| Err(crate::tools::ToolError { status: "tool_panicked", detail: String::new() }))
+            };
 
             let (status, content, is_error) = match executed {
                 Ok(out) => {
@@ -1251,18 +1377,55 @@ mod tests {
         sessions: Arc<Sessions>,
         root: &std::path::Path,
     ) -> SharedState {
+        // No registry directory at all — every principal is unknown, so the
+        // gate offers and permits none of the three verbs. That is the right
+        // default for the tests that never touch them.
+        state_with_registry(
+            provider,
+            sessions,
+            root,
+            std::path::PathBuf::from("/nonexistent/registry"),
+        )
+        .await
+    }
+
+    /// `state_with`, plus the registry directory the gate reads the caller's
+    /// grants from — a knob for the tests that are ABOUT the grants.
+    async fn state_with_registry(
+        provider: std::sync::Arc<dyn crate::provider::ModelProvider>,
+        sessions: Arc<Sessions>,
+        root: &std::path::Path,
+        registry_dir: std::path::PathBuf,
+    ) -> SharedState {
         Arc::new(AppState {
             root: root.canonicalize().unwrap(),
             sessions,
             model: model_config(),
             providers: provider::fixed(provider),
             models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
-        hostname: "test-host".to_string(),
-            registry_dir: std::path::PathBuf::from("/nonexistent/registry"),
+            hostname: "test-host".to_string(),
+            registry_dir,
             anthropic_key_present: false,
             zen_key_present: false,
             boot: None,
         })
+    }
+
+    /// A registry directory in which `name` holds exactly `grants`. Called
+    /// again with the same directory, it REPLACES that principal's file —
+    /// which is how a test revokes a grant mid-turn, and how a device is
+    /// re-enrolled for real (`enroll` overwrites by name).
+    fn grant_to(dir: &std::path::Path, name: &str, grants: Vec<crate::principals::Grant>) {
+        crate::principals::write_principal(
+            dir,
+            &crate::principals::Principal {
+                name: name.to_string(),
+                token_hash: crate::principals::hash_token("unused-by-the-gate"),
+                grants,
+                minted: "2026-08-09T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1358,6 +1521,13 @@ mod tests {
         let sessions = Arc::new(Sessions::new(store));
         let id = create_instance_as(&sessions, Some("tycho"), Some("iphone")).await;
 
+        // The three fences, all open: the device consented to `commit` on this
+        // send, its principal holds the grant, and `workspace_with_repo`'s
+        // manifest declares all three `[router]` keys. Anything less and the
+        // gate refuses — which is what the two tests below are about.
+        let registry = tempfile::tempdir().unwrap();
+        grant_to(registry.path(), "iphone", vec![crate::principals::Grant::Commit]);
+
         let provider = std::sync::Arc::new(RoundScript::new(vec![
             calls_with(
                 "toolu_c1",
@@ -1366,10 +1536,19 @@ mod tests {
             ),
             says("done"),
         ]));
-        let state = state_with(provider, sessions.clone(), &root).await;
+        let state =
+            state_with_registry(provider, sessions.clone(), &root, registry.path().to_path_buf())
+                .await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
+        run_turn(
+            state,
+            id.clone(),
+            "gen-1".to_string(),
+            cancel_rx,
+            vec![crate::principals::Grant::Commit],
+        )
+        .await;
 
         let host_events = sessions
             .store()
@@ -1389,6 +1568,217 @@ mod tests {
             ev.actor.principal.as_ref().map(|p| p.name.as_str()),
             Some("iphone"),
             "at the device's request"
+        );
+    }
+
+    /// `RoundScript`, wrapped so a test can act in the window between the
+    /// offer being assembled and the model's call coming back — which is
+    /// exactly where a phone's toggle flip or a `revoke` on the host lands,
+    /// and the only place a test can open that window from.
+    ///
+    /// It also records the tool names each round was offered, so a test can
+    /// prove the verb WAS on the turn before it was refused — without that,
+    /// "refused at dispatch" is indistinguishable from "never offered".
+    struct BetweenOfferAndCall {
+        inner: RoundScript,
+        offered: std::sync::Mutex<Vec<Vec<String>>>,
+        between: Box<dyn Fn() + Send + Sync>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::ModelProvider for BetweenOfferAndCall {
+        async fn run_turn(
+            &self,
+            req: crate::provider::TurnRequest,
+            sink: mpsc::Sender<String>,
+            cancel: watch::Receiver<bool>,
+        ) -> Result<TurnOutcome, crate::provider::ProviderError> {
+            self.offered
+                .lock()
+                .unwrap()
+                .push(req.tools.iter().map(|t| t.name.to_string()).collect());
+            (self.between)();
+            self.inner.run_turn(req, sink, cancel).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_grant_revoked_mid_turn_is_refused_at_dispatch_and_the_turn_continues() {
+        // The load-bearing one (design D2): the toolset resolves per turn, and
+        // a flip that lands mid-turn is caught at the till, not trusted from
+        // the door. The offer here is genuine — the assertion below proves
+        // `commit_repo` really was on the turn — and the grant is withdrawn in
+        // the one window that exists between the offer and the call coming
+        // back. Fail-closed: revocation beats the advertisement.
+        //
+        // The re-check must read the registry AFRESH for this to fire. A gate
+        // that resolved once per turn and cached would offer and permit the
+        // same stale answer, and this test is what catches that.
+        let data_dir = tempfile::tempdir().unwrap();
+        let (root, _remote, repo) = crate::testgit::workspace_with_repo("jianyi");
+        std::fs::write(repo.join("note.md"), "still uncommitted\n").unwrap();
+        let head_before = crate::git::head_sha(&repo, crate::git::DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance_as(&sessions, Some("tycho"), Some("iphone")).await;
+
+        let registry = tempfile::tempdir().unwrap();
+        grant_to(registry.path(), "iphone", vec![crate::principals::Grant::Commit]);
+
+        let revoked = registry.path().to_path_buf();
+        let provider = std::sync::Arc::new(BetweenOfferAndCall {
+            inner: RoundScript::new(vec![
+                calls_with(
+                    "toolu_c1",
+                    "commit_repo",
+                    serde_json::json!({ "name": "jianyi", "message": "notes: from a turn" }),
+                ),
+                says("I could not commit — that permission was withdrawn"),
+            ]),
+            offered: std::sync::Mutex::new(Vec::new()),
+            // Re-enrolling the same name replaces its entry, which is what
+            // `revoke` and a re-enroll both do on the host.
+            between: Box::new(move || grant_to(&revoked, "iphone", Vec::new())),
+        });
+        let state = state_with_registry(
+            provider.clone(),
+            sessions.clone(),
+            &root,
+            registry.path().to_path_buf(),
+        )
+        .await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(
+            state,
+            id.clone(),
+            "gen-1".to_string(),
+            cancel_rx,
+            vec![crate::principals::Grant::Commit],
+        )
+        .await;
+
+        assert!(
+            provider.offered.lock().unwrap()[0].contains(&"commit_repo".to_string()),
+            "the verb must have been genuinely OFFERED, or this proves nothing: {:?}",
+            provider.offered.lock().unwrap()[0]
+        );
+
+        let events = sessions.store().read_from(&id, 0).unwrap();
+        let result = events
+            .iter()
+            .find(|e| e.event_type == "tool_result")
+            .expect("the call must be answered — an unanswered tool_use is a 400 on every later turn");
+        assert_eq!(result.data["status"], "tool_not_permitted");
+        assert_eq!(result.data["isError"], true);
+
+        // The turn CONTINUED (write-refusal precedent): the model got the
+        // refusal as a tool result and spoke after it, rather than the turn
+        // being aborted out from under the person.
+        let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "instance_created",
+                "user_message",
+                "assistant_message",
+                "tool_use",
+                "tool_result",
+                "assistant_message"
+            ],
+            "{types:?}"
+        );
+        assert_eq!(
+            events.last().unwrap().data["text"],
+            "I could not commit — that permission was withdrawn"
+        );
+
+        // And nothing was committed: no record on the host stream, and the
+        // repo's HEAD is where it was. A refusal that still ran the verb would
+        // be the whole defect.
+        let host_events = sessions
+            .store()
+            .read_from(crate::repo_events::WORKSPACE_STREAM, 0)
+            .unwrap_or_default();
+        assert!(
+            !host_events.iter().any(|e| e.event_type == "repo_committed"),
+            "a refused verb must not have run: {host_events:?}"
+        );
+        assert_eq!(
+            crate::git::head_sha(&repo, crate::git::DEFAULT_TIMEOUT).await.unwrap(),
+            head_before
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verb_that_was_never_offered_is_refused_at_dispatch_all_the_same() {
+        // `dispatch` searches `repo_tools()` as well as `registry()`, so a
+        // hallucinated `commit_repo` RESOLVES whether or not the turn offered
+        // it. Without the re-check standing in front of the git arms
+        // unconditionally, a model that simply invented the call would commit
+        // under the host identity with no consent, no grant and no ceiling ever
+        // consulted. The gate is keyed on the CALL, not on what was offered.
+        let data_dir = tempfile::tempdir().unwrap();
+        let (root, _remote, repo) = crate::testgit::workspace_with_repo("jianyi");
+        std::fs::write(repo.join("note.md"), "still uncommitted\n").unwrap();
+        let head_before = crate::git::head_sha(&repo, crate::git::DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance_as(&sessions, Some("tycho"), Some("iphone")).await;
+
+        // Everything the fences could want EXCEPT consent: the principal holds
+        // all three grants and the manifest declares all three keys. The send
+        // named none, so nothing was offered — and nothing may run.
+        let registry = tempfile::tempdir().unwrap();
+        grant_to(
+            registry.path(),
+            "iphone",
+            vec![
+                crate::principals::Grant::Sync,
+                crate::principals::Grant::Push,
+                crate::principals::Grant::Commit,
+            ],
+        );
+
+        let provider = std::sync::Arc::new(RoundScript::new(vec![
+            calls_with(
+                "toolu_c1",
+                "commit_repo",
+                serde_json::json!({ "name": "jianyi", "message": "notes: unasked for" }),
+            ),
+            says("I cannot do that here"),
+        ]));
+        let state =
+            state_with_registry(provider, sessions.clone(), &root, registry.path().to_path_buf())
+                .await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
+
+        let events = sessions.store().read_from(&id, 0).unwrap();
+        let result = events
+            .iter()
+            .find(|e| e.event_type == "tool_result")
+            .expect("even an unoffered call must be answered");
+        assert_eq!(result.data["status"], "tool_not_permitted");
+        assert_eq!(result.data["isError"], true);
+        assert_eq!(events.last().unwrap().event_type, "assistant_message");
+
+        let host_events = sessions
+            .store()
+            .read_from(crate::repo_events::WORKSPACE_STREAM, 0)
+            .unwrap_or_default();
+        assert!(
+            !host_events.iter().any(|e| e.event_type == "repo_committed"),
+            "a verb nobody offered must not have run: {host_events:?}"
+        );
+        assert_eq!(
+            crate::git::head_sha(&repo, crate::git::DEFAULT_TIMEOUT).await.unwrap(),
+            head_before
         );
     }
 

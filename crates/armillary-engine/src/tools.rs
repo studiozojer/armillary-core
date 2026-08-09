@@ -426,11 +426,11 @@ pub fn registry() -> &'static [Tool] {
 /// in. And `registry()`'s order is the cached prompt prefix (E-4) — leaving it
 /// untouched is free.
 ///
-/// **Unoffered is not unreachable, yet.** `dispatch` searches both slices, so
-/// a call the loop offered still resolves — and until the gate lands, so would
-/// one it did not. That is the interim state this task ships on purpose: the
-/// verbs exist and are exercised, the conjunction that decides who may hold
-/// them is the next task's, and until then nothing offers them at all.
+/// **Unoffered is not unreachable, so the gate is not the offer.** `dispatch`
+/// searches both slices, so a call the loop never offered still RESOLVES here.
+/// What stops it is `loop_::permitted_grants`, re-run in front of the git arms
+/// on every call — keyed on the call, not on the offer, precisely because this
+/// slice cannot tell the two apart.
 pub fn repo_tools() -> &'static [Tool] {
     static REPO_TOOLS: std::sync::OnceLock<Vec<Tool>> = std::sync::OnceLock::new();
     REPO_TOOLS.get_or_init(|| {
@@ -682,6 +682,11 @@ pub enum Effect {
 /// Searches `repo_tools()` as well as `registry()`: a verb that WAS offered
 /// this turn has to resolve, and which of the two slices a name came from is
 /// the offer's question, not this switch's.
+///
+/// **This is not the authority boundary.** It runs every name it recognizes,
+/// including the three git verbs. `loop_::permitted_grants` is what decides
+/// whether a call reaches this function at all, and it is re-run per call —
+/// see `repo_tools`.
 pub fn dispatch(
     name: &str,
     input: &serde_json::Value,
