@@ -132,6 +132,29 @@ pub fn record_push(
     emit(sessions, "repo_pushed", actor(caller), data);
 }
 
+/// A commit's record. No `executed_as`: nothing leaves the machine
+/// (`repo_pulled`'s proportionality, not `repo_pushed`'s). `subject` is the
+/// message's first line — the full message lives in git; the event indexes it.
+pub fn record_commit(
+    sessions: &Sessions,
+    caller: &Caller,
+    repo: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+    subject: Option<&str>,
+    files: Option<u32>,
+    err: Option<&repos::ActionError>,
+) {
+    let mut data = json!({ "repo": repo, "result": result(err) });
+    insert_if_known(&mut data, "before", before);
+    insert_if_known(&mut data, "after", after);
+    insert_if_known(&mut data, "subject", subject);
+    if let Some(n) = files {
+        data["files"] = json!(n);
+    }
+    emit(sessions, "repo_committed", actor(caller), data);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +310,45 @@ mod tests {
         assert!(
             evs.iter().all(|e| e.actor.principal.as_ref().unwrap().name == "iphone"),
             "every verb names its requester"
+        );
+    }
+
+    #[test]
+    fn record_commit_carries_principal_shas_subject_and_count() {
+        let (s, _d) = sessions();
+        record_commit(
+            &s,
+            &caller(),
+            "zojercommons",
+            Some("aaa"),
+            Some("bbb"),
+            Some("subject"),
+            Some(3),
+            None,
+        );
+
+        let evs = s.store().read_from(WORKSPACE_STREAM, 0).unwrap();
+        let ev = &evs[0];
+        assert_eq!(ev.event_type, "repo_committed");
+        assert_eq!(ev.actor.principal.as_ref().unwrap().name, "iphone");
+        assert_eq!(ev.data["before"], "aaa");
+        assert_eq!(ev.data["after"], "bbb");
+        assert_eq!(ev.data["subject"], "subject");
+        assert_eq!(ev.data["files"], 3);
+        assert_eq!(ev.data["result"], "ok");
+    }
+
+    #[test]
+    fn record_commit_failure_emits_too_with_absent_optionals() {
+        let (s, _d) = sessions();
+        let err = repos::ActionError { kind: "nothing-to-commit", message: "clean".into() };
+        record_commit(&s, &caller(), "r", Some("aaa"), Some("aaa"), None, Some(0), Some(&err));
+
+        let ev = &s.store().read_from(WORKSPACE_STREAM, 0).unwrap()[0];
+        assert_eq!(ev.data["result"]["error"]["kind"], "nothing-to-commit");
+        assert!(
+            ev.data.get("subject").is_none(),
+            "an absent field says 'not known', never null"
         );
     }
 }

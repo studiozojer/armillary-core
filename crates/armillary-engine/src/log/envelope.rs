@@ -37,6 +37,7 @@ pub const DURABLE_TYPES: &[&str] = &[
     "repo_fetched",
     "repo_pulled",
     "repo_pushed",
+    "repo_committed",
 ];
 
 /// Who REQUESTED an action, when that differs from what performed it.
