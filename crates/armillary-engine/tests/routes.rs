@@ -226,6 +226,28 @@ fn assert_boot_loaded_nothing(root: &std::path::Path, data_dir: &std::path::Path
 /// `get_json` reads them back as `Null`. Two different refusals can share a
 /// status code (`not_openable` and `not_text` are both 415), so the body is
 /// what actually says which branch fired.
+/// Like `get_json`, but with a bearer credential attached — `/whoami`'s
+/// success path needs one, and `get_json` deliberately never carries one
+/// (every other GET in this file stays on R1's open-read path).
+async fn get_json_auth(router: axum::Router, uri: &str, bearer: &str) -> (StatusCode, serde_json::Value) {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 8 * ONE_MIB)
+        .await
+        .unwrap();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
 async fn get_text(router: axum::Router, uri: &str) -> (StatusCode, String) {
     let response = router
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -1279,4 +1301,85 @@ async fn an_instance_records_the_principal_that_asked_for_it() {
     );
     // And it is on the durable event itself, under the key the reader uses.
     assert_eq!(events[0].data["principal"], "test-client");
+}
+
+// `GET /whoami` — Task 1. The first authenticated read: no grant check, but
+// it cannot answer without a credential, since the answer IS the credential's
+// own facts.
+
+#[tokio::test]
+async fn whoami_without_a_credential_is_401_no_principal() {
+    let (status, body) = get_text(app_over(|_| {}), "/whoami").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body.starts_with("no_principal"), "{body}");
+}
+
+#[tokio::test]
+async fn whoami_reports_the_presented_principals_own_facts() {
+    // `full_grant_registry` enrolls exactly one principal, `test-client`,
+    // holding sync+push and minted at a fixed timestamp — asserted here
+    // verbatim against `/whoami`'s response.
+    let (status, json) = get_json_auth(app_over(|_| {}), "/whoami", TEST_TOKEN).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["name"], "test-client");
+    assert_eq!(json["grants"], serde_json::json!(["sync", "push"]));
+    assert_eq!(json["minted"], "2026-08-07T00:00:00Z");
+}
+
+#[tokio::test]
+async fn whoami_never_names_a_principal_other_than_the_one_presented() {
+    // Two principals, not one. With `full_grant_registry`'s single-principal
+    // fixture, "the response names a principal" and "the response names
+    // THIS caller, and no other" are the same observation — a handler that
+    // (say) returned the registry's first entry regardless of who
+    // authenticated would still pass. Two distinct principals, and asserting
+    // the ABSENT one's name never appears, is the only way to see the leak
+    // `whoami`'s own doc comment promises cannot happen ("and nothing
+    // else's").
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.keep().canonicalize().unwrap();
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let store = LogStore::open(&data_dir).unwrap();
+
+    let registry_dir = tempfile::tempdir().unwrap().keep();
+    let token_iphone = "iphone-token-for-whoami-leak-test";
+    let token_ipad = "ipad-token-for-whoami-leak-test";
+    write_principal(
+        &registry_dir,
+        &Principal {
+            name: "iphone".to_string(),
+            token_hash: hash_token(token_iphone),
+            grants: vec![Grant::Sync],
+            minted: "2026-08-07T00:00:00Z".to_string(),
+        },
+    )
+    .unwrap();
+    write_principal(
+        &registry_dir,
+        &Principal {
+            name: "ipad".to_string(),
+            token_hash: hash_token(token_ipad),
+            grants: vec![Grant::Push],
+            minted: "2026-08-08T00:00:00Z".to_string(),
+        },
+    )
+    .unwrap();
+
+    let router = armillary_engine::app(AppState {
+        root,
+        sessions: Arc::new(Sessions::new(store)),
+        model: model_config(),
+        providers: provider::fixed(Arc::new(KeylessProvider)),
+        models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+        hostname: "test-host".to_string(),
+        registry_dir,
+        anthropic_key_present: false,
+        zen_key_present: false,
+        boot: None,
+    });
+
+    let (status, json) = get_json_auth(router, "/whoami", token_iphone).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["name"], "iphone");
+    assert!(!json.to_string().contains("ipad"), "{json}");
 }

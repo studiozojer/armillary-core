@@ -8,3 +8,4 @@ pub mod session_ops;
 pub mod subscribe;
 pub mod tree;
 pub mod voicenotes;
+pub mod whoami;
