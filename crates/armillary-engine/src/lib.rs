@@ -70,6 +70,7 @@ pub fn app(state: AppState) -> Router {
         .route("/repos/{name}/fetch", post(routes::repos::fetch_one))
         .route("/repos/{name}/pull", post(routes::repos::pull))
         .route("/repos/{name}/push", post(routes::repos::push))
+        .route("/repos/{name}/commit", post(routes::repos::commit))
         .route("/repos/{name}/log", get(routes::repos::log))
         .route("/repos/{name}/changes", get(routes::repos::changes))
         .with_state(shared)

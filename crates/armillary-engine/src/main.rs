@@ -105,7 +105,7 @@ enum Command {
 fn resolve_grants(words: &[String]) -> Result<Vec<Grant>, String> {
     words
         .iter()
-        .map(|w| Grant::parse(w).ok_or_else(|| format!("unknown grant {w:?} — expected sync or push")))
+        .map(|w| Grant::parse(w).ok_or_else(|| format!("unknown grant {w:?} — expected sync, push or commit")))
         .collect()
 }
 
@@ -411,15 +411,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Announced for the same reason `boot:` is: each gate lives in
     // `Router.extra`, which C-5 forbids validating, so a misspelled `snyc` or
-    // `psuh` disables the grant with no error anywhere. Both are named, not
-    // just `sync` — `push` is a second, independently misspellable key (D7:
-    // it lets the host publish under its own credential, a strictly bigger
-    // authority than fetch/fast-forward), and a typo there would be exactly
+    // `psuh` disables the grant with no error anywhere. All three are named,
+    // not just `sync` — `push` is a second, independently misspellable key
+    // (D7: it lets the host publish under its own credential, a strictly
+    // bigger authority than fetch/fast-forward), and `commit` is a third
+    // (authorship, not publication) — a typo on any of them would be exactly
     // as silent if it went unannounced.
     let banner_comp =
         armillary_composition::parse_workspace(&root).unwrap_or_default();
     let sync_on = armillary_engine::repos::gate_enabled(&banner_comp);
     let push_on = armillary_engine::repos::push_enabled(&banner_comp);
+    let commit_on = armillary_engine::repos::commit_enabled(&banner_comp);
     if sync_on {
         eprintln!(
             "sync: enabled by [router] sync — /repos/{{name}}/fetch and /repos/{{name}}/pull will act"
@@ -434,6 +436,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         eprintln!(
             "push: not declared — /repos/{{name}}/push will refuse (add `push = true` under [router] in modules.local.toml)"
+        );
+    }
+    if commit_on {
+        eprintln!("commit: enabled by [router] commit — /repos/{{name}}/commit will act");
+    } else {
+        eprintln!(
+            "commit: not declared — /repos/{{name}}/commit will refuse (add `commit = true` under [router] in modules.local.toml)"
         );
     }
 

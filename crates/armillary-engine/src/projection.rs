@@ -221,6 +221,7 @@ const HANDLED_TYPES: &[&str] = &[
     "repo_fetched",
     "repo_pulled",
     "repo_pushed",
+    "repo_committed",
 ];
 
 /// Resolve a boot event's `data.path` under `root`, through the same guard
@@ -875,7 +876,7 @@ pub fn project_context(
             // falling through is indistinguishable from one nobody thought
             // about. This arm is the difference between "decided" and
             // "missed", and it is the only record of which one this was.
-            "repo_fetched" | "repo_pulled" | "repo_pushed" => {}
+            "repo_fetched" | "repo_pulled" | "repo_pushed" | "repo_committed" => {}
 
             // Never silent (P-3): visible in the transcript rather than
             // dropped, so a gap in coverage shows up where a human or the
@@ -1785,6 +1786,7 @@ mod tests {
                     "executed_as": { "host": "test-host", "credential": "host-user-git" },
                     "result": "ok",
                 }),
+                "repo_committed" => json!({ "repo": "r", "result": "ok", "before": "a", "after": "b", "subject": "s", "files": 2 }),
                 other => panic!("test fixture missing a data payload for durable type {other}"),
             };
             events.push(ev(seq, &id, t, data));

@@ -227,6 +227,10 @@ pub struct ReposResponse {
     /// single-repo read, so the client can hide the Push action on its own
     /// without a round trip per repo.
     push_enabled: bool,
+    /// Whether this workspace has additionally granted COMMIT authority
+    /// (`commit_enabled`) — reported alongside the others so the client can
+    /// gate the commit affordance without a per-repo round trip.
+    commit_enabled: bool,
     repos: Vec<repos::RepoState>,
     /// Git checkouts on disk that no manifest declares (see
     /// `repos::undeclared_checkouts`) — surfaced, never swept.
@@ -253,6 +257,7 @@ pub async fn list(State(state): State<SharedState>) -> Json<ReposResponse> {
     Json(ReposResponse {
         enabled: repos::gate_enabled(&snap.composition),
         push_enabled: repos::push_enabled(&snap.composition),
+        commit_enabled: repos::commit_enabled(&snap.composition),
         repos: repos::list(&root, &snap.composition).await,
         not_composed,
     })
@@ -565,6 +570,164 @@ pub async fn push(
     Ok(Json(new_state))
 }
 
+/// Cap chosen in the design (§ 6): far above any honest message, far below
+/// anything that could stress the log or the stdin pipe.
+const MAX_MESSAGE_BYTES: usize = 8 * 1024;
+
+#[derive(serde::Deserialize)]
+pub struct CommitRequest {
+    pub message: String,
+}
+
+/// Reject before anything runs. Control characters other than newline and tab
+/// have no place in a commit message; NUL in particular would truncate what
+/// git records vs what the event records.
+fn validate_message(message: &str) -> Result<(), (StatusCode, String)> {
+    if message.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "invalid_message: empty commit message".to_string()));
+    }
+    if message.len() > MAX_MESSAGE_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("invalid_message: message exceeds {MAX_MESSAGE_BYTES} bytes"),
+        ));
+    }
+    if message.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid_message: control characters are not allowed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The device's name, appended by the engine, LAST — so a client-supplied
+/// `Committed-from:` line is superseded rather than trusted (last trailer
+/// wins under `git interpret-trailers`, and ours is written after anything
+/// the message carried).
+fn with_trailer(message: &str, principal: &str) -> String {
+    format!("{}\n\nCommitted-from: {}\n", message.trim_end(), principal)
+}
+
+/// 403 for a missing `[router] commit = true` grant — same reasoning as its
+/// two siblings: name the table and key, and keep one wording per gate.
+fn commit_gate_denied() -> (StatusCode, String) {
+    (
+        StatusCode::FORBIDDEN,
+        "this workspace has not granted the engine authority to commit. \
+         Declare it by adding `commit = true` under `[router]` in \
+         modules.local.toml (or modules.toml), then retry."
+            .to_string(),
+    )
+}
+
+/// Unlike push, git gives a failed commit no stable locale-pinned marker the
+/// way `[rejected]` marks a push — a pre-commit hook's decline is whatever
+/// the hook printed. So one kind carries the message, and the *typed*
+/// refusals (`detached`, `nothing-to-commit`) are engine-side pre-checks that
+/// never reach git at all.
+fn commit_action_error(e: GitError) -> repos::ActionError {
+    match e {
+        GitError::Timeout => repos::ActionError { kind: "timeout", message: "timed out".to_string() },
+        GitError::Failed(msg) | GitError::InvalidArg(msg) => {
+            repos::ActionError { kind: "commit-failed", message: msg }
+        }
+    }
+}
+
+/// `POST /repos/{name}/commit` — stage everything, commit once, return the
+/// repo's state AFTER the attempt. Gated on `commit` (D2): authorship under
+/// the host identity is a distinct authority from `sync`'s reads and
+/// `push`'s publication.
+pub async fn commit(
+    State(state): State<SharedState>,
+    caller: Caller,
+    Path(name): Path<String>,
+    Json(body): Json<CommitRequest>,
+) -> Result<Json<repos::RepoState>, (StatusCode, String)> {
+    crate::auth::require(&caller, Grant::Commit)?;
+    let root = state.root.clone();
+    let snap = snapshot_or_default(&root);
+    let module = repos::resolve(&root, &snap.composition, &name)
+        .ok_or((StatusCode::NOT_FOUND, "unknown_repo".to_string()))?;
+    if !repos::commit_enabled(&snap.composition) {
+        return Err(commit_gate_denied());
+    }
+    validate_message(&body.message)?;
+
+    let abs = root.join(&module.path);
+    let full_message = with_trailer(&body.message, &caller.0.name);
+    let done = locked_status_then_commit(&abs, &full_message).await;
+    crate::repo_events::record_commit(
+        &state.sessions,
+        &caller,
+        &name,
+        done.before.as_deref(),
+        done.after.as_deref(),
+        body.message.lines().next(),
+        done.files,
+        done.error.as_ref(),
+    );
+
+    let mut new_state = repos::read_one(&root, &module, true).await;
+    new_state.action_error = done.error;
+    Ok(Json(new_state))
+}
+
+/// What one commit attempt did. On a refusal `after == before` — recorded,
+/// moved nothing (Pulled's contract, same reasons).
+struct Committed {
+    error: Option<repos::ActionError>,
+    before: Option<String>,
+    after: Option<String>,
+    files: Option<u32>,
+}
+
+/// Status check, stage, and commit under the process write lock — pull's
+/// argument, one verb over: without the lock a `write_file` landing between
+/// the status read and `git add --all` would be swept into a commit whose
+/// message never described it. One `status_v2` fork answers detached, clean,
+/// the file count, and `before` at once.
+async fn locked_status_then_commit(abs: &std::path::Path, full_message: &str) -> Committed {
+    let _write_guard = crate::write::write_lock_async().await;
+    let status = match git::status_v2(abs, git::DEFAULT_TIMEOUT).await {
+        Ok(s) => s,
+        Err(e) => {
+            return Committed { error: Some(dirty_check_action_error(e)), before: None, after: None, files: None }
+        }
+    };
+    let before = status.head.clone();
+    if status.branch.is_none() {
+        return Committed {
+            error: Some(repos::ActionError {
+                kind: "detached",
+                message: "refusing to commit: HEAD is detached — a commit here would belong to no branch".to_string(),
+            }),
+            before: before.clone(),
+            after: before,
+            files: None,
+        };
+    }
+    if status.dirty_files == 0 {
+        return Committed {
+            error: Some(repos::ActionError {
+                kind: "nothing-to-commit",
+                message: "the working tree is clean".to_string(),
+            }),
+            before: before.clone(),
+            after: before,
+            files: Some(0),
+        };
+    }
+    let files = Some(status.dirty_files);
+    let error = match git::add_all(abs, git::DEFAULT_TIMEOUT).await {
+        Err(e) => Some(commit_action_error(e)),
+        Ok(()) => git::commit(abs, full_message, git::DEFAULT_TIMEOUT).await.err().map(commit_action_error),
+    };
+    let after = git::head_sha(abs, git::DEFAULT_TIMEOUT).await.ok().flatten();
+    Committed { error, before, after, files }
+}
+
 /// `POST /repos/fetch` — fetch EVERY composed repo, bounded concurrency
 /// (`repos::CONCURRENCY`). Gated on `sync`, same as the single-repo fetch —
 /// a group fetch touches no working tree and no branch, so it carries no
@@ -704,6 +867,38 @@ mod tests {
         // And an up-to-date pull moved nothing, which the shas must say rather
         // than the event's absence saying it for them.
         assert_eq!(outcome.before, outcome.after, "nothing to fast-forward");
+        assert!(outcome.before.is_some(), "a cloned repo has a HEAD");
+    }
+
+    #[tokio::test]
+    async fn the_commit_path_waits_on_a_held_write_lock() {
+        // Same discriminator as the pull path's own test above, one verb
+        // over: with the guard removed from `locked_status_then_commit`, the
+        // timeout branch completes and this fails. 100ms is the safe
+        // direction — a false PASS would need status+add+commit to outrun
+        // the timeout while unblocked, against a local tempdir clone.
+        let (_remote, clone) = crate::testgit::remote_and_clone();
+        std::fs::write(clone.join("dirty.md"), "uncommitted").unwrap();
+        let message = "test: from the wait\n\nCommitted-from: test\n";
+
+        let guard = crate::write::write_lock_async().await;
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            locked_status_then_commit(&clone, message),
+        )
+        .await;
+        assert!(blocked.is_err(), "commit must wait while the write lock is held");
+
+        drop(guard);
+        let outcome = locked_status_then_commit(&clone, message).await;
+        assert!(
+            outcome.error.is_none(),
+            "a dirty clone with an untracked file commits clean: {:?}",
+            outcome.error
+        );
+        // And a landed commit moved HEAD, which the shas must say rather
+        // than the event's absence saying it for them.
+        assert_ne!(outcome.before, outcome.after, "a landed commit must move HEAD");
         assert!(outcome.before.is_some(), "a cloned repo has a HEAD");
     }
 
@@ -878,5 +1073,85 @@ mod tests {
                 "manifest push = {manifest_push}"
             );
         }
+    }
+
+    /// `POST /repos/a/commit` against `ws`, authenticating against
+    /// `registry_dir` with `token` (or unauthenticated when `None`), through
+    /// the real axum router — same reasoning as `call_push`, plus a JSON
+    /// body every commit request must carry.
+    async fn call_commit(
+        ws: &tempfile::TempDir,
+        registry_dir: &std::path::Path,
+        token: Option<&str>,
+    ) -> (StatusCode, String) {
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = crate::log::store::LogStore::open(data_dir.path()).unwrap();
+        let state = crate::state::AppState {
+            root: ws.path().to_path_buf(),
+            sessions: std::sync::Arc::new(crate::sessions::Sessions::new(store)),
+            model: crate::state::ModelConfig { model: "claude-sonnet-5".to_string() },
+            providers: crate::provider::fixed(std::sync::Arc::new(crate::provider::KeylessProvider)),
+            models_path: std::path::PathBuf::from("/nonexistent/models.toml"),
+            hostname: "test-host".to_string(),
+            registry_dir: registry_dir.to_path_buf(),
+            anthropic_key_present: false,
+            zen_key_present: false,
+            boot: None,
+        };
+
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/repos/a/commit")
+            .header(axum::http::header::CONTENT_TYPE, "application/json");
+        if let Some(t) = token {
+            req = req.header(axum::http::header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let response = crate::app(state)
+            .oneshot(req.body(axum::body::Body::from(r#"{"message":"m"}"#)).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test]
+    async fn commit_refuses_the_ungranted_principal_before_the_ceiling() {
+        // Principal enrolled with sync+push but NOT commit; manifest grants commit.
+        // Expected: 403 whose body starts "principal_not_granted" — the registry
+        // half refuses first and the response never mentions modules.local.toml.
+        let (_home, token) = enrolled(vec![
+            crate::principals::Grant::Sync,
+            crate::principals::Grant::Push,
+        ]);
+        let ws = workspace_with("[router]\ncommit = true\n[[repos]]\nname = \"a\"\npath = \"repos/a\"\n");
+        let res = call_commit(&ws, _home.path(), Some(&token)).await;
+        assert_eq!(res.0, StatusCode::FORBIDDEN);
+        assert!(res.1.starts_with("principal_not_granted"), "{}", res.1);
+        assert!(!res.1.contains("modules.local.toml"), "must not leak the ceiling: {}", res.1);
+    }
+
+    #[tokio::test]
+    async fn commit_ceiling_denies_when_manifest_lacks_the_key() {
+        // Principal enrolled WITH commit; manifest has sync/push but no commit key.
+        // Expected: 403 naming `commit = true` under `[router]`.
+        let (_home, token) = enrolled(vec![crate::principals::Grant::Commit]);
+        let ws = workspace_with(
+            "[router]\nsync = true\npush = true\n[[repos]]\nname = \"a\"\npath = \"repos/a\"\n",
+        );
+        let res = call_commit(&ws, _home.path(), Some(&token)).await;
+        assert_eq!(res.0, StatusCode::FORBIDDEN);
+        assert!(res.1.contains("commit = true"), "the ceiling's own message: {}", res.1);
+        assert!(res.1.contains("[router]"), "{}", res.1);
+    }
+
+    #[tokio::test]
+    async fn commit_without_a_token_is_401_no_principal() {
+        // No Authorization header. Expected: 401, body starts "no_principal".
+        let (_home, _t) = enrolled(vec![]);
+        let ws = workspace_with("[router]\ncommit = true\n[[repos]]\nname = \"a\"\npath = \"repos/a\"\n");
+        let res = call_commit(&ws, _home.path(), None).await;
+        assert_eq!(res.0, StatusCode::UNAUTHORIZED);
+        assert!(res.1.starts_with("no_principal"), "{}", res.1);
     }
 }

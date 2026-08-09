@@ -169,7 +169,15 @@ use crate::git::{self, GitError, Position};
 /// remote WAS reached, so it isn't `"transport"`, and pulling first will not
 /// help, so it isn't `"not-fast-forwardable"`; see
 /// `routes::repos::push_action_error`), `"transport"` (the remote could not
-/// be reached), `"timeout"` (the invocation exceeded its cap). `message` is
+/// be reached — and, for commit's pre-flight status read, a failed `git
+/// status` before the commit ever runs also lands here: see
+/// `routes::repos::dirty_check_action_error`), `"timeout"` (the invocation
+/// exceeded its cap), `"detached"` (a commit was refused because HEAD is
+/// detached — it would belong to no branch), `"nothing-to-commit"` (a
+/// commit was refused because the working tree is clean), `"commit-failed"`
+/// (`git add`/`git commit` itself failed — a declining pre-commit hook, most
+/// commonly, whose own text becomes `message` since git gives it no stable
+/// locale-pinned marker the way `"[rejected]"` marks a push). `message` is
 /// the human-readable detail for display; `kind` is what code branches on.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ActionError {
@@ -299,6 +307,21 @@ pub fn push_enabled(composition: &Composition) -> bool {
         .router
         .extra
         .get("push")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Whether this workspace has granted the engine authority to COMMIT.
+///
+/// Separate from `push_enabled` in both directions (design D2): push without
+/// commit is today's world — publish what already exists; commit without push
+/// is a device that authors locally but cannot publish. Same fail-closed
+/// posture — absent, misspelled, non-boolean or unparseable all mean disabled.
+pub fn commit_enabled(composition: &Composition) -> bool {
+    composition
+        .router
+        .extra
+        .get("commit")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
 }
@@ -598,6 +621,18 @@ mod tests {
             std::fs::write(root.join("modules.local.toml"), body).unwrap();
             assert!(!push_enabled(&comp(&root)), "must fail closed on {body:?}");
         }
+    }
+
+    #[test]
+    fn commit_gate_defaults_closed_and_reads_true() {
+        let root = workspace();
+        assert!(!commit_enabled(&comp(&root)), "absent must fail closed");
+
+        std::fs::write(root.join("modules.local.toml"), "[router]\ncommit = true\n").unwrap();
+        assert!(commit_enabled(&comp(&root)));
+
+        std::fs::write(root.join("modules.local.toml"), "[router]\ncommit = \"yes\"\n").unwrap();
+        assert!(!commit_enabled(&comp(&root)), "non-boolean must fail closed");
     }
 
     use crate::testgit::{commit, git_sync, remote_and_clone};
