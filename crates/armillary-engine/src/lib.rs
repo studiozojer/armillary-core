@@ -22,6 +22,7 @@ pub mod projection;
 pub mod provider;
 pub mod provider_openai;
 pub mod repo_events;
+pub mod repo_verbs;
 pub mod repos;
 pub mod routes;
 mod search;
