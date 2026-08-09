@@ -329,6 +329,13 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 /// enumeration is on the MISS path only, and it earns its cost: a model told
 /// only "no" cannot recover, and a model told which names exist can (D6').
 fn resolve_repo(ctx: &ToolCtx, name: &str) -> Result<std::path::PathBuf, ToolError> {
+    // The SECOND snapshot a gated tool call loads — `loop_::permitted_grants`
+    // already read one for the manifest ceiling. The routes hold exactly one
+    // per request and pass it down; this path deliberately does not, because
+    // the two reads answer different questions at different moments and the
+    // gate's whole discipline is that its answer is never cached (design D2).
+    // A tool body also holds nothing it could have been handed one through —
+    // `ToolCtx` carries what the SESSION is, not what the request read.
     let snap = crate::snapshot::WorkspaceSnapshot::load(&ctx.root).unwrap_or_default();
     if let Some(module) = repos::resolve(&ctx.root, &snap.composition, name) {
         return Ok(ctx.root.join(&module.path));
