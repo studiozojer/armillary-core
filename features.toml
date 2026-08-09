@@ -1,0 +1,41 @@
+# armillary-core — feature manifest
+#
+# Declarative, not discovered. Each entry is the human-legible summary of a
+# landed feature — what the engine can do. Read at build time, served at
+# /features. One entry == one closing act in the spec that landed it.
+#
+# [[features]]
+# name    = "<feature>"
+# landed  = "<YYYY-MM-DD>"
+# commit  = "<short sha>"
+# summary = "<one-line description>"
+
+[[features]]
+name    = "Agent permissions"
+landed  = "2026-08-09"
+commit  = "668ed29"
+summary = "Git verbs (sync, push, commit) consent-gated per enrolled device — each grant fail-closed, each request attributed"
+
+[[features]]
+name    = "Commit from device"
+landed  = "2026-08-08"
+commit  = "3f706d2"
+summary = "An enrolled device can author and publish commits under the host identity — attributed, recorded, revocable"
+
+[[features]]
+name    = "Repo operations record"
+landed  = "2026-08-08"
+commit  = "2116338"
+summary = "Fetch, pull, and push leave a durable event — who asked, what ran, whose credential. Mutations carry a principal."
+
+[[features]]
+name    = "Repository search"
+landed  = "2026-08-02"
+commit  = "325fabe"
+summary = "Model-driven code exploration with search and find_files tool calls — 359 tests, device-walked"
+
+[[features]]
+name    = "Boot event recording"
+landed  = "2026-07-30"
+commit  = "0493db4"
+summary = "Session boot recorded as a durable event — the composition is surfaced before any tool fires, not inferred from a prompt"
