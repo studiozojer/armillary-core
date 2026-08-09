@@ -355,6 +355,17 @@ pub fn fetch_action_error(e: GitError) -> ActionError {
     }
 }
 
+/// `git fetch --prune` on one repo, and its classified outcome.
+///
+/// **One statement, three callers** — the single-repo route, the group sweep
+/// below, and `repo_verbs::sync_repo`'s fetch half. It lives here rather than
+/// beside the other verbs because `fetch_action_error` already does, and
+/// because `fetch_all` is one of the three: a home in `repo_verbs` would have
+/// this module depending back on the module that depends on it, for one line.
+pub async fn fetch_repo(abs: &Path) -> Option<ActionError> {
+    git::fetch(abs, git::DEFAULT_TIMEOUT).await.err().map(fetch_action_error)
+}
+
 /// Fetch every composed repo, bounded at CONCURRENCY, then read each state.
 ///
 /// Group FETCH only. Group pull and group push are deliberately absent (design
@@ -380,8 +391,7 @@ pub async fn fetch_all(root: &Path, composition: &Composition) -> Vec<RepoState>
             // The semaphore is never closed, so acquire cannot fail.
             let _permit = permits.acquire().await.expect("semaphore is open");
             let abs = root.join(&module.path);
-            let action_error =
-                git::fetch(&abs, git::DEFAULT_TIMEOUT).await.err().map(fetch_action_error);
+            let action_error = fetch_repo(&abs).await;
             let mut state = read_one(&root, &module, false).await;
             state.action_error = action_error;
             state

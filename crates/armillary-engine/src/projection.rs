@@ -369,6 +369,10 @@ fn recovery_hint(status: &str) -> &'static str {
         "no_match" => "old_string does not appear in that file; re-read the file and copy the exact text, without read_file's line-number prefixes",
         "ambiguous_match" => "old_string appears more than once; include more surrounding lines until exactly one match remains, or call edit_file once per occurrence",
         "write_failed" => "the file could not be written to disk; check the path and try again, or write somewhere else",
+        // The git verbs. A repo is addressed by its MANIFEST name, so the
+        // recovery is to go read what the manifest declares — never to guess
+        // a path, which is not what these verbs take.
+        "unknown_repo" => "no composed repo goes by that name; call get_composition to see which repos this workspace declares, and pass one of those names",
         // The three ways a call ends without its tool ever running. Each says
         // whether repeating it is worth anything — `interrupted` and
         // `no_result_recorded` are retryable, `bound_reached` is not.
@@ -1587,6 +1591,8 @@ mod tests {
             "interrupted", "no_result_recorded", "bound_reached", "tool_panicked",
             // write
             "composition_locked", "no_match", "ambiguous_match", "write_failed",
+            // git verbs
+            "unknown_repo",
         ];
         let fallback = recovery_hint("__a_status_no_one_emits__");
 

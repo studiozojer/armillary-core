@@ -45,8 +45,8 @@ use crate::auth::Caller;
 use crate::git::{self, GitError};
 use crate::principals::Grant;
 use crate::repo_verbs::{
-    locked_dirty_check_then_pull, locked_status_then_commit, push_action_error, validate_message,
-    with_trailer, Pulled,
+    locked_dirty_check_then_pull, locked_status_then_commit, push_then_count, validate_message,
+    with_trailer, Pulled, Pushed,
 };
 use crate::repos;
 use crate::state::SharedState;
@@ -339,8 +339,7 @@ pub async fn fetch_one(
     }
 
     let abs = root.join(&module.path);
-    let action_error =
-        git::fetch(&abs, git::DEFAULT_TIMEOUT).await.err().map(repos::fetch_action_error);
+    let action_error = repos::fetch_repo(&abs).await;
     crate::repo_events::record_fetch(
         &state.sessions,
         crate::repo_events::device_actor(&caller),
@@ -417,23 +416,12 @@ pub async fn push(
     }
 
     let abs = root.join(&module.path);
-    let outcome = git::push(&abs, git::DEFAULT_TIMEOUT).await;
-    let push_error = outcome.as_ref().err().cloned().map(push_action_error);
-
-    // `commits` only where there is a range to count. A new branch and an
-    // up-to-date push both report no shas, and a count derived from anything
-    // else — the ahead-count `status_v2` holds, say — would be this machine's
-    // belief before the push rather than what the push moved.
-    let report = outcome.as_ref().ok();
-    let commits = match report.and_then(|r| r.before.as_ref().zip(r.after.as_ref())) {
-        Some((b, a)) => git::count_range(&abs, b, a, git::DEFAULT_TIMEOUT).await.ok(),
-        None => None,
-    };
+    let Pushed { error: push_error, report, commits } = push_then_count(&abs).await;
     crate::repo_events::record_push(
         &state.sessions,
         crate::repo_events::device_actor(&caller),
         &name,
-        report,
+        report.as_ref(),
         commits,
         &state.hostname,
         push_error.as_ref(),

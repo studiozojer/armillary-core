@@ -235,6 +235,43 @@ pub(crate) async fn locked_status_then_commit(abs: &std::path::Path, full_messag
     Committed { error, before, after, files }
 }
 
+/// What one push attempt did: git's own report of the ref it moved and the
+/// shas it moved between, how many commits that range held, and the outcome.
+///
+/// `Pulled`/`Committed`'s sibling, and it exists for the same reason they do:
+/// two callers, one derivation. The `commits` count in particular has to have
+/// exactly one home — it is derived from git's report rather than from
+/// anything this machine believed beforehand, and a second copy of that rule
+/// is a second chance to derive it from the wrong thing.
+pub(crate) struct Pushed {
+    pub(crate) error: Option<repos::ActionError>,
+    /// git's own account of what moved. `None` when the push failed — there
+    /// is no report of a push that did not happen.
+    pub(crate) report: Option<git::PushReport>,
+    pub(crate) commits: Option<u32>,
+}
+
+/// `git push`, then count what it moved.
+///
+/// No write lock, unlike pull and commit: a push reads the working tree not at
+/// all and changes nothing on this side that a concurrent `write_file` could
+/// corrupt or be swept into.
+pub(crate) async fn push_then_count(abs: &std::path::Path) -> Pushed {
+    let outcome = git::push(abs, git::DEFAULT_TIMEOUT).await;
+    let error = outcome.as_ref().err().cloned().map(push_action_error);
+    let report = outcome.ok();
+
+    // `commits` only where there is a range to count. A new branch and an
+    // up-to-date push both report no shas, and a count derived from anything
+    // else — the ahead-count `status_v2` holds, say — would be this machine's
+    // belief before the push rather than what the push moved.
+    let commits = match report.as_ref().and_then(|r| r.before.as_ref().zip(r.after.as_ref())) {
+        Some((b, a)) => git::count_range(abs, b, a, git::DEFAULT_TIMEOUT).await.ok(),
+        None => None,
+    };
+    Pushed { error, report, commits }
+}
+
 use crate::tools::{Effect, RepoVerb, ToolCtx, ToolError, ToolOutcome};
 
 /// Cap chosen in the design (§ 6): far above any honest message, far below
@@ -391,9 +428,7 @@ pub(crate) fn commit_repo(ctx: &ToolCtx, name: &str, message: &str) -> Result<To
 pub(crate) fn sync_repo(ctx: &ToolCtx, name: &str) -> Result<ToolOutcome, ToolError> {
     let abs = resolve_repo(ctx, name)?;
 
-    let fetch_error = block_on(git::fetch(&abs, git::DEFAULT_TIMEOUT))
-        .err()
-        .map(repos::fetch_action_error);
+    let fetch_error = block_on(repos::fetch_repo(&abs));
     let pulled = block_on(locked_dirty_check_then_pull(&abs));
 
     let fetched = match &fetch_error {
@@ -447,20 +482,9 @@ pub(crate) fn sync_repo(ctx: &ToolCtx, name: &str) -> Result<ToolOutcome, ToolEr
 pub(crate) fn push_repo(ctx: &ToolCtx, name: &str) -> Result<ToolOutcome, ToolError> {
     let abs = resolve_repo(ctx, name)?;
 
-    let outcome = block_on(git::push(&abs, git::DEFAULT_TIMEOUT));
-    let error = outcome.as_ref().err().cloned().map(push_action_error);
-    let report = outcome.as_ref().ok();
-
-    // `commits` only where there is a range to count. A new branch and an
-    // up-to-date push both report no shas, and a count derived from anything
-    // else — the ahead-count `status_v2` holds, say — would be this machine's
-    // belief before the push rather than what the push moved.
-    let commits = match report.and_then(|r| r.before.as_ref().zip(r.after.as_ref())) {
-        Some((b, a)) => block_on(git::count_range(&abs, b, a, git::DEFAULT_TIMEOUT)).ok(),
-        None => None,
-    };
+    let Pushed { error, report, commits } = block_on(push_then_count(&abs));
     let (reference, before, after) = match report {
-        Some(r) => (r.reference.clone(), r.before.clone(), r.after.clone()),
+        Some(r) => (r.reference, r.before, r.after),
         None => (None, None, None),
     };
 
