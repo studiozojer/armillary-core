@@ -133,9 +133,12 @@ pub fn model_for(events: &[EventEnvelope]) -> Option<String> {
 /// creation. `None` for an instance created before principals existed, and
 /// for one created on the host path with no requester to name.
 ///
-/// This is what a `file_changed` inherits: there is no HTTP write route, so a
-/// write is a model tool reached inside a turn, and the principal behind that
-/// turn is the one that created the instance the turn belongs to.
+/// **A record of who opened the window, and nothing more.** It is deliberately
+/// NOT what a turn runs as: authority and attribution both key off the device
+/// that sent the turn (`run_turn`'s `caller`), because any enrolled device can
+/// send into any instance. Kept and read because the creation fact is worth
+/// having in the log — `tests/routes.rs` pins the writer and this reader to
+/// the same key.
 pub fn principal_for(events: &[EventEnvelope]) -> Option<String> {
     events
         .iter()
@@ -436,18 +439,23 @@ fn permitted_grants(
 /// this, so `interrupt` (racing this task from another request) and this
 /// task's own read of `cancel` are the same channel throughout.
 ///
-/// `agent_tools` is the device's consent for this one turn, already
-/// validated (`Grant::parse`) by `send` — carried here on the spawned
-/// turn's own arguments rather than appended to the durable log, because
-/// consent is per-request state, never a durable fact about the instance.
-/// It is the first term of `permitted_grants`, which this turn resolves
-/// afresh at each of the two doorways: assembling the offer, and re-checking
-/// the call that comes back.
+/// `caller` is the principal `send` authenticated, and `agent_tools` is what
+/// that same request consented to (`Grant::parse`-validated by `send`) — the
+/// two terms of the gate that belong to the REQUEST, carried on the spawned
+/// turn's own arguments rather than appended to the durable log, because both
+/// are per-request state and neither is a durable fact about the instance.
+/// They are the first two terms of `permitted_grants`, which this turn
+/// resolves afresh at each of the two doorways: assembling the offer, and
+/// re-checking the call that comes back.
+///
+/// `caller` is `None` only for a turn no HTTP request started — nothing
+/// spawns one today — and that turn holds no git verb and names no device.
 pub async fn run_turn(
     state: SharedState,
     stream: String,
     generation: String,
     cancel_rx: watch::Receiver<bool>,
+    caller: Option<String>,
     agent_tools: Vec<crate::principals::Grant>,
 ) {
     let _end_turn_guard = EndTurnGuard {
@@ -472,12 +480,20 @@ pub async fn run_turn(
     // models keeps working unchanged.
     let write_grant = may_write_composition(&events);
     let model = model_for(&events).unwrap_or_else(|| state.model.model.clone());
-    // Resolved from the SAME first event, at the same point, for the same
-    // reason: read back rather than threaded through the loop as a parameter.
-    // Every `file_changed` this turn produces carries it — the write is a
-    // model tool inside a turn, so "at whose request" is the principal that
-    // created this instance.
-    let principal = principal_for(&events).map(|name| ActorPrincipal { name });
+    // **The device that SENT this turn, threaded in — not the one read back
+    // off `instance_created`.** This is both the turn's authority (the
+    // caller-grants term of `permitted_grants`) and its attribution (every
+    // `file_changed` and every repo event this turn produces, plus the commit
+    // trailer), and the two must be the same name or the record credits an
+    // authority it did not spend.
+    //
+    // The creator is the wrong name for both. Nothing scopes an instance to
+    // the device that opened it, so any enrolled device can send into any
+    // window; keying off the creator would let a device holding nothing spend
+    // the grants of the device that happened to open the window. `send` is the
+    // only caller and it always has an authenticated `Caller` — `None` is
+    // therefore the shape of a turn nobody asked for, and holds nothing.
+    let principal = caller.map(|name| ActorPrincipal { name });
 
     // Text produced by rounds already finished. The provider restarts its own
     // accumulator on every call, so without this the phone's bubble would jump
@@ -725,7 +741,7 @@ pub async fn run_turn(
                 // re-derived: `commit_repo`'s trailer names all three, and a
                 // tool body holds no log handle to read them from.
                 turn: crate::tools::TurnIdentity {
-                    // No device to name means the turn was asked for on the
+                    // No sending device means the turn was asked for on the
                     // host itself; the host's own name is the honest answer,
                     // and a trailer line cannot be absent the way an event
                     // field can.
@@ -1432,9 +1448,9 @@ mod tests {
     async fn a_file_changed_names_the_principal_behind_its_turn() {
         // § 3.4. There is no HTTP write route: `write_file` is a model tool
         // reached inside a turn, so a file write inherits the principal that
-        // authenticated the `send`, by way of the instance that turn belongs
-        // to. Without this, the one existing effect-event in the system is the
-        // only one that cannot answer "at whose request".
+        // authenticated the `send` that started it. Without this, the one
+        // existing effect-event in the system is the only one that cannot
+        // answer "at whose request".
         let data_dir = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("modules.toml"), "[[repos]]\nname='r'\npath='p'\n")
@@ -1454,7 +1470,18 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
+        // The phone created this instance AND sent this turn — the ordinary
+        // case, spelled out rather than assumed now that the two are separate
+        // facts and only the sender is authority.
+        run_turn(
+            state,
+            id.clone(),
+            "gen-1".to_string(),
+            cancel_rx,
+            Some("iphone".to_string()),
+            Vec::new(),
+        )
+        .await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let changed = events.iter().find(|e| e.event_type == "file_changed").unwrap();
@@ -1468,9 +1495,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_file_changed_from_a_principal_less_instance_names_nobody_rather_than_guessing() {
-        // An instance created before principals existed, or on the host path
-        // with no requester to name. Absent is the honest answer; a
+    async fn a_file_changed_from_a_caller_less_turn_names_nobody_rather_than_guessing() {
+        // A turn no HTTP caller started — nothing spawns one today, and the
+        // shape has to be honest anyway. Absent is the honest answer; a
         // placeholder like "host" would be a fact nobody measured.
         let data_dir = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -1491,7 +1518,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, None, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let changed = events.iter().find(|e| e.event_type == "file_changed").unwrap();
@@ -1546,6 +1573,7 @@ mod tests {
             id.clone(),
             "gen-1".to_string(),
             cancel_rx,
+            Some("iphone".to_string()),
             vec![crate::principals::Grant::Commit],
         )
         .await;
@@ -1656,6 +1684,7 @@ mod tests {
             id.clone(),
             "gen-1".to_string(),
             cancel_rx,
+            Some("iphone".to_string()),
             vec![crate::principals::Grant::Commit],
         )
         .await;
@@ -1757,7 +1786,18 @@ mod tests {
                 .await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
+        // The sender is named and fully granted, so consent is the ONLY fence
+        // that is closed — an anonymous send would close a second one and this
+        // test would stop proving which of them refused.
+        run_turn(
+            state,
+            id.clone(),
+            "gen-1".to_string(),
+            cancel_rx,
+            Some("iphone".to_string()),
+            Vec::new(),
+        )
+        .await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let result = events
@@ -1776,6 +1816,209 @@ mod tests {
             !host_events.iter().any(|e| e.event_type == "repo_committed"),
             "a verb nobody offered must not have run: {host_events:?}"
         );
+        assert_eq!(
+            crate::git::head_sha(&repo, crate::git::DEFAULT_TIMEOUT).await.unwrap(),
+            head_before
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_device_sending_into_an_instance_is_gated_on_its_own_grants() {
+        // THE security claim. Every enrolled device can reach every instance
+        // on this engine — nothing scopes an instance to the device that
+        // created it — so a gate keyed on the CREATOR's grants is a gate any
+        // device can walk around: open a window as the granted phone, then
+        // send `agentTools: ["commit"]` from the laptop that was granted
+        // nothing. The authority spent is the SENDER's, and this device has
+        // none.
+        //
+        // Both devices are genuinely enrolled: "unknown to the registry" is a
+        // different refusal and would pass this test for the wrong reason.
+        let data_dir = tempfile::tempdir().unwrap();
+        let (root, _remote, repo) = crate::testgit::workspace_with_repo("jianyi");
+        std::fs::write(repo.join("note.md"), "still uncommitted\n").unwrap();
+        let head_before = crate::git::head_sha(&repo, crate::git::DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance_as(&sessions, Some("tycho"), Some("device-a")).await;
+
+        let registry = tempfile::tempdir().unwrap();
+        grant_to(registry.path(), "device-a", vec![crate::principals::Grant::Commit]);
+        grant_to(registry.path(), "device-b", Vec::new());
+
+        let provider = std::sync::Arc::new(BetweenOfferAndCall {
+            inner: RoundScript::new(vec![
+                calls_with(
+                    "toolu_c1",
+                    "commit_repo",
+                    serde_json::json!({ "name": "jianyi", "message": "notes: borrowed authority" }),
+                ),
+                says("I could not commit"),
+            ]),
+            offered: std::sync::Mutex::new(Vec::new()),
+            between: Box::new(|| {}),
+        });
+        let state = state_with_registry(
+            provider.clone(),
+            sessions.clone(),
+            &root,
+            registry.path().to_path_buf(),
+        )
+        .await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(
+            state,
+            id.clone(),
+            "gen-1".to_string(),
+            cancel_rx,
+            Some("device-b".to_string()),
+            vec![crate::principals::Grant::Commit],
+        )
+        .await;
+
+        // Nothing offered: the door never opened for a device holding nothing.
+        assert!(
+            !provider.offered.lock().unwrap()[0].contains(&"commit_repo".to_string()),
+            "a zero-grant sender must be offered no git verb: {:?}",
+            provider.offered.lock().unwrap()[0]
+        );
+        // And the till refuses too, independently — the model called it anyway.
+        let events = sessions.store().read_from(&id, 0).unwrap();
+        let result = events
+            .iter()
+            .find(|e| e.event_type == "tool_result")
+            .expect("the call must be answered");
+        assert_eq!(result.data["status"], "tool_not_permitted");
+
+        let host_events = sessions
+            .store()
+            .read_from(crate::repo_events::WORKSPACE_STREAM, 0)
+            .unwrap_or_default();
+        assert!(
+            !host_events.iter().any(|e| e.event_type == "repo_committed"),
+            "a device spending another device's grant must not have committed: {host_events:?}"
+        );
+        assert_eq!(
+            crate::git::head_sha(&repo, crate::git::DEFAULT_TIMEOUT).await.unwrap(),
+            head_before
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_names_the_device_that_sent_the_turn_not_the_one_that_opened_the_instance() {
+        // The other half of the same threading, and the one a refusal cannot
+        // cover: when the send IS permitted, the record has to name the device
+        // that asked for it. Both devices hold `commit` here, so the gate is
+        // open either way and attribution is the only thing under test — a
+        // record naming the creator would be a true-looking lie about who
+        // spent the authority.
+        let data_dir = tempfile::tempdir().unwrap();
+        let (root, _remote, repo) = crate::testgit::workspace_with_repo("jianyi");
+        std::fs::write(repo.join("note.md"), "written by the other device\n").unwrap();
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance_as(&sessions, Some("tycho"), Some("device-a")).await;
+
+        let registry = tempfile::tempdir().unwrap();
+        grant_to(registry.path(), "device-a", vec![crate::principals::Grant::Commit]);
+        grant_to(registry.path(), "device-b", vec![crate::principals::Grant::Commit]);
+
+        let provider = std::sync::Arc::new(RoundScript::new(vec![
+            calls_with(
+                "toolu_c1",
+                "commit_repo",
+                serde_json::json!({ "name": "jianyi", "message": "notes: from the second device" }),
+            ),
+            says("done"),
+        ]));
+        let state =
+            state_with_registry(provider, sessions.clone(), &root, registry.path().to_path_buf())
+                .await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(
+            state,
+            id.clone(),
+            "gen-1".to_string(),
+            cancel_rx,
+            Some("device-b".to_string()),
+            vec![crate::principals::Grant::Commit],
+        )
+        .await;
+
+        let host_events = sessions
+            .store()
+            .read_from(crate::repo_events::WORKSPACE_STREAM, 0)
+            .expect("the verb must have opened the workspace stream");
+        let ev = host_events
+            .iter()
+            .find(|e| e.event_type == "repo_committed")
+            .expect("the commit must have landed — both devices hold the grant");
+        assert_eq!(
+            ev.actor.principal.as_ref().map(|p| p.name.as_str()),
+            Some("device-b"),
+            "the event names whoever SENT the turn"
+        );
+
+        // And the trailer agrees. A git-only reader never sees the event, so
+        // the two records have to name the same device or one of them lies.
+        let message = crate::testgit::last_message(&repo);
+        assert!(message.contains("Committed-from: device-b"), "{message}");
+        assert!(!message.contains("device-a"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_no_sending_caller_holds_no_git_verb_at_all() {
+        // Nothing spawns a turn without an HTTP caller today, and the argument
+        // is an `Option` anyway — so the empty case has to be fail-closed by
+        // construction rather than by nobody having built the caller yet. The
+        // instance's creator is fully granted and consent names `commit`: if
+        // an absent sender fell back to the creator, this would commit.
+        let data_dir = tempfile::tempdir().unwrap();
+        let (root, _remote, repo) = crate::testgit::workspace_with_repo("jianyi");
+        std::fs::write(repo.join("note.md"), "still uncommitted\n").unwrap();
+        let head_before = crate::git::head_sha(&repo, crate::git::DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+        let store = LogStore::open(data_dir.path()).unwrap();
+        let sessions = Arc::new(Sessions::new(store));
+        let id = create_instance_as(&sessions, Some("tycho"), Some("iphone")).await;
+
+        let registry = tempfile::tempdir().unwrap();
+        grant_to(registry.path(), "iphone", vec![crate::principals::Grant::Commit]);
+
+        let provider = std::sync::Arc::new(RoundScript::new(vec![
+            calls_with(
+                "toolu_c1",
+                "commit_repo",
+                serde_json::json!({ "name": "jianyi", "message": "notes: nobody asked" }),
+            ),
+            says("I cannot do that here"),
+        ]));
+        let state =
+            state_with_registry(provider, sessions.clone(), &root, registry.path().to_path_buf())
+                .await;
+
+        let (_c, cancel_rx) = watch::channel(false);
+        run_turn(
+            state,
+            id.clone(),
+            "gen-1".to_string(),
+            cancel_rx,
+            None,
+            vec![crate::principals::Grant::Commit],
+        )
+        .await;
+
+        let events = sessions.store().read_from(&id, 0).unwrap();
+        let result = events
+            .iter()
+            .find(|e| e.event_type == "tool_result")
+            .expect("the call must be answered");
+        assert_eq!(result.data["status"], "tool_not_permitted");
         assert_eq!(
             crate::git::head_sha(&repo, crate::git::DEFAULT_TIMEOUT).await.unwrap(),
             head_before
@@ -1811,7 +2054,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, None, Vec::new()).await;
 
         // The write is real, on the real disk.
         assert_eq!(
@@ -1892,7 +2135,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, None, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let with_thinking: Vec<_> = events
@@ -1938,7 +2181,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, None, Vec::new()).await;
 
         assert!(!root.path().join("secrets.json").exists());
 
@@ -1972,7 +2215,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, None, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -2052,7 +2295,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, None, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let results: Vec<&EventEnvelope> = events
@@ -2102,7 +2345,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, None, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let result = events.iter().find(|e| e.event_type == "tool_result").unwrap();
@@ -2134,7 +2377,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, None, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let rounds = events.iter().filter(|e| e.event_type == "tool_use").count();
@@ -2177,7 +2420,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, None, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let last = events.last().unwrap();
@@ -2241,7 +2484,7 @@ mod tests {
         let state = state_with(provider, sessions.clone(), root.path()).await;
 
         let (_c, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, Vec::new()).await;
+        run_turn(state, id.clone(), "gen-1".to_string(), cancel_rx, None, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let heal = events
@@ -2286,7 +2529,7 @@ mod tests {
 
         let generation = uuid::Uuid::new_v4().to_string();
         let (_cancel_tx, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), generation.clone(), cancel_rx, Vec::new()).await;
+        run_turn(state, id.clone(), generation.clone(), cancel_rx, None, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let last = events.last().unwrap();
@@ -2326,7 +2569,7 @@ mod tests {
 
         let generation = uuid::Uuid::new_v4().to_string();
         let (_cancel_tx, cancel_rx) = watch::channel(false);
-        run_turn(state, id.clone(), generation, cancel_rx, Vec::new()).await;
+        run_turn(state, id.clone(), generation, cancel_rx, None, Vec::new()).await;
 
         let events = sessions.store().read_from(&id, 0).unwrap();
         let last = events.last().unwrap();

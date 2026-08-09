@@ -250,7 +250,7 @@ async fn every_event_a_scripted_turn_emits_validates_against_the_schema() {
 
     let generation = uuid::Uuid::new_v4().to_string();
     let (_cancel_tx, cancel_rx) = watch::channel(false);
-    run_turn(state, id.clone(), generation, cancel_rx, Vec::new()).await;
+    run_turn(state, id.clone(), generation, cancel_rx, None, Vec::new()).await;
 
     let events = sessions.store().read_from(&id, 0).unwrap();
     assert!(

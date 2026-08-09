@@ -110,7 +110,7 @@ async fn require_known_instance(state: &SharedState, id: &str) -> Result<(), (St
 ///    independently of this request, which has already gotten its answer.
 pub async fn send(
     State(state): State<SharedState>,
-    _caller: Caller,
+    caller: Caller,
     Path(id): Path<String>,
     Json(body): Json<SendRequest>,
 ) -> Result<(StatusCode, Json<SendReceipt>), (StatusCode, String)> {
@@ -165,7 +165,22 @@ pub async fn send(
         seq: user_event.seq,
     };
 
-    tokio::spawn(loop_::run_turn(state.clone(), id, generation, cancel_rx, agent_tools));
+    // The turn is handed WHO ASKED, not merely what they consented to. The
+    // gate is `agentTools ∩ caller-grants ∩ manifest`, and the caller in that
+    // phrase is this authenticated sender — every enrolled device can reach
+    // every instance on this route, so keying the grant lookup off the
+    // instance's CREATOR would let a zero-grant device spend a better-granted
+    // device's authority by sending into its instance. Attribution follows
+    // the same name for the same reason: the record answers "who asked for
+    // THIS turn", not "who opened this window".
+    tokio::spawn(loop_::run_turn(
+        state.clone(),
+        id,
+        generation,
+        cancel_rx,
+        Some(caller.0.name),
+        agent_tools,
+    ));
 
     Ok((StatusCode::CREATED, Json(receipt)))
 }

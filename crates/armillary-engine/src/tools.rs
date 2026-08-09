@@ -546,9 +546,10 @@ pub struct ToolCtx {
 
 /// The acting identity of the turn a tool body runs inside.
 ///
-/// Three facts the loop already resolves once per turn from the instance's
-/// own first event — the operator it was created with, the model piloting it,
-/// and the device that asked. They ride on the context rather than being
+/// Three facts the loop already resolves once per turn — the operator the
+/// instance was created with and the model piloting it, both read off its
+/// first event, plus the device that SENT this turn, which arrives on the
+/// request rather than the log. They ride on the context rather than being
 /// re-derived here because a tool body holds no log handle and could not read
 /// them if it wanted to; `commit_repo` is the one verb that needs them, and it
 /// needs all three at once (D6: a git-only reader must be able to tell a
@@ -558,9 +559,11 @@ pub struct ToolCtx {
 /// touch it — no tool consults this except the commit trailer.
 #[derive(Debug, Clone, Default)]
 pub struct TurnIdentity {
-    /// The device that asked for the turn — the principal recorded at
-    /// instance creation, or this host's own name when there is no device to
-    /// name (an instance created on the host path).
+    /// The device that asked for the turn — the principal `send`
+    /// authenticated, or this host's own name when no request started the
+    /// turn. Never the instance's creator: the two differ whenever a second
+    /// device sends into a window somebody else opened, and the one that
+    /// spent the authority is the one the trailer must name.
     pub device: String,
     /// The composed operator this instance is, or `"dispatcher"`.
     pub operator: String,
