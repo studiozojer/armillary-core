@@ -60,6 +60,7 @@ pub struct Instance {
     pub last_seq: u64,
     pub may_write_composition: bool,
     pub model: Option<String>,
+    pub archived: bool,
 }
 
 #[derive(Serialize)]
@@ -70,12 +71,27 @@ pub struct AttachInfo {
     pub head_seq: u64,
 }
 
+/// The latest lifecycle marker wins. A stream recorded before the archive
+/// verbs existed carries none and lists active — defaulted, not required,
+/// for the same reason `mayWriteComposition` is.
+fn archived_from_events(events: &[EventEnvelope]) -> bool {
+    events
+        .iter()
+        .rev()
+        .find_map(|e| match e.event_type.as_str() {
+            "instance_archived" => Some(true),
+            "instance_unarchived" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
 /// Reconstructs an `Instance` from a stream's first event and its current
 /// head. `None` when the first event is not `instance_created` — defensive:
 /// nothing in this codebase writes a stream's first event as anything else,
 /// but the registry being log-derived means this function is the one place
 /// that discipline could quietly break, so it is checked rather than assumed.
-fn instance_from_first_event(stream: &str, first: &EventEnvelope, head_seq: u64) -> Option<Instance> {
+fn instance_from_first_event(stream: &str, first: &EventEnvelope, head_seq: u64, archived: bool) -> Option<Instance> {
     if first.event_type != "instance_created" {
         return None;
     }
@@ -113,6 +129,7 @@ fn instance_from_first_event(stream: &str, first: &EventEnvelope, head_seq: u64)
         last_seq: head_seq,
         may_write_composition,
         model,
+        archived,
     })
 }
 
@@ -126,7 +143,7 @@ fn list_instances(store: &LogStore) -> Result<Vec<Instance>, SessionError> {
             continue;
         };
         let head_seq = events.last().map(|e| e.seq).unwrap_or(0);
-        match instance_from_first_event(&stream, first, head_seq) {
+        match instance_from_first_event(&stream, first, head_seq, archived_from_events(&events)) {
             Some(instance) => out.push(instance),
             None => eprintln!(
                 "warning: stream {stream:?}'s first event is {:?}, not instance_created — \
@@ -147,7 +164,7 @@ fn attach_info(store: &LogStore, id: &str) -> Result<AttachInfo, SessionError> {
     let first = events.first().ok_or(SessionError::UnknownInstance)?;
     let head_seq = events.last().map(|e| e.seq).unwrap_or(0);
     let earliest_seq = first.seq;
-    let instance = instance_from_first_event(id, first, head_seq)
+    let instance = instance_from_first_event(id, first, head_seq, archived_from_events(&events))
         .ok_or(SessionError::UnknownInstance)?;
 
     Ok(AttachInfo {
@@ -483,7 +500,7 @@ pub async fn create(
     // last_seq stays ev.seq (1, from instance_created) even when a boot event
     // just landed at seq 2: this response describes the instance as CREATED,
     // not its current head. A client that wants the head calls attach.
-    let instance = instance_from_first_event(&id, &ev, ev.seq).ok_or((
+    let instance = instance_from_first_event(&id, &ev, ev.seq, false).ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
         "log_write_failed".to_string(),
     ))?;
@@ -511,4 +528,46 @@ pub async fn attach(
     })
     .await?;
     Ok(Json(info))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log::envelope::{Actor, Role};
+
+    fn marker(seq: u64, event_type: &str) -> EventEnvelope {
+        EventEnvelope {
+            stream: "s".to_string(),
+            id: format!("e{seq}"),
+            seq,
+            ts: "2026-08-11T00:00:00Z".to_string(),
+            actor: Actor { role: Role::User, instance: None, principal: None },
+            event_type: event_type.to_string(),
+            thread: None,
+            parent: None,
+            version: 1,
+            cost: None,
+            data: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn a_stream_with_no_marker_lists_active() {
+        // Every instance recorded before the archive verbs existed has no
+        // marker; they must list as active, not fail to parse — the same
+        // defaulting posture as mayWriteComposition.
+        assert!(!archived_from_events(&[marker(1, "instance_created")]));
+    }
+
+    #[test]
+    fn the_latest_marker_wins() {
+        let events = vec![
+            marker(1, "instance_created"),
+            marker(2, "instance_archived"),
+            marker(3, "instance_unarchived"),
+            marker(4, "instance_archived"),
+        ];
+        assert!(archived_from_events(&events));
+        assert!(!archived_from_events(&events[..3]));
+    }
 }
