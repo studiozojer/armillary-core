@@ -57,6 +57,8 @@ pub fn app(state: AppState) -> Router {
         .route("/instances/{id}/send", post(routes::session_ops::send))
         .route("/instances/{id}/interrupt", post(routes::session_ops::interrupt))
         .route("/instances/{id}/evict", post(routes::session_ops::evict))
+        .route("/instances/{id}/archive", post(routes::session_ops::archive))
+        .route("/instances/{id}/unarchive", post(routes::session_ops::unarchive))
         .route("/streams/{stream}/events", get(routes::subscribe::subscribe))
         // `/repos/fetch` (static) and `/repos/{name}` (dynamic) occupy the
         // same two-segment shape. Verified live 2026-08-04 (see

@@ -999,6 +999,71 @@ async fn evict_on_an_unknown_instance_is_404_unknown_instance() {
     assert_eq!(response.text().await.unwrap(), "unknown_instance");
 }
 
+#[tokio::test]
+async fn archive_on_an_unknown_instance_is_404_unknown_instance() {
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let provider = Arc::new(ScriptedProvider::new(vec!["unused"]));
+    let (addr, _sessions) = spawn(&data_dir, provider).await;
+    let client = authed_client();
+
+    let response = client
+        .post(format!("http://{addr}/instances/does-not-exist/archive"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(response.text().await.unwrap(), "unknown_instance");
+}
+
+// --- D1 pinned end to end: archive flips the listing flag and bars nothing ---
+
+#[tokio::test]
+async fn archive_flips_the_listing_flag_and_bars_nothing() {
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let provider = Arc::new(ScriptedProvider::new(vec!["still here"]));
+    let (addr, _sessions) = spawn(&data_dir, provider).await;
+    let client = authed_client();
+
+    let created: serde_json::Value = client
+        .post(format!("http://{addr}/instances"))
+        .json(&serde_json::json!({}))
+        .send().await.unwrap()
+        .json().await.unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["archived"], serde_json::json!(false));
+
+    let response = client
+        .post(format!("http://{addr}/instances/{id}/archive"))
+        .send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let listed: Vec<serde_json::Value> = client
+        .get(format!("http://{addr}/instances"))
+        .send().await.unwrap().json().await.unwrap();
+    let mine = listed.iter().find(|i| i["id"] == created["id"]).unwrap();
+    assert_eq!(mine["archived"], serde_json::json!(true));
+
+    // D1 / A-3: an archived instance still takes a send — 201, not a refusal.
+    let send = client
+        .post(format!("http://{addr}/instances/{id}/send"))
+        .json(&serde_json::json!({ "text": "still alive", "clientKey": "c1" }))
+        .send().await.unwrap();
+    assert_eq!(send.status(), reqwest::StatusCode::CREATED);
+
+    // Unarchive restores the default listing state.
+    let response = client
+        .post(format!("http://{addr}/instances/{id}/unarchive"))
+        .send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let listed: Vec<serde_json::Value> = client
+        .get(format!("http://{addr}/instances"))
+        .send().await.unwrap().json().await.unwrap();
+    let mine = listed.iter().find(|i| i["id"] == created["id"]).unwrap();
+    assert_eq!(mine["archived"], serde_json::json!(false));
+}
+
 // --- Task 4: the gate, at the door. `offered = the base seven + (agent_tools
 // ∩ caller-grants ∩ manifest)`, resolved fresh per turn. These four drive the
 // WHOLE path a phone drives — `agentTools` over the wire, a principal recorded
