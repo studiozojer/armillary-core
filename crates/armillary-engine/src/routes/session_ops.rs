@@ -256,6 +256,67 @@ pub async fn evict(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// All filesystem work for one lifecycle marker: unknown instance -> 404
+/// `unknown_instance`; otherwise append the marker unconditionally.
+/// Archiving an already-archived instance appends anyway — the event records
+/// the user's action, the listing derives state from the LATEST marker
+/// (`routes::instances::archived_from_events`), and refusing a duplicate
+/// would make this endpoint read state it has no other need for.
+fn append_lifecycle_marker(
+    sessions: &Sessions,
+    stream: &str,
+    event_type: &str,
+) -> Result<(), SessionError> {
+    if !stream_exists(sessions.store(), stream)? {
+        return Err(SessionError::UnknownInstance);
+    }
+    sessions.append(
+        stream,
+        NewEvent {
+            actor: Actor {
+                role: Role::User,
+                instance: None,
+                principal: None,
+            },
+            event_type: event_type.to_string(),
+            data: serde_json::json!({}),
+        },
+    )?;
+    Ok(())
+}
+
+/// `POST /instances/{id}/archive` -> 204, or 404 `unknown_instance`.
+/// Design 2026-08-11 D1: archive only hides — nothing about the stream is
+/// locked; send, attach and subscribe are untouched (A-3).
+pub async fn archive(
+    State(state): State<SharedState>,
+    _caller: Caller,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let sessions = state.sessions.clone();
+    blocking::run(move || {
+        append_lifecycle_marker(&sessions, &id, "instance_archived")
+            .map_err(SessionError::into_response)
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /instances/{id}/unarchive` -> 204, or 404 `unknown_instance`.
+pub async fn unarchive(
+    State(state): State<SharedState>,
+    _caller: Caller,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let sessions = state.sessions.clone();
+    blocking::run(move || {
+        append_lifecycle_marker(&sessions, &id, "instance_unarchived")
+            .map_err(SessionError::into_response)
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
