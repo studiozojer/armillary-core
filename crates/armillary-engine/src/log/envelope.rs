@@ -38,6 +38,13 @@ pub const DURABLE_TYPES: &[&str] = &[
     "repo_pulled",
     "repo_pushed",
     "repo_committed",
+    // Instance lifecycle markers (instance-archive design, 2026-08-11).
+    // Append-only state: the LATEST of these two in a stream decides the
+    // listing's `archived` flag. D1: archive only hides — neither marker
+    // bars send/attach/subscribe (A-3), and neither enters the model's
+    // context (see projection.rs's arm).
+    "instance_archived",
+    "instance_unarchived",
 ];
 
 /// Who REQUESTED an action, when that differs from what performed it.

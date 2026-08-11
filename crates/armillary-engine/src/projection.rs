@@ -222,6 +222,8 @@ const HANDLED_TYPES: &[&str] = &[
     "repo_pulled",
     "repo_pushed",
     "repo_committed",
+    "instance_archived",
+    "instance_unarchived",
 ];
 
 /// Resolve a boot event's `data.path` under `root`, through the same guard
@@ -885,6 +887,13 @@ pub fn project_context(
             // about. This arm is the difference between "decided" and
             // "missed", and it is the only record of which one this was.
             "repo_fetched" | "repo_pulled" | "repo_pushed" | "repo_committed" => {}
+
+            // Instance lifecycle markers: durable, deliberately projecting
+            // NOTHING (design 2026-08-11 D6) — they govern the Instances
+            // list, not the model's context. An explicit arm, not the
+            // catch-all: handled-by-skipping is still handled (P-3), and the
+            // catch-all renders "[unhandled event type: …]" into the prompt.
+            "instance_archived" | "instance_unarchived" => {}
 
             // Never silent (P-3): visible in the transcript rather than
             // dropped, so a gap in coverage shows up where a human or the
@@ -1797,6 +1806,8 @@ mod tests {
                     "result": "ok",
                 }),
                 "repo_committed" => json!({ "repo": "r", "result": "ok", "before": "a", "after": "b", "subject": "s", "files": 2 }),
+                "instance_archived" => json!({}),
+                "instance_unarchived" => json!({}),
                 other => panic!("test fixture missing a data payload for durable type {other}"),
             };
             events.push(ev(seq, &id, t, data));
@@ -1876,6 +1887,30 @@ mod tests {
         assert!(!rendered.contains("file_changed"), "{rendered}");
         assert!(!rendered.contains("unhandled event type"), "{rendered}");
         assert!(!rendered.contains("todo.md"), "{rendered}");
+    }
+
+    #[test]
+    fn archive_markers_are_durable_and_have_explicit_reducer_arms() {
+        // MUTATION-CHECKED, same shape as file_changed's guard: P-3 enforced,
+        // not remembered.
+        assert!(DURABLE_TYPES.contains(&"instance_archived"));
+        assert!(HANDLED_TYPES.contains(&"instance_archived"));
+        assert!(DURABLE_TYPES.contains(&"instance_unarchived"));
+        assert!(HANDLED_TYPES.contains(&"instance_unarchived"));
+    }
+
+    #[test]
+    fn archive_markers_contribute_nothing_to_the_projection() {
+        // D6: list-level metadata. A stream with markers projects the same
+        // message count as one without — nothing added, nothing marked.
+        let events = vec![
+            ev(1, "u1", "user_message", json!({"text": "hello"})),
+            ev(2, "m1", "instance_archived", json!({})),
+            ev(3, "m2", "instance_unarchived", json!({})),
+        ];
+        let with_markers = project_context(&events, Path::new(".")).unwrap();
+        let without = project_context(&events[..1], Path::new(".")).unwrap();
+        assert_eq!(with_markers.messages.len(), without.messages.len());
     }
 
     #[test]
