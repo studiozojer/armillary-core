@@ -41,8 +41,39 @@ pub struct NewEvent {
 /// caller can find out which generation is currently in flight for a stream.
 pub struct TurnHandle {
     pub cancel: watch::Sender<bool>,
-    #[allow(dead_code)] // read by callers via a future accessor; not yet needed internally
     pub generation: String,
+}
+
+/// One transient turn-lifecycle envelope. I-4: `seq` MUST be 0 and this is
+/// never appended.
+///
+/// `actor.role` is `Role::Machine`, not the operator: this is the harness
+/// stating a fact about the stream's own scheduling, not the operator
+/// speaking. It also sidesteps operator resolution entirely — `begin_turn`
+/// is called before the log has been read and does not know which operator
+/// is attached.
+fn transient_turn_envelope(
+    stream: &str,
+    event_type: &str,
+    generation: &str,
+) -> crate::log::envelope::EventEnvelope {
+    EventEnvelope {
+        stream: stream.to_string(),
+        id: uuid::Uuid::new_v4().to_string(),
+        seq: 0,
+        ts: humantime::format_rfc3339_millis(SystemTime::now()).to_string(),
+        actor: crate::log::envelope::Actor {
+            role: crate::log::envelope::Role::Machine,
+            instance: None,
+            principal: None,
+        },
+        event_type: event_type.to_string(),
+        thread: None,
+        parent: None,
+        version: 1,
+        cost: None,
+        data: serde_json::json!({ "generation": generation }),
+    }
 }
 
 /// Per-stream live state.
@@ -258,7 +289,13 @@ impl Sessions {
         if state.turn.is_some() {
             return Err(SessionError::TurnInProgress);
         }
+        let generation = handle.generation.clone();
         state.turn = Some(handle);
+        // Sent under the same lock that made the claim, so no observer can see
+        // the slot filled without the signal that filled it.
+        let _ = state
+            .tx
+            .send(transient_turn_envelope(stream, "turn_started", &generation));
         Ok(())
     }
 
@@ -270,8 +307,61 @@ impl Sessions {
     pub fn end_turn(&self, stream: &str) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(state) = inner.get_mut(stream) {
-            state.turn = None;
+            // `take()`, not `= None`: the returned handle is how this knows
+            // whether there was anything to end. `end_turn` is called
+            // unconditionally on several paths, and a spurious `turn_ended`
+            // would tell a client the turn it is watching just finished.
+            if let Some(handle) = state.turn.take() {
+                let _ = state
+                    .tx
+                    .send(transient_turn_envelope(stream, "turn_ended", &handle.generation));
+            }
         }
+    }
+
+    /// Whether a turn is currently claimed for `stream`.
+    ///
+    /// **Live process state, not a log fact** — unlike every other field on the
+    /// instance payload this feeds, it is reconstructed from nothing and
+    /// survives no restart. That is correct: an engine that restarted mid-turn
+    /// has no turn, and reporting `false` is the honest answer rather than a
+    /// gap.
+    ///
+    /// Uses `get`, never `entry`: being asked about a stream must not create a
+    /// `StreamState` for it. `begin_turn` and `broadcast_transient` legitimately
+    /// create one because they are writing, but a read that allocates would grow the
+    /// map by one entry per probe of a nonexistent instance.
+    ///
+    /// This field and the `turn_started`/`turn_ended` transients are two views
+    /// of the same fact, and a client that consumes both owes them a strict
+    /// order: **subscribe BEFORE attaching, never after.** A client that reads
+    /// `turnInProgress: false` from `GET /instances/{id}` and only then opens
+    /// its subscription has left a gap between the read and the subscribe —
+    /// any `turn_started` broadcast in that gap is gone, unseen by anyone, and
+    /// the client renders idle for an entire real turn with no way to notice.
+    /// The reverse order is safe, not merely different: subscribe-then-attach
+    /// can at worst see a `turn_started` land before the attach resolves and
+    /// then read `turnInProgress: true` on top of it — a duplicate `true`,
+    /// harmless — while attach-then-subscribe can drop the only `true` there
+    /// was, which is the bug this whole design exists to remove. The asymmetry
+    /// is the point: these two operations do not commute, and the safe order
+    /// is not the intuitive one, so say it here rather than let a client
+    /// author discover it by reintroducing the defect.
+    ///
+    /// The second hazard is reconnection. `tail_envelopes` ends the live
+    /// stream on `RecvError::Lagged` by design (A-2; see `routes/subscribe.rs`)
+    /// — a client that falls behind is dropped, not caught up. A client that
+    /// reconnects by replaying durable events from its last-seen cursor and
+    /// nothing else has no way to learn a `turn_ended` it missed while
+    /// disconnected, because transients are never written to the log (I-4) —
+    /// they exist only on the live channel, for the moment they're sent. Such
+    /// a client can be stuck reporting "working" forever, having missed the
+    /// one event that would have told it otherwise. Reconnect must re-attach —
+    /// re-open the subscription and re-read `turnInProgress` per the ordering
+    /// above — not merely resume replay from a cursor.
+    pub fn turn_in_progress(&self, stream: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.get(stream).is_some_and(|state| state.turn.is_some())
     }
 
     /// Sends the interrupt signal if a turn is currently claimed for
@@ -524,5 +614,56 @@ mod tests {
         // The old handle's cancel sender was dropped along with the cleared
         // slot, so its receiver observes closure, never a stray `true`.
         assert!(rx1.changed().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_claim_and_its_release_each_broadcast_one_transient() {
+        let (_dir, sessions) = sessions();
+        let mut rx = sessions.subscribe_live("s1");
+
+        let (tx, _keep) = tokio::sync::watch::channel(false);
+        sessions
+            .begin_turn("s1", TurnHandle { cancel: tx, generation: "g1".to_string() })
+            .unwrap();
+
+        let started = rx.try_recv().expect("begin_turn must broadcast");
+        assert_eq!(started.event_type, "turn_started");
+        assert_eq!(started.seq, 0, "I-4: transients are seq 0");
+        assert_eq!(started.data["generation"], "g1");
+
+        sessions.end_turn("s1");
+        let ended = rx.try_recv().expect("end_turn must broadcast");
+        assert_eq!(ended.event_type, "turn_ended");
+        assert_eq!(ended.seq, 0);
+        assert_eq!(ended.data["generation"], "g1");
+    }
+
+    #[tokio::test]
+    async fn end_turn_on_an_unclaimed_stream_broadcasts_nothing() {
+        // end_turn is called unconditionally on paths that may not hold a claim.
+        // A spurious turn_ended would tell a client the turn it is watching just
+        // finished, which is the exact lie this whole design exists to remove.
+        let (_dir, sessions) = sessions();
+        let mut rx = sessions.subscribe_live("s1");
+        sessions.end_turn("s1");
+        assert!(rx.try_recv().is_err(), "no claim, no signal");
+    }
+
+    #[tokio::test]
+    async fn turn_in_progress_tracks_the_claim_and_an_unknown_stream_is_false() {
+        let (_dir, sessions) = sessions();
+        assert!(!sessions.turn_in_progress("s1"), "no turn claimed yet");
+
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let h1 = TurnHandle { cancel: tx, generation: "g1".to_string() };
+        sessions.begin_turn("s1", h1).unwrap();
+        assert!(sessions.turn_in_progress("s1"));
+
+        sessions.end_turn("s1");
+        assert!(!sessions.turn_in_progress("s1"));
+
+        // A stream nothing has ever touched must answer false rather than
+        // creating a StreamState as a side effect of being asked about.
+        assert!(!sessions.turn_in_progress("never-seen"));
     }
 }

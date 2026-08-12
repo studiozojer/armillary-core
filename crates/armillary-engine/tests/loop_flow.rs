@@ -443,10 +443,19 @@ async fn subscriber_sees_echo_then_transients_then_the_durable_assistant_message
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::CREATED);
 
-    // The user echo arrives first, clientKey intact.
-    let (event, data) = sub.next_frame().await;
-    assert_eq!(event, "envelope");
-    let echo: serde_json::Value = serde_json::from_str(&data).unwrap();
+    // `begin_turn` broadcasts a `turn_started` transient before
+    // `session_ops::send` appends the durable echo (Task 2) — filter for the
+    // type under test rather than assume it is the very next frame.
+    let echo = loop {
+        let (event, data) = sub.next_frame().await;
+        assert_eq!(event, "envelope");
+        let json: serde_json::Value = serde_json::from_str(&data).unwrap();
+        if json["type"] == "turn_started" {
+            assert_eq!(json["seq"], 0, "I-4: transients are seq 0");
+            continue;
+        }
+        break json;
+    };
     assert_eq!(echo["type"], "user_message");
     assert_eq!(echo["data"]["clientKey"], "c1");
 
@@ -475,6 +484,151 @@ async fn subscriber_sees_echo_then_transients_then_the_durable_assistant_message
     assert_eq!(
         assistant_message["data"]["generation"],
         generation_seen.expect("at least one transient should have carried a generation")
+    );
+}
+
+// --- (b') the whole-path claim: a live subscriber hears the turn's
+// open/close bracket, and `attach` reports the claim while it is genuinely
+// held ---
+
+/// Task 4, test 1 (brief step 1): proves `begin_turn`/`end_turn`'s
+/// transients (Tasks 1-2) actually reach a subscriber wired through the real
+/// `Sessions` a running server holds — `turn_started` first, the turn's own
+/// work between, `turn_ended` last. Unlike (b) above this reads straight off
+/// `Sessions::subscribe_live` rather than the SSE wire, because the claim is
+/// about `Sessions` broadcasting correctly to any subscriber, and the SSE
+/// framing is already covered by (b).
+#[tokio::test]
+async fn a_subscriber_sees_the_turn_open_and_close_around_its_work() {
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let provider = Arc::new(
+        ScriptedProvider::new(vec!["Hel", "Hello", "Hello there"])
+            .with_pause(Duration::from_millis(20)),
+    );
+    let (addr, sessions) = spawn(&data_dir, provider).await;
+    let client = authed_client();
+    let id = create_instance(&client, addr).await;
+
+    let mut rx = sessions.subscribe_live(&id);
+
+    let response = client
+        .post(format!("http://{addr}/instances/{id}/send"))
+        .json(&serde_json::json!({ "text": "hi", "clientKey": "c1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+
+    let mut seen: Vec<String> = Vec::new();
+    // Bounded: collect until turn_ended or the budget runs out, so a
+    // regression fails as a wrong sequence rather than hanging forever.
+    for _ in 0..200 {
+        match tokio::time::timeout(READ_TIMEOUT, rx.recv()).await {
+            Ok(Ok(ev)) => {
+                let done = ev.event_type == "turn_ended";
+                seen.push(ev.event_type.clone());
+                if done {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    assert_eq!(
+        seen.first().map(String::as_str),
+        Some("turn_started"),
+        "the claim must be the first thing a subscriber hears, got {seen:?}"
+    );
+    // This only proves nothing *collected* comes after `turn_ended` — the
+    // loop above breaks the moment it sees one, so it stops looking rather
+    // than keeps watching and finding nothing follows. The claim that the
+    // release is genuinely last is true (`_end_turn_guard` is declared first
+    // in `run_turn`, so it drops last), just not established by this assertion.
+    assert_eq!(
+        seen.last().map(String::as_str),
+        Some("turn_ended"),
+        "the release must be the last, got {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|t| t == "assistant_message"),
+        "the turn's actual work must sit between them, got {seen:?}"
+    );
+}
+
+/// Task 4, test 2 (scope amendment): the load-bearing claim the design
+/// exists for — a client that attaches mid-turn, never having seen
+/// `turn_started`, still learns the turn is running from `turnInProgress` on
+/// the attach payload; and once the turn ends, a fresh attach reports it
+/// cleared. Goes through the real HTTP `attach` handler (`GET
+/// /instances/{id}`, this file's existing `attach` helper) and asserts on
+/// the wire's own camelCase field name, so the serialization is pinned
+/// end-to-end and not just at `instance_from_first_event`'s unit level.
+///
+/// Held open deterministically: rather than sleeping and hoping the turn is
+/// still running, this subscribes to the same live channel test 1 uses and
+/// waits for the `turn_started` transient before calling `attach` — that
+/// transient is broadcast by `Sessions::begin_turn` under the very lock that
+/// fills the turn slot (see `sessions.rs`), so observing it is proof the
+/// slot is occupied at that instant, not a guess about scheduling. The
+/// scripted provider's multi-fragment pause then gives a wide, deterministic
+/// margin (at least 3 * 40ms of remaining script) for the attach round-trip
+/// to land before the turn can finish. The "after" attach is gated the same
+/// way, off `turn_ended`, so it can only run once the slot has actually
+/// cleared.
+#[tokio::test]
+async fn attach_reports_turn_in_progress_while_a_turn_is_mid_flight_then_clears_it() {
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let provider = Arc::new(
+        ScriptedProvider::new(vec!["a", "ab", "abc", "abcd"])
+            .with_pause(Duration::from_millis(40)),
+    );
+    let (addr, sessions) = spawn(&data_dir, provider).await;
+    let client = authed_client();
+    let id = create_instance(&client, addr).await;
+
+    let mut rx = sessions.subscribe_live(&id);
+
+    let response = client
+        .post(format!("http://{addr}/instances/{id}/send"))
+        .json(&serde_json::json!({ "text": "hi", "clientKey": "c1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let ev = rx.recv().await.unwrap();
+            if ev.event_type == "turn_started" {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for turn_started");
+
+    let mid_flight = attach(&client, addr, &id).await;
+    assert_eq!(
+        mid_flight["instance"]["turnInProgress"], true,
+        "attach must report turnInProgress while the turn is genuinely mid-flight: {mid_flight:?}"
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let ev = rx.recv().await.unwrap();
+            if ev.event_type == "turn_ended" {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for turn_ended");
+
+    let after = attach(&client, addr, &id).await;
+    assert_eq!(
+        after["instance"]["turnInProgress"], false,
+        "attach must report the turn cleared once it has ended: {after:?}"
     );
 }
 
