@@ -443,10 +443,19 @@ async fn subscriber_sees_echo_then_transients_then_the_durable_assistant_message
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::CREATED);
 
-    // The user echo arrives first, clientKey intact.
-    let (event, data) = sub.next_frame().await;
-    assert_eq!(event, "envelope");
-    let echo: serde_json::Value = serde_json::from_str(&data).unwrap();
+    // `begin_turn` broadcasts a `turn_started` transient before
+    // `session_ops::send` appends the durable echo (Task 2) — filter for the
+    // type under test rather than assume it is the very next frame.
+    let echo = loop {
+        let (event, data) = sub.next_frame().await;
+        assert_eq!(event, "envelope");
+        let json: serde_json::Value = serde_json::from_str(&data).unwrap();
+        if json["type"] == "turn_started" {
+            assert_eq!(json["seq"], 0, "I-4: transients are seq 0");
+            continue;
+        }
+        break json;
+    };
     assert_eq!(echo["type"], "user_message");
     assert_eq!(echo["data"]["clientKey"], "c1");
 

@@ -45,6 +45,38 @@ pub struct TurnHandle {
     pub generation: String,
 }
 
+/// One transient turn-lifecycle envelope. I-4: `seq` MUST be 0 and this is
+/// never appended.
+///
+/// `actor.role` is `Role::Machine`, not the operator: this is the harness
+/// stating a fact about the stream's own scheduling, not the operator
+/// speaking. It also sidesteps operator resolution entirely — `begin_turn`
+/// is called before the log has been read and does not know which operator
+/// is attached.
+fn transient_turn_envelope(
+    stream: &str,
+    event_type: &str,
+    generation: &str,
+) -> crate::log::envelope::EventEnvelope {
+    EventEnvelope {
+        stream: stream.to_string(),
+        id: uuid::Uuid::new_v4().to_string(),
+        seq: 0,
+        ts: humantime::format_rfc3339_millis(SystemTime::now()).to_string(),
+        actor: crate::log::envelope::Actor {
+            role: crate::log::envelope::Role::Machine,
+            instance: None,
+            principal: None,
+        },
+        event_type: event_type.to_string(),
+        thread: None,
+        parent: None,
+        version: 1,
+        cost: None,
+        data: serde_json::json!({ "generation": generation }),
+    }
+}
+
 /// Per-stream live state.
 struct StreamState {
     tx: broadcast::Sender<EventEnvelope>,
@@ -258,7 +290,13 @@ impl Sessions {
         if state.turn.is_some() {
             return Err(SessionError::TurnInProgress);
         }
+        let generation = handle.generation.clone();
         state.turn = Some(handle);
+        // Sent under the same lock that made the claim, so no observer can see
+        // the slot filled without the signal that filled it.
+        let _ = state
+            .tx
+            .send(transient_turn_envelope(stream, "turn_started", &generation));
         Ok(())
     }
 
@@ -270,7 +308,15 @@ impl Sessions {
     pub fn end_turn(&self, stream: &str) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(state) = inner.get_mut(stream) {
-            state.turn = None;
+            // `take()`, not `= None`: the returned handle is how this knows
+            // whether there was anything to end. `end_turn` is called
+            // unconditionally on several paths, and a spurious `turn_ended`
+            // would tell a client the turn it is watching just finished.
+            if let Some(handle) = state.turn.take() {
+                let _ = state
+                    .tx
+                    .send(transient_turn_envelope(stream, "turn_ended", &handle.generation));
+            }
         }
     }
 
@@ -541,6 +587,39 @@ mod tests {
         // The old handle's cancel sender was dropped along with the cleared
         // slot, so its receiver observes closure, never a stray `true`.
         assert!(rx1.changed().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_claim_and_its_release_each_broadcast_one_transient() {
+        let (_dir, sessions) = sessions();
+        let mut rx = sessions.subscribe_live("s1");
+
+        let (tx, _keep) = tokio::sync::watch::channel(false);
+        sessions
+            .begin_turn("s1", TurnHandle { cancel: tx, generation: "g1".to_string() })
+            .unwrap();
+
+        let started = rx.try_recv().expect("begin_turn must broadcast");
+        assert_eq!(started.event_type, "turn_started");
+        assert_eq!(started.seq, 0, "I-4: transients are seq 0");
+        assert_eq!(started.data["generation"], "g1");
+
+        sessions.end_turn("s1");
+        let ended = rx.try_recv().expect("end_turn must broadcast");
+        assert_eq!(ended.event_type, "turn_ended");
+        assert_eq!(ended.seq, 0);
+        assert_eq!(ended.data["generation"], "g1");
+    }
+
+    #[tokio::test]
+    async fn end_turn_on_an_unclaimed_stream_broadcasts_nothing() {
+        // end_turn is called unconditionally on paths that may not hold a claim.
+        // A spurious turn_ended would tell a client the turn it is watching just
+        // finished, which is the exact lie this whole design exists to remove.
+        let (_dir, sessions) = sessions();
+        let mut rx = sessions.subscribe_live("s1");
+        sessions.end_turn("s1");
+        assert!(rx.try_recv().is_err(), "no claim, no signal");
     }
 
     #[tokio::test]
