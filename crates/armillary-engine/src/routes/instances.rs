@@ -9,8 +9,7 @@
 
 use crate::auth::Caller;
 use crate::log::envelope::{Actor, EventEnvelope, Role};
-use crate::log::store::LogStore;
-use crate::sessions::{NewEvent, SessionError};
+use crate::sessions::{NewEvent, SessionError, Sessions};
 use crate::state::SharedState;
 use crate::blocking;
 use axum::{
@@ -61,6 +60,19 @@ pub struct Instance {
     pub may_write_composition: bool,
     pub model: Option<String>,
     pub archived: bool,
+
+    /// Whether a turn is running for this instance right now.
+    ///
+    /// **The one field here that is not log-derived.** Every sibling is
+    /// reconstructed from events; this is read from `Sessions`' in-memory
+    /// turn slot at request time. An engine restarted mid-turn reports
+    /// `false`, which is correct — that turn died with the process.
+    ///
+    /// Exists so a client can render "working" and keep an interrupt
+    /// affordance up for the WHOLE turn. Before it, the only way to learn a
+    /// turn was running was to attempt a send and be refused with 409
+    /// `turn_in_progress`.
+    pub turn_in_progress: bool,
 }
 
 #[derive(Serialize)]
@@ -91,7 +103,13 @@ fn archived_from_events(events: &[EventEnvelope]) -> bool {
 /// nothing in this codebase writes a stream's first event as anything else,
 /// but the registry being log-derived means this function is the one place
 /// that discipline could quietly break, so it is checked rather than assumed.
-fn instance_from_first_event(stream: &str, first: &EventEnvelope, head_seq: u64, archived: bool) -> Option<Instance> {
+fn instance_from_first_event(
+    stream: &str,
+    first: &EventEnvelope,
+    head_seq: u64,
+    archived: bool,
+    turn_in_progress: bool,
+) -> Option<Instance> {
     if first.event_type != "instance_created" {
         return None;
     }
@@ -130,12 +148,17 @@ fn instance_from_first_event(stream: &str, first: &EventEnvelope, head_seq: u64,
         may_write_composition,
         model,
         archived,
+        turn_in_progress,
     })
 }
 
 /// All filesystem work for a listing: one instance per stream whose first
-/// event is `instance_created`.
-fn list_instances(store: &LogStore) -> Result<Vec<Instance>, SessionError> {
+/// event is `instance_created`. Takes `&Sessions` rather than `&LogStore`
+/// because `turnInProgress` is not log-derived — it comes from `Sessions`'
+/// in-memory turn slot, so this needs the same handle `archived_from_events`
+/// gets its data from the log via.
+fn list_instances(sessions: &Sessions) -> Result<Vec<Instance>, SessionError> {
+    let store = sessions.store();
     let mut out = Vec::new();
     for stream in store.streams()? {
         let events = store.read_from(&stream, 0)?;
@@ -143,7 +166,13 @@ fn list_instances(store: &LogStore) -> Result<Vec<Instance>, SessionError> {
             continue;
         };
         let head_seq = events.last().map(|e| e.seq).unwrap_or(0);
-        match instance_from_first_event(&stream, first, head_seq, archived_from_events(&events)) {
+        match instance_from_first_event(
+            &stream,
+            first,
+            head_seq,
+            archived_from_events(&events),
+            sessions.turn_in_progress(&stream),
+        ) {
             Some(instance) => out.push(instance),
             None => eprintln!(
                 "warning: stream {stream:?}'s first event is {:?}, not instance_created — \
@@ -159,13 +188,22 @@ fn list_instances(store: &LogStore) -> Result<Vec<Instance>, SessionError> {
 /// All filesystem work for one attach: `LogStore::read_from` is the replay
 /// half of A-1's `subscribe(stream, from_seq)`; this just derives the
 /// summary an attaching client needs before it starts consuming events.
-fn attach_info(store: &LogStore, id: &str) -> Result<AttachInfo, SessionError> {
+/// Takes `&Sessions` for the same reason `list_instances` does —
+/// `turnInProgress` lives in process memory, not the log.
+fn attach_info(sessions: &Sessions, id: &str) -> Result<AttachInfo, SessionError> {
+    let store = sessions.store();
     let events = store.read_from(id, 0)?;
     let first = events.first().ok_or(SessionError::UnknownInstance)?;
     let head_seq = events.last().map(|e| e.seq).unwrap_or(0);
     let earliest_seq = first.seq;
-    let instance = instance_from_first_event(id, first, head_seq, archived_from_events(&events))
-        .ok_or(SessionError::UnknownInstance)?;
+    let instance = instance_from_first_event(
+        id,
+        first,
+        head_seq,
+        archived_from_events(&events),
+        sessions.turn_in_progress(id),
+    )
+    .ok_or(SessionError::UnknownInstance)?;
 
     Ok(AttachInfo {
         instance,
@@ -500,7 +538,9 @@ pub async fn create(
     // last_seq stays ev.seq (1, from instance_created) even when a boot event
     // just landed at seq 2: this response describes the instance as CREATED,
     // not its current head. A client that wants the head calls attach.
-    let instance = instance_from_first_event(&id, &ev, ev.seq, false).ok_or((
+    // turnInProgress is `false` by construction — a turn cannot have started
+    // before this response for an instance that did not exist a moment ago.
+    let instance = instance_from_first_event(&id, &ev, ev.seq, false, false).ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
         "log_write_failed".to_string(),
     ))?;
@@ -513,7 +553,7 @@ pub async fn list(
 ) -> Result<Json<Vec<Instance>>, (StatusCode, String)> {
     let sessions = state.sessions.clone();
     let instances =
-        blocking::run(move || list_instances(sessions.store()).map_err(SessionError::into_response))
+        blocking::run(move || list_instances(&sessions).map_err(SessionError::into_response))
             .await?;
     Ok(Json(instances))
 }
@@ -524,7 +564,7 @@ pub async fn attach(
 ) -> Result<Json<AttachInfo>, (StatusCode, String)> {
     let sessions = state.sessions.clone();
     let info = blocking::run(move || {
-        attach_info(sessions.store(), &id).map_err(SessionError::into_response)
+        attach_info(&sessions, &id).map_err(SessionError::into_response)
     })
     .await?;
     Ok(Json(info))
@@ -549,6 +589,27 @@ mod tests {
             cost: None,
             data: serde_json::json!({}),
         }
+    }
+
+    /// An `instance_created` marker that carries `startedAt` —
+    /// `instance_from_first_event` requires it and `marker()` doesn't set it.
+    fn created_event() -> EventEnvelope {
+        let mut e = marker(1, "instance_created");
+        e.data = serde_json::json!({ "startedAt": "2026-08-11T00:00:00Z" });
+        e
+    }
+
+    #[test]
+    fn an_instance_carries_turn_in_progress_and_it_serializes_camel_case() {
+        let first = created_event();
+        let idle = instance_from_first_event("s1", &first, 7, false, false).unwrap();
+        assert!(!idle.turn_in_progress);
+
+        let busy = instance_from_first_event("s1", &first, 7, false, true).unwrap();
+        assert!(busy.turn_in_progress);
+
+        let json = serde_json::to_value(&busy).unwrap();
+        assert_eq!(json["turnInProgress"], true, "the wire name is camelCase");
     }
 
     #[test]
