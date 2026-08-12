@@ -41,7 +41,6 @@ pub struct NewEvent {
 /// caller can find out which generation is currently in flight for a stream.
 pub struct TurnHandle {
     pub cancel: watch::Sender<bool>,
-    #[allow(dead_code)] // read by callers via a future accessor; not yet needed internally
     pub generation: String,
 }
 
@@ -332,6 +331,34 @@ impl Sessions {
     /// `StreamState` for it. `begin_turn` and `broadcast_transient` legitimately
     /// create one because they are writing, but a read that allocates would grow the
     /// map by one entry per probe of a nonexistent instance.
+    ///
+    /// This field and the `turn_started`/`turn_ended` transients are two views
+    /// of the same fact, and a client that consumes both owes them a strict
+    /// order: **subscribe BEFORE attaching, never after.** A client that reads
+    /// `turnInProgress: false` from `GET /instances/{id}` and only then opens
+    /// its subscription has left a gap between the read and the subscribe —
+    /// any `turn_started` broadcast in that gap is gone, unseen by anyone, and
+    /// the client renders idle for an entire real turn with no way to notice.
+    /// The reverse order is safe, not merely different: subscribe-then-attach
+    /// can at worst see a `turn_started` land before the attach resolves and
+    /// then read `turnInProgress: true` on top of it — a duplicate `true`,
+    /// harmless — while attach-then-subscribe can drop the only `true` there
+    /// was, which is the bug this whole design exists to remove. The asymmetry
+    /// is the point: these two operations do not commute, and the safe order
+    /// is not the intuitive one, so say it here rather than let a client
+    /// author discover it by reintroducing the defect.
+    ///
+    /// The second hazard is reconnection. `tail_envelopes` ends the live
+    /// stream on `RecvError::Lagged` by design (A-2; see `routes/subscribe.rs`)
+    /// — a client that falls behind is dropped, not caught up. A client that
+    /// reconnects by replaying durable events from its last-seen cursor and
+    /// nothing else has no way to learn a `turn_ended` it missed while
+    /// disconnected, because transients are never written to the log (I-4) —
+    /// they exist only on the live channel, for the moment they're sent. Such
+    /// a client can be stuck reporting "working" forever, having missed the
+    /// one event that would have told it otherwise. Reconnect must re-attach —
+    /// re-open the subscription and re-read `turnInProgress` per the ordering
+    /// above — not merely resume replay from a cursor.
     pub fn turn_in_progress(&self, stream: &str) -> bool {
         let inner = self.inner.lock().unwrap();
         inner.get(stream).is_some_and(|state| state.turn.is_some())

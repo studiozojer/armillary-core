@@ -5,7 +5,9 @@
 //! events. There is no separate table an instance could be created in and
 //! then missing from, or vice versa — the log is the only place an instance
 //! is recorded, per this repo's standing rule that the log is the truth and
-//! everything else is a projection over it.
+//! everything else is a projection over it — with exactly one exception,
+//! `turnInProgress`, which is live process state rather than a log fact; see
+//! its field doc on `Instance` for what that means and why.
 
 use crate::auth::Caller;
 use crate::log::envelope::{Actor, EventEnvelope, Role};

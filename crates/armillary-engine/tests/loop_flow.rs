@@ -523,7 +523,7 @@ async fn a_subscriber_sees_the_turn_open_and_close_around_its_work() {
     // Bounded: collect until turn_ended or the budget runs out, so a
     // regression fails as a wrong sequence rather than hanging forever.
     for _ in 0..200 {
-        match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+        match tokio::time::timeout(READ_TIMEOUT, rx.recv()).await {
             Ok(Ok(ev)) => {
                 let done = ev.event_type == "turn_ended";
                 seen.push(ev.event_type.clone());
@@ -540,6 +540,11 @@ async fn a_subscriber_sees_the_turn_open_and_close_around_its_work() {
         Some("turn_started"),
         "the claim must be the first thing a subscriber hears, got {seen:?}"
     );
+    // This only proves nothing *collected* comes after `turn_ended` — the
+    // loop above breaks the moment it sees one, so it stops looking rather
+    // than keeps watching and finding nothing follows. The claim that the
+    // release is genuinely last is true (`_end_turn_guard` is declared first
+    // in `run_turn`, so it drops last), just not established by this assertion.
     assert_eq!(
         seen.last().map(String::as_str),
         Some("turn_ended"),
