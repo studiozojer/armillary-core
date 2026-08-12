@@ -274,6 +274,23 @@ impl Sessions {
         }
     }
 
+    /// Whether a turn is currently claimed for `stream`.
+    ///
+    /// **Live process state, not a log fact** — unlike every other field on the
+    /// instance payload this feeds, it is reconstructed from nothing and
+    /// survives no restart. That is correct: an engine that restarted mid-turn
+    /// has no turn, and reporting `false` is the honest answer rather than a
+    /// gap.
+    ///
+    /// Uses `get`, never `entry`: being asked about a stream must not create a
+    /// `StreamState` for it. `begin_turn` and `broadcast_transient` legitimately
+    /// create one because they are writing, but a read that allocates would grow the
+    /// map by one entry per probe of a nonexistent instance.
+    pub fn turn_in_progress(&self, stream: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.get(stream).is_some_and(|state| state.turn.is_some())
+    }
+
     /// Sends the interrupt signal if a turn is currently claimed for
     /// `stream`; otherwise does nothing. Always safe to call — the route
     /// this backs returns 204 either way (interrupt is idempotent).
@@ -524,5 +541,23 @@ mod tests {
         // The old handle's cancel sender was dropped along with the cleared
         // slot, so its receiver observes closure, never a stray `true`.
         assert!(rx1.changed().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn turn_in_progress_tracks_the_claim_and_an_unknown_stream_is_false() {
+        let (_dir, sessions) = sessions();
+        assert!(!sessions.turn_in_progress("s1"), "no turn claimed yet");
+
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let h1 = TurnHandle { cancel: tx, generation: "g1".to_string() };
+        sessions.begin_turn("s1", h1).unwrap();
+        assert!(sessions.turn_in_progress("s1"));
+
+        sessions.end_turn("s1");
+        assert!(!sessions.turn_in_progress("s1"));
+
+        // A stream nothing has ever touched must answer false rather than
+        // creating a StreamState as a side effect of being asked about.
+        assert!(!sessions.turn_in_progress("never-seen"));
     }
 }
