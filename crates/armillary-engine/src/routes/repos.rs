@@ -355,18 +355,19 @@ pub async fn fetch_one(
 }
 
 /// `POST /repos/{name}/pull` — `git merge --ff-only @{u}` on one repo,
-/// returning its state AFTER the attempt. Gated on `sync`, same as fetch:
-/// pull can only ever fast-forward (never merge, never `--force`), so it is
-/// the same authority tier as fetch, not push's.
+/// falling through to `git merge --no-edit @{u}` when fast-forward refuses
+/// (a diverged branch). Gated on `sync`, same as fetch.
 ///
-/// **A dirty working tree is refused before `git merge` ever runs**, not
-/// left for git to catch. `git merge --ff-only` only refuses when the
-/// incoming commits actually conflict with the uncommitted change; an
-/// uncommitted edit to a file the remote never touched would sail through a
-/// bare `--ff-only` call, silently carrying someone's in-progress edit
-/// forward under a commit that never saw it. The explicit `is_dirty` check
-/// closes that gap by refusing on ANY uncommitted change, not just a
-/// conflicting one.
+/// The `--ff-only` attempt still runs first — on a clean behind-only branch
+/// it succeeds instantly at zero cost. On a diverged branch the merge creates
+/// a merge commit; on a conflict the merge is aborted and the response
+/// carries `action_error.kind = "merge-conflict"`.
+///
+/// **A dirty working tree is refused before either merge runs** — the
+/// `is_dirty` check runs first, same as before. `git merge --ff-only` refuses
+/// only when incoming commits conflict with uncommitted changes; an uncommitted
+/// edit to an untouched file sails through. The explicit `is_dirty` check
+/// closes that gap by refusing on ANY uncommitted change.
 pub async fn pull(
     State(state): State<SharedState>,
     caller: Caller,

@@ -652,6 +652,26 @@ pub async fn pull_ff(repo: &Path, timeout: Duration) -> Result<(), GitError> {
     )
 }
 
+/// `git merge --no-edit {merge_arg}`.
+///
+/// A plain merge — no `--ff-only`, no `--commit` (the merge commit is
+/// created by git automatically; `--no-edit` suppresses the editor).
+/// The caller wraps this inside the write lock and guards the dirty-tree
+/// check, same as `pull_ff`.
+///
+/// A nonzero exit (typically a conflict) is an `Err(GitError::Failed(…))`.
+/// The caller must `git merge --abort` to leave the working tree clean.
+///
+/// `merge_arg` is `@{u}` in production — the same upstream reference
+/// `pull_ff` uses — but it is a plain `&str` rather than hardcoded so
+/// the test can merge an arbitrary branch.
+pub async fn merge(repo: &Path, timeout: Duration, merge_arg: &str) -> Result<(), GitError> {
+    require_ok(
+        run_git(repo, &["merge", "--no-edit", merge_arg], timeout).await?,
+        "git merge",
+    )
+}
+
 /// Reject a request-derived value that git would read as a flag.
 ///
 /// Argv already defeats the shell — there is no string for a metacharacter to
@@ -1607,5 +1627,33 @@ mod tests {
         // Nothing staged, nothing committed ever: `git commit` exits nonzero.
         let err = super::commit(repo, "message", DEFAULT_TIMEOUT).await.unwrap_err();
         assert!(matches!(err, GitError::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn merge_succeeds_on_a_diverged_branch() {
+        let (_remote, clone) = remote_and_clone();
+        git_sync(&clone, &["checkout", "-b", "feat"]);
+        commit(&clone, "feat.md", "feat");
+        git_sync(&clone, &["checkout", "main"]);
+        commit(&clone, "main.md", "main");
+        let result = super::merge(&clone, DEFAULT_TIMEOUT, "feat").await;
+        assert!(result.is_ok(), "merge should succeed: {:?}", result);
+        let msg = crate::testgit::last_message(&clone);
+        assert!(msg.contains("Merge"), "merge should create a merge commit; got {msg:?}");
+    }
+
+    #[tokio::test]
+    async fn merge_refuses_on_a_conflict() {
+        let (_remote, clone) = remote_and_clone();
+        git_sync(&clone, &["checkout", "-b", "left"]);
+        std::fs::write(clone.join("seed.md"), "left change\n").unwrap();
+        git_sync(&clone, &["add", "seed.md"]);
+        git_sync(&clone, &["commit", "-m", "left"]);
+        git_sync(&clone, &["checkout", "main"]);
+        std::fs::write(clone.join("seed.md"), "right change\n").unwrap();
+        git_sync(&clone, &["add", "seed.md"]);
+        git_sync(&clone, &["commit", "-m", "right"]);
+        let result = super::merge(&clone, DEFAULT_TIMEOUT, "left").await;
+        assert!(result.is_err(), "merge should fail on conflict");
     }
 }
