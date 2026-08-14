@@ -45,6 +45,7 @@ pub const DURABLE_TYPES: &[&str] = &[
     // context (see projection.rs's arm).
     "instance_archived",
     "instance_unarchived",
+    "instance_renamed",
 ];
 
 /// Who REQUESTED an action, when that differs from what performed it.

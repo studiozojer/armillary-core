@@ -178,7 +178,20 @@ impl Sessions {
     /// The lock is held for the whole operation (read current head, write,
     /// broadcast) — see the struct doc for why a coarse lock is fine here.
     pub fn append(&self, stream: &str, partial: NewEvent) -> Result<EventEnvelope, SessionError> {
-        self.append_inner(stream, partial, None)
+        self.append_inner(stream, partial, None, None)
+    }
+
+    /// Append an event with an explicit `thread` field — the daemon's
+    /// mechanism for writing events into a stream without them appearing in
+    /// the model's context (the projection filters `daemon-*` threads). Every
+    /// other caller uses `append`, which sets `thread: None`.
+    pub fn append_threaded(
+        &self,
+        stream: &str,
+        partial: NewEvent,
+        thread: &str,
+    ) -> Result<EventEnvelope, SessionError> {
+        self.append_inner(stream, partial, None, Some(thread.to_string()))
     }
 
     /// Append an event that belongs to another event — a tool call or its
@@ -197,7 +210,7 @@ impl Sessions {
         parent: &str,
         partial: NewEvent,
     ) -> Result<EventEnvelope, SessionError> {
-        self.append_inner(stream, partial, Some(parent.to_string()))
+        self.append_inner(stream, partial, Some(parent.to_string()), None)
     }
 
     fn append_inner(
@@ -205,6 +218,7 @@ impl Sessions {
         stream: &str,
         partial: NewEvent,
         parent: Option<String>,
+        thread: Option<String>,
     ) -> Result<EventEnvelope, SessionError> {
         // Everything through here is durable by construction — `seq` is
         // `head + 1`, never 0 — so its type belongs on the durable list. The
@@ -231,7 +245,7 @@ impl Sessions {
             ts: humantime::format_rfc3339_millis(SystemTime::now()).to_string(),
             actor: partial.actor,
             event_type: partial.event_type,
-            thread: None,
+            thread,
             parent,
             version: 1,
             cost: None,

@@ -224,6 +224,7 @@ const HANDLED_TYPES: &[&str] = &[
     "repo_committed",
     "instance_archived",
     "instance_unarchived",
+    "instance_renamed",
 ];
 
 /// Resolve a boot event's `data.path` under `root`, through the same guard
@@ -560,6 +561,15 @@ fn text_field(data: &serde_json::Value, key: &str) -> String {
         .to_string()
 }
 
+/// Events whose `thread` field starts with `daemon-` are daemon-owned
+/// projections — they live in the log for durability and daemon-fold
+/// consumption but MUST NOT appear in the model's context window.
+fn is_daemon_event(event: &EventEnvelope) -> bool {
+    event.thread.as_ref()
+        .map(|t| t.starts_with("daemon-"))
+        .unwrap_or(false)
+}
+
 /// P-1: the context window is a projection of the log. P-3: total over
 /// `DURABLE_TYPES` — see the module doc for what "total" means when the
 /// type tag is a `String`, not a closed enum.
@@ -683,6 +693,10 @@ pub fn project_context(
         if evicted.contains(ev.id.as_str()) {
             // P-1: evicted, not deleted — the event still lives in the log,
             // it is simply absent from this particular projection.
+            continue;
+        }
+
+        if is_daemon_event(ev) {
             continue;
         }
 
@@ -894,6 +908,12 @@ pub fn project_context(
             // catch-all: handled-by-skipping is still handled (P-3), and the
             // catch-all renders "[unhandled event type: …]" into the prompt.
             "instance_archived" | "instance_unarchived" => {}
+
+            // Daemon-owned events (thread: "daemon-*"). Durable, replayed,
+            // but MUST NOT appear in the model's context window. Filtered by
+            // thread prefix, not by type — a daemon may emit multiple event
+            // types and one rule handles all of them.
+            "instance_renamed" => {}
 
             // Never silent (P-3): visible in the transcript rather than
             // dropped, so a gap in coverage shows up where a human or the
@@ -1808,6 +1828,7 @@ mod tests {
                 "repo_committed" => json!({ "repo": "r", "result": "ok", "before": "a", "after": "b", "subject": "s", "files": 2 }),
                 "instance_archived" => json!({}),
                 "instance_unarchived" => json!({}),
+                "instance_renamed" => json!({"title": "Test session", "previous_title": null}),
                 other => panic!("test fixture missing a data payload for durable type {other}"),
             };
             events.push(ev(seq, &id, t, data));
