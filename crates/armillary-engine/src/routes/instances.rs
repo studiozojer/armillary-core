@@ -75,6 +75,11 @@ pub struct Instance {
     /// turn was running was to attempt a send and be refused with 409
     /// `turn_in_progress`.
     pub turn_in_progress: bool,
+
+    /// The instance's current title, from the most recent `instance_renamed`
+    /// event. `None` when the title daemon has never run. Log-derived like
+    /// `archived` — read from events, never mutated directly.
+    pub title: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -110,6 +115,7 @@ fn instance_from_first_event(
     first: &EventEnvelope,
     head_seq: u64,
     archived: bool,
+    title: Option<String>,
     turn_in_progress: bool,
 ) -> Option<Instance> {
     if first.event_type != "instance_created" {
@@ -151,6 +157,7 @@ fn instance_from_first_event(
         model,
         archived,
         turn_in_progress,
+        title,
     })
 }
 
@@ -173,6 +180,7 @@ fn list_instances(sessions: &Sessions) -> Result<Vec<Instance>, SessionError> {
             first,
             head_seq,
             archived_from_events(&events),
+            crate::loop_::title_from_events(&events),
             sessions.turn_in_progress(&stream),
         ) {
             Some(instance) => out.push(instance),
@@ -203,6 +211,7 @@ fn attach_info(sessions: &Sessions, id: &str) -> Result<AttachInfo, SessionError
         first,
         head_seq,
         archived_from_events(&events),
+        crate::loop_::title_from_events(&events),
         sessions.turn_in_progress(id),
     )
     .ok_or(SessionError::UnknownInstance)?;
@@ -542,7 +551,7 @@ pub async fn create(
     // not its current head. A client that wants the head calls attach.
     // turnInProgress is `false` by construction — a turn cannot have started
     // before this response for an instance that did not exist a moment ago.
-    let instance = instance_from_first_event(&id, &ev, ev.seq, false, false).ok_or((
+    let instance = instance_from_first_event(&id, &ev, ev.seq, false, None, false).ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
         "log_write_failed".to_string(),
     ))?;
@@ -604,10 +613,10 @@ mod tests {
     #[test]
     fn an_instance_carries_turn_in_progress_and_it_serializes_camel_case() {
         let first = created_event();
-        let idle = instance_from_first_event("s1", &first, 7, false, false).unwrap();
+        let idle = instance_from_first_event("s1", &first, 7, false, None, false).unwrap();
         assert!(!idle.turn_in_progress);
 
-        let busy = instance_from_first_event("s1", &first, 7, false, true).unwrap();
+        let busy = instance_from_first_event("s1", &first, 7, false, None, true).unwrap();
         assert!(busy.turn_in_progress);
 
         let json = serde_json::to_value(&busy).unwrap();

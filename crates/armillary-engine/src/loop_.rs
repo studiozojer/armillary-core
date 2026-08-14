@@ -50,7 +50,7 @@ async fn read_all(sessions: &Arc<Sessions>, stream: &str) -> io::Result<Vec<Even
     spawn_blocking_io(move || sessions.store().read_from(&stream, 0)).await
 }
 
-async fn append_blocking(
+pub(crate) async fn append_blocking(
     sessions: &Arc<Sessions>,
     stream: &str,
     ev: NewEvent,
@@ -122,6 +122,21 @@ pub fn may_write_composition(events: &[EventEnvelope]) -> bool {
 /// and same defaulting discipline as `may_write_composition` above, for
 /// the same reason: the registry is log-derived, so the first event is the
 /// only place either answer lives.
+/// The instance's current title, from the most recent `instance_renamed`
+/// event in its log. `None` when the daemon has never run. Same shape as
+/// `archived_from_events` in instances.rs: scan rearward, take the first
+/// match, stop.
+pub fn title_from_events(events: &[EventEnvelope]) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .find(|e| e.event_type == "instance_renamed")
+        .and_then(|e| e.data.get("title"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 pub fn model_for(events: &[EventEnvelope]) -> Option<String> {
     events
         .iter()
@@ -520,6 +535,8 @@ pub async fn run_turn(
     // only caller and it always has an authenticated `Caller` — `None` is
     // therefore the shape of a turn nobody asked for, and holds nothing.
     let principal = caller.map(|name| ActorPrincipal { name });
+
+    crate::daemon::daemon_turn(&state, &stream, &operator, &model, &events).await;
 
     // Text produced by rounds already finished. The provider restarts its own
     // accumulator on every call, so without this the phone's bubble would jump
@@ -1709,7 +1726,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(req.tools.iter().map(|t| t.name.to_string()).collect());
-            (self.between)();
+            // Only fire `between` on operator rounds (non-empty tools) — the
+            // daemon's empty-tools pre-round must not consume the one-shot
+            // mutation this test exists to exercise.
+            if !req.tools.is_empty() {
+                (self.between)();
+            }
             self.inner.run_turn(req, sink, cancel).await
         }
     }
@@ -1773,10 +1795,11 @@ mod tests {
         )
         .await;
 
+        // [0] is the daemon's empty-tools round; [1] is the first operator round.
         assert!(
-            provider.offered.lock().unwrap()[0].contains(&"commit_repo".to_string()),
+            provider.offered.lock().unwrap()[1].contains(&"commit_repo".to_string()),
             "the verb must have been genuinely OFFERED, or this proves nothing: {:?}",
-            provider.offered.lock().unwrap()[0]
+            provider.offered.lock().unwrap()[1]
         );
 
         let events = sessions.store().read_from(&id, 0).unwrap();
@@ -1796,6 +1819,7 @@ mod tests {
             vec![
                 "instance_created",
                 "user_message",
+                "instance_renamed",
                 "assistant_message",
                 "tool_use",
                 "tool_result",
@@ -2119,6 +2143,12 @@ mod tests {
         // Order is asserted, not incidental: `file_changed` precedes
         // `tool_result` because the effect preceded the report of it, and a
         // replay should read that way.
+        //
+        // UPDATED 2026-08-14: the daemon's empty-tools model call prepends an
+        // empty offer to the offered list and RoundScript returns "forced to
+        // speak" (the no-tools fallback), producing an `instance_renamed`
+        // event. The main loop's first round then consumes the first real
+        // scripted response unchanged.
         let data_dir = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("modules.toml"), "[[repos]]\nname='r'\npath='p'\n")
@@ -2153,6 +2183,7 @@ mod tests {
             vec![
                 "instance_created",
                 "user_message",
+                "instance_renamed",
                 "assistant_message",
                 "tool_use",
                 "file_changed",
@@ -2284,6 +2315,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_tool_call_is_executed_and_answered_and_the_turn_continues() {
+        // UPDATED 2026-08-14: the daemon's empty-tools model call prepends
+        // RoundScript's no-tools fallback ("forced to speak"), producing an
+        // `instance_renamed` event. The main loop's first round then gets
+        // the first real scripted response unchanged.
         let data_dir = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("modules.toml"), "[[repos]]\nname='r'\npath='p'\n")
@@ -2312,6 +2347,7 @@ mod tests {
             vec![
                 "instance_created",
                 "user_message",
+                "instance_renamed",
                 "assistant_message",
                 "tool_use",
                 "tool_result",
