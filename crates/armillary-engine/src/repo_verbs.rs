@@ -18,28 +18,17 @@
 use crate::git::{self, GitError};
 use crate::repos;
 
-/// `git merge --ff-only`'s failure, folded to the typed error that lands in
-/// `RepoState::action_error`.
-///
-/// Distinct from `routes::repos::git_error_response`: that one is for a READ
-/// route, where the failure of the read itself is the response. Here the git
-/// call is the ACT step of a verb whose response is always 200 (or 403/404
-/// from the gate/resolve steps, which never reach this far) — the failure is
-/// data riding inside an otherwise-successful `RepoState`, not a status code.
-///
-/// `pull_ff` touches no network — it is `git merge --ff-only @{u}` against
-/// refs already on disk — so every non-timeout failure IS a fast-forward
-/// refusal (a diverged branch, a missing upstream, anything else `--ff-only`
-/// itself declines) rather than something reachability-shaped. That is a
-/// structural fact about what `pull_ff` can fail at, not a guess: there is no
-/// `"transport"` failure mode for a command that never dials out.
-pub(crate) fn pull_action_error(e: GitError) -> repos::ActionError {
+/// `git merge`'s failure, folded to the typed error. A full merge can produce
+/// a conflict — a different fact from `"not-fast-forwardable"` (the historic
+/// `pull_ff` error, now unreachable since the fallback merge handles the
+/// diverged case). A full merge can produce
+/// a conflict — a different fact from `"not-fast-forwardable"` (which means
+/// `--ff-only` refused; the fallback merge now handles that case).
+pub(crate) fn merge_action_error(e: GitError) -> repos::ActionError {
     match e {
         GitError::Timeout => repos::ActionError { kind: "timeout", message: "timed out".to_string() },
-        GitError::Failed(msg) => repos::ActionError { kind: "not-fast-forwardable", message: msg },
-        // Unreachable in practice: no argument reaching `git::pull_ff` is
-        // request-derived. Carried like `Failed` rather than panicking.
-        GitError::InvalidArg(msg) => repos::ActionError { kind: "not-fast-forwardable", message: msg },
+        GitError::Failed(msg) => repos::ActionError { kind: "merge-conflict", message: msg },
+        GitError::InvalidArg(msg) => repos::ActionError { kind: "merge-conflict", message: msg },
     }
 }
 
@@ -174,7 +163,20 @@ pub(crate) async fn locked_dirty_check_then_pull(abs: &std::path::Path) -> Pulle
             kind: "dirty",
             message: "refusing to pull: the working tree has uncommitted changes".to_string(),
         }),
-        Ok(false) => git::pull_ff(abs, git::DEFAULT_TIMEOUT).await.err().map(pull_action_error),
+        Ok(false) => {
+            match git::pull_ff(abs, git::DEFAULT_TIMEOUT).await {
+                Ok(()) => None,
+                Err(_ff_err) => {
+                    match git::merge(abs, git::DEFAULT_TIMEOUT, "@{u}").await {
+                        Ok(()) => None,
+                        Err(merge_err) => {
+                            let _ = git::run_git(abs, &["merge", "--abort"], git::DEFAULT_TIMEOUT).await;
+                            Some(merge_action_error(merge_err))
+                        }
+                    }
+                }
+            }
+        }
         Err(e) => Some(dirty_check_action_error(e)),
     };
     let after = git::head_sha(abs, git::DEFAULT_TIMEOUT).await.ok().flatten();
@@ -668,5 +670,56 @@ mod tests {
             "{out}"
         );
         assert!(out.starts_with("notes: a line\n\n"), "one blank line, no more: {out}");
+    }
+
+    #[tokio::test]
+    async fn diverged_merge_succeeds_when_ff_only_refuses() {
+        use crate::git::{self, DEFAULT_TIMEOUT};
+        use crate::testgit::{advance_remote, commit, remote_and_clone};
+
+        let (remote, clone_a) = remote_and_clone();
+        advance_remote(&remote);
+        commit(&clone_a, "local.md", "local work");
+        git::fetch(&clone_a, DEFAULT_TIMEOUT).await.unwrap();
+        let pulled = locked_dirty_check_then_pull(&clone_a).await;
+        assert!(pulled.error.is_none(), "diverged merge should succeed: {:?}", pulled.error);
+        assert_ne!(pulled.before, pulled.after, "HEAD must move on a successful merge");
+        let msg = crate::testgit::last_message(&clone_a);
+        assert!(msg.contains("Merge"), "merge should produce a merge commit; got {msg:?}");
+    }
+
+    #[tokio::test]
+    async fn diverged_merge_with_conflict_aborts_and_returns_merge_conflict_error() {
+        use crate::git::{self, DEFAULT_TIMEOUT};
+        use crate::testgit::{advance_remote, git_sync, remote_and_clone};
+
+        let (remote, clone_a) = remote_and_clone();
+        advance_remote(&remote);
+        // advance_remote touches from-elsewhere.md, so touch the SAME file
+        // locally to create a genuine merge conflict.
+        std::fs::write(clone_a.join("from-elsewhere.md"), "local conflicting change\n").unwrap();
+        git_sync(&clone_a, &["add", "from-elsewhere.md"]);
+        git_sync(&clone_a, &["commit", "-m", "local conflicting commit"]);
+        git::fetch(&clone_a, DEFAULT_TIMEOUT).await.unwrap();
+        let pulled = locked_dirty_check_then_pull(&clone_a).await;
+        assert!(pulled.error.is_some(), "conflict should produce an error: {:?}", pulled.error);
+        assert_eq!(pulled.error.as_ref().unwrap().kind, "merge-conflict");
+        assert_eq!(pulled.before, pulled.after, "conflict must not move HEAD");
+        let dirty = git::is_dirty(&clone_a, DEFAULT_TIMEOUT).await.unwrap();
+        assert!(!dirty, "git merge --abort must leave the working tree clean");
+    }
+
+    #[tokio::test]
+    async fn dirty_tree_still_refuses_before_either_merge_runs() {
+        use crate::testgit::{advance_remote, commit, remote_and_clone};
+
+        let (remote, clone_a) = remote_and_clone();
+        advance_remote(&remote);
+        commit(&clone_a, "local.md", "local work");
+        std::fs::write(clone_a.join("untracked.txt"), "dirty\n").unwrap();
+        let pulled = locked_dirty_check_then_pull(&clone_a).await;
+        assert!(pulled.error.is_some(), "dirty tree must refuse");
+        assert_eq!(pulled.error.as_ref().unwrap().kind, "dirty");
+        assert_eq!(pulled.before, pulled.after, "dirty refusal must not move HEAD");
     }
 }

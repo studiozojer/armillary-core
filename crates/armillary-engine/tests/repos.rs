@@ -459,34 +459,34 @@ async fn pull_refuses_a_dirty_repo_and_leaves_the_working_tree_alone() {
 }
 
 #[tokio::test]
-async fn pull_on_a_diverged_branch_reports_not_fast_forwardable() {
-    // pull_ff never touches the network — a diverged branch is a git-side
-    // fast-forward refusal, not a transport failure, and the kind must say so.
+async fn pull_on_a_diverged_branch_merges_and_succeeds() {
+    // A diverged branch now falls through from --ff-only to a plain merge.
+    // Diverged files that don't conflict (different filenames) merge cleanly.
     let (root, remote) = live_workspace_with_sync();
     advance_remote(&remote);
     commit(&root.join("repos/jianyi"), "local-only.md", "mine");
     post_json(&root, "/repos/jianyi/fetch").await;
     let body = post_json(&root, "/repos/jianyi/pull").await;
-    assert_eq!(body["action_error"]["kind"], "not-fast-forwardable");
+    assert!(body["action_error"].is_null(), "diverged merge should succeed, got {:?}", body["action_error"]);
+    assert_eq!(body["position"]["behind"], 0, "behind must be zero after a successful merge");
+    // The remote's file was merged in.
+    assert!(root.join("repos/jianyi/from-elsewhere.md").exists());
 }
 
 #[tokio::test]
-async fn pull_under_a_gone_upstream_reports_not_fast_forwardable_naming_the_upstream() {
-    // The previously unpinned arm (survey 2026-08-06, weakness #3): the
-    // remote branch is deleted and pruned, `@{u}` no longer resolves, and the
-    // merge fails before it begins. The kind stays in the closed vocabulary —
-    // "not-fast-forwardable" is what a shipped client can already render.
-    // Measured writing this test: git's own message is the cryptic
-    // "merge: @{u} - not something we can merge" (C locale), naming nothing —
-    // so the HUMAN-readable half of the answer is the same response's
-    // read-side `position`, which discriminates upstream-gone and names the
-    // branch. The pin is the response as a whole, not the message.
+async fn pull_under_a_gone_upstream_reports_merge_conflict_naming_the_upstream() {
+    // The remote branch is deleted and pruned, `@{u}` no longer resolves.
+    // --ff-only refuses, then `git merge --no-edit @{u}` also fails because
+    // the upstream ref doesn't exist. The merge is aborted and the kind is
+    // "merge-conflict" — the new surface for a failed merge attempt.
+    // The read-side `position` still discriminates upstream-gone and names
+    // the branch, so the full response remains diagnostic.
     let (root, remote) = live_workspace_with_sync();
     git_sync(&remote, &["branch", "-m", "main", "elsewhere"]);
     git_sync(&root.join("repos/jianyi"), &["fetch", "--prune"]);
     let body = post_json(&root, "/repos/jianyi/pull").await;
 
-    assert_eq!(body["action_error"]["kind"], "not-fast-forwardable");
+    assert_eq!(body["action_error"]["kind"], "merge-conflict");
     assert_eq!(body["position"]["kind"], "upstream-gone");
     assert_eq!(body["position"]["upstream"], "origin/main");
 }
