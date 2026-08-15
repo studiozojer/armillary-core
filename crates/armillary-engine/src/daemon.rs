@@ -53,6 +53,7 @@ pub async fn daemon_turn(
     model: &str,
     events: &[EventEnvelope],
 ) -> Option<String> {
+    eprintln!("daemon_title: starting stream={stream:?}");
     let prompt = build_title_prompt(events);
     let current_title = title_from_events(events);
 
@@ -77,16 +78,23 @@ pub async fn daemon_turn(
 
     let outcome = match provider.run_turn(req, tx, cancel).await {
         Ok(outcome) => outcome,
-        Err(_) => return None,
+        Err(e) => {
+            eprintln!(
+                "daemon_title: model_call_failed stream={stream:?} error={e:?}"
+            );
+            return None;
+        }
     };
 
     while rx.try_recv().is_ok() {}
 
     let title = outcome.text.trim().to_string();
     if title.is_empty() {
+        eprintln!("daemon_title: empty_title stream={stream:?}");
         return None;
     }
     if current_title.as_deref() == Some(&title) {
+        eprintln!("daemon_title: unchanged stream={stream:?} title={title:?}");
         return None;
     }
 
@@ -106,7 +114,12 @@ pub async fn daemon_turn(
 
     let sessions = &state.sessions;
     match sessions.append_threaded(stream, ev, "daemon-title") {
-        Ok(_) => Some(title),
+        Ok(_) => {
+            eprintln!(
+                "daemon_title: wrote stream={stream:?} title={title:?}"
+            );
+            Some(title)
+        }
         Err(e) => {
             eprintln!(
                 "daemon_title: append_instance_renamed_failed stream={stream:?} error={e:?}"
