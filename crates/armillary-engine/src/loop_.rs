@@ -536,7 +536,10 @@ pub async fn run_turn(
     // therefore the shape of a turn nobody asked for, and holds nothing.
     let principal = caller.map(|name| ActorPrincipal { name });
 
-    crate::daemon::daemon_turn(&state, &stream, &operator, &model, &events).await;
+    let daemon_result = crate::daemon::daemon_turn(&state, &stream, &operator, &model, &events).await;
+    if daemon_result.is_none() {
+        eprintln!("daemon_title: no_title_produced stream={stream:?}");
+    }
 
     // Text produced by rounds already finished. The provider restarts its own
     // accumulator on every call, so without this the phone's bubble would jump
