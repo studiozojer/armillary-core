@@ -5,7 +5,7 @@ use crate::state::SharedState;
 
 const TITLE_DAEMON_WINDOW: usize = 10;
 
-fn build_title_prompt(events: &[EventEnvelope]) -> String {
+fn build_title_prompt(events: &[EventEnvelope], current_title: Option<&str>) -> String {
     let recent: Vec<&EventEnvelope> = events
         .iter()
         .rev()
@@ -34,14 +34,17 @@ fn build_title_prompt(events: &[EventEnvelope]) -> String {
         }
     }
 
+    let current = current_title.unwrap_or("(none yet)");
     format!(
-        "You are a title-generating daemon for an AI work session. Your ONLY job: read the conversation below and return a short, descriptive title (1-6 words) that captures what this session is about.\n\n\
-         Rules:\n\
-         - Be specific, not generic. \"Debugging the auth flow\" not \"Working on code.\"\n\
-         - If the topic shifts, update the title to reflect the new focus.\n\
-         - If you can't determine a topic, return the empty string.\n\
-         - Return ONLY the title as plain text, nothing else.\n\n\
-         Conversation:\n{}",
+        "You are a title-generating daemon for an AI work session. Your job: assess whether this session's title needs updating, and return the title that should be shown.\n\n\
+         The CURRENT title is: {current}\n\n\
+         Read the recent conversation below against that title:\n\
+         - If the conversation continues or confirms the current topic, return the CURRENT title VERBATIM — byte-for-byte unchanged. Do not rephrase it.\n\
+         - If the conversation has shifted to a new topic, return a short, specific new title (1-6 words): \"Debugging the auth flow\" not \"Working on code.\"\n\
+         - Prefer keeping a good existing title over churning on wording.\n\
+         - This session always has a title — if none exists yet, propose one from the conversation rather than returning the empty string.\n\n\
+         Return ONLY the title as plain text, nothing else.\n\n\
+         Recent conversation:\n{}",
         conversation
     )
 }
@@ -101,8 +104,8 @@ pub async fn daemon_turn(
     events: &[EventEnvelope],
 ) -> Option<String> {
     eprintln!("daemon_title: starting stream={stream:?}");
-    let prompt = build_title_prompt(events);
     let current_title = title_from_events(events);
+    let prompt = build_title_prompt(events, current_title.as_deref());
 
     let provider = state.providers.provider_for(model);
 
@@ -158,17 +161,31 @@ pub async fn daemon_turn(
 
     // Disposition decided BEFORE the rename guard, because the pulse records
     // all four outcomes and only one of them also renames.
+    //
+    // Always-strive hardening (review directive 2026-08-19): a blank model
+    // response must NEVER leave a titled session untitled. When a title
+    // already exists and the model returns empty, that empty is a failure,
+    // not a judgment — keep the existing title (recorded "unchanged", so the
+    // next good turn can still correct a genuinely shifted topic). A session
+    // can only be truly untitled when there is *nothing* to title yet, which
+    // is exactly the state the "always propose one" instruction is meant to
+    // exit on its first substantive turn.
     if title.is_empty() {
-        eprintln!("daemon_title: empty_title stream={stream:?}");
-        append_pulse(
-            state,
-            stream,
-            operator,
-            "empty",
-            "",
-            &current_title.unwrap_or_default(),
-            None,
-        );
+        if let Some(existing) = current_title {
+            eprintln!("daemon_title: empty_but_kept stream={stream:?} title={existing:?}");
+            append_pulse(
+                state,
+                stream,
+                operator,
+                "unchanged",
+                &existing,
+                &existing,
+                None,
+            );
+            return Some(existing);
+        }
+        eprintln!("daemon_title: still_untitled stream={stream:?}");
+        append_pulse(state, stream, operator, "empty", "", "", None);
         return None;
     }
     if current_title.as_deref() == Some(&title) {
