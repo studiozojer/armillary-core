@@ -138,5 +138,14 @@
       "type": "object"
     },
     "name": "edit_file"
+  },
+  {
+    "description": "Inspect the daemons attached to this session — background functions the engine runs alongside the conversation, like the title daemon that keeps the session's title current. Returns structured state grouped by daemon: current title, run count, dispositions over time, and recent history. Call this when the operator asks what the daemons are doing, or to check whether a daemon is running, stuck, or erroring.",
+    "input_schema": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "inspect_daemons"
   }
 ]

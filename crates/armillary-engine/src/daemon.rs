@@ -46,6 +46,53 @@ fn build_title_prompt(events: &[EventEnvelope]) -> String {
     )
 }
 
+/// Append the daemon's heartbeat (observability design 2026-08-19 D2): one
+/// `daemon_pulse` per run, WHATEVER the run did — "checked and unchanged" is
+/// a record, not a non-event. Threaded `daemon-title` like the rename, so
+/// the projection's thread filter keeps it out of model context; the
+/// `inspect_daemons` verb reads it back. A failed append is logged and
+/// swallowed: the pulse observes the daemon, it must never fail the daemon.
+///
+/// `token_cost` is deliberately absent for now — `TurnOutcome` does not yet
+/// surface the provider's usage frames, and inventing a number here would be
+/// worse than omitting the field the design already marks optional.
+fn append_pulse(
+    state: &SharedState,
+    stream: &str,
+    operator: &str,
+    disposition: &str,
+    title: &str,
+    previous_title: &str,
+    error: Option<String>,
+) {
+    let mut data = serde_json::json!({
+        "daemon": "title",
+        "disposition": disposition,
+        "title": title,
+        "previous_title": previous_title,
+    });
+    if let Some(e) = error {
+        data["error"] = serde_json::json!(e);
+    }
+    let pulse = NewEvent {
+        actor: Actor {
+            role: Role::Machine,
+            instance: Some(operator.to_string()),
+            principal: None,
+        },
+        event_type: "daemon_pulse".to_string(),
+        data,
+    };
+    match state.sessions.append_threaded(stream, pulse, "daemon-title") {
+        Ok(_) => {
+            eprintln!("daemon_title: pulse stream={stream:?} disposition={disposition}");
+        }
+        Err(e) => {
+            eprintln!("daemon_title: pulse_append_failed stream={stream:?} error={e:?}");
+        }
+    }
+}
+
 pub async fn daemon_turn(
     state: &SharedState,
     stream: &str,
@@ -73,7 +120,16 @@ pub async fn daemon_turn(
         tool_choice: None,
     };
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
+    // The daemon wants the OUTCOME, not the stream — but `run_turn`'s
+    // contract requires a live sink, and a provider sends every fragment into
+    // it with a blocking `send().await`. A bounded channel nobody drains
+    // until after `run_turn` returns is therefore a deadlock on the second
+    // fragment (found via `conformance_log`'s scripted turn, which streams
+    // two): the drain must run CONCURRENTLY with the turn. The task ends by
+    // itself — `run_turn` takes `tx` by value, so the channel closes when
+    // the provider returns.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let cancel = tokio::sync::watch::channel(false).1;
 
     let outcome = match provider.run_turn(req, tx, cancel).await {
@@ -82,22 +138,48 @@ pub async fn daemon_turn(
             eprintln!(
                 "daemon_title: model_call_failed stream={stream:?} error={e:?}"
             );
+            // The heartbeat fires on failure too — an errored run that left
+            // no pulse would be indistinguishable from a run that never
+            // happened, which is the exact gap this event exists to close.
+            append_pulse(
+                state,
+                stream,
+                operator,
+                "error",
+                "",
+                &current_title.clone().unwrap_or_default(),
+                Some(format!("{e:?}")),
+            );
             return None;
         }
     };
 
-    while rx.try_recv().is_ok() {}
-
     let title = outcome.text.trim().to_string();
+
+    // Disposition decided BEFORE the rename guard, because the pulse records
+    // all four outcomes and only one of them also renames.
     if title.is_empty() {
         eprintln!("daemon_title: empty_title stream={stream:?}");
+        append_pulse(
+            state,
+            stream,
+            operator,
+            "empty",
+            "",
+            &current_title.unwrap_or_default(),
+            None,
+        );
         return None;
     }
     if current_title.as_deref() == Some(&title) {
         eprintln!("daemon_title: unchanged stream={stream:?} title={title:?}");
+        append_pulse(state, stream, operator, "unchanged", &title, &title, None);
         return None;
     }
 
+    // Kept as an Option: `instance_renamed` has always serialized a missing
+    // previous title as `null`, and the pulse (a new event) flattens it to ""
+    // without touching the older event's wire shape.
     let previous_title = current_title;
     let ev = NewEvent {
         actor: Actor {
@@ -117,6 +199,15 @@ pub async fn daemon_turn(
         Ok(_) => {
             eprintln!(
                 "daemon_title: wrote stream={stream:?} title={title:?}"
+            );
+            append_pulse(
+                state,
+                stream,
+                operator,
+                "updated",
+                &title,
+                previous_title.as_deref().unwrap_or_default(),
+                None,
             );
             Some(title)
         }

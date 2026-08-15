@@ -798,6 +798,12 @@ pub async fn run_turn(
                     operator: operator.clone(),
                     model: model.clone(),
                 },
+                // The log as of the turn's start — already read once above
+                // and paid for; `inspect_daemons` is the one body that reads
+                // it. Events this turn appends (including this turn's own
+                // pulse) land after the snapshot, which is the honest answer
+                // to "what had the daemons done when this turn began".
+                instance_events: Some(events.clone()),
             };
             // The second doorway, and the one that has to hold on its own.
             // `dispatch` searches `repo_tools()` too, so a git verb resolves
@@ -1823,6 +1829,7 @@ mod tests {
                 "instance_created",
                 "user_message",
                 "instance_renamed",
+                "daemon_pulse",
                 "assistant_message",
                 "tool_use",
                 "tool_result",
@@ -2187,6 +2194,7 @@ mod tests {
                 "instance_created",
                 "user_message",
                 "instance_renamed",
+                "daemon_pulse",
                 "assistant_message",
                 "tool_use",
                 "file_changed",
@@ -2351,6 +2359,7 @@ mod tests {
                 "instance_created",
                 "user_message",
                 "instance_renamed",
+                "daemon_pulse",
                 "assistant_message",
                 "tool_use",
                 "tool_result",

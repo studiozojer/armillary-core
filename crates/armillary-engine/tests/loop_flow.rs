@@ -473,6 +473,12 @@ async fn subscriber_sees_echo_then_transients_then_the_durable_assistant_message
             generation_seen = Some(json["data"]["generation"].as_str().unwrap().to_string());
             continue;
         }
+        // The title daemon's durable events (thread "daemon-*") ride the
+        // same stream before the operator's rounds — they are not the type
+        // under test here, and the SSE contract deliberately carries them.
+        if json["thread"].as_str().is_some_and(|t| t.starts_with("daemon-")) {
+            continue;
+        }
         assert_eq!(json["type"], "assistant_message", "no other durable type expected here");
         break json;
     };
@@ -651,6 +657,24 @@ async fn interrupt_mid_script_records_interrupt_then_a_partial_assistant_message
         .await
         .unwrap();
 
+    // The title daemon's own provider call runs the SAME paused script to
+    // completion before the operator's round begins, and its cancel channel
+    // is private — an interrupt landing during the daemon's run would leave
+    // the operator's round cancelled before its first fragment, recording an
+    // EMPTY partial. Wait for the daemon's pulse (its always-written last
+    // event) so the sleep below lands mid-way through the operator's script.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let events = sessions.store().read_from(&id, 0).unwrap();
+            if events.iter().any(|e| e.event_type == "daemon_pulse") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the daemon's pulse never landed");
+
     // Give the turn time to emit its first snapshot, then interrupt while
     // still mid-script (pauses are 50ms; fragment 4 of 4 is well past this).
     tokio::time::sleep(Duration::from_millis(30)).await;
@@ -803,8 +827,10 @@ async fn crash_resume_the_log_survives_dropping_and_rebuilding_the_whole_process
 
     let head_before = sessions.store().head_seq(&id).unwrap();
     assert_eq!(
-        head_before, 4,
-        "instance_created, composition, user_message, assistant_message"
+        head_before, 6,
+        "instance_created, composition, user_message, instance_renamed, \
+         daemon_pulse, assistant_message — the title daemon's two events \
+         are part of the log this test proves durable"
     );
 
     // "Crash": drop every in-process handle this test holds onto the first
@@ -821,13 +847,16 @@ async fn crash_resume_the_log_survives_dropping_and_rebuilding_the_whole_process
     assert_eq!(fresh_sessions.store().head_seq(&id).unwrap(), head_before, "headSeq survives the rebuild");
 
     let replayed = fresh_sessions.store().read_from(&id, 0).unwrap();
-    assert_eq!(replayed.len(), 4);
+    assert_eq!(replayed.len(), 6);
     assert_eq!(replayed[0].event_type, "instance_created");
     assert_eq!(replayed[1].event_type, "composition");
     assert_eq!(replayed[2].event_type, "user_message");
     assert_eq!(replayed[2].data["text"], "hello");
-    assert_eq!(replayed[3].event_type, "assistant_message");
-    assert_eq!(replayed[3].data["text"], "done");
+    assert_eq!(replayed[3].event_type, "instance_renamed");
+    assert_eq!(replayed[4].event_type, "daemon_pulse");
+    assert_eq!(replayed[4].data["disposition"], "updated");
+    assert_eq!(replayed[5].event_type, "assistant_message");
+    assert_eq!(replayed[5].data["text"], "done");
 
     // And over HTTP, via a brand-new server built on the SAME data dir and a
     // brand-new AppState — attach reports the identical headSeq.
@@ -1229,7 +1258,7 @@ async fn archive_flips_the_listing_flag_and_bars_nothing() {
 /// in its offer order. Spelled out rather than counted so a test failure names
 /// which one went missing, and so a new base tool has to be admitted here on
 /// purpose.
-const BASE_TOOLS: [&str; 7] = [
+const BASE_TOOLS: [&str; 8] = [
     "get_composition",
     "list_directory",
     "read_file",
@@ -1237,6 +1266,7 @@ const BASE_TOOLS: [&str; 7] = [
     "search",
     "write_file",
     "edit_file",
+    "inspect_daemons",
 ];
 
 /// A registry directory holding one principal — the same `test-client` every
@@ -1329,10 +1359,17 @@ impl ModelProvider for OfferProbe {
         _sink: mpsc::Sender<String>,
         _cancel: watch::Receiver<bool>,
     ) -> Result<TurnOutcome, ProviderError> {
-        self.offered
-            .lock()
-            .unwrap()
-            .push(req.tools.iter().map(|t| t.name.to_string()).collect());
+        // The title daemon's pre-round offers no tools at all — it is a
+        // model call but not an OFFER, so recording it would shift every
+        // operator round's index by one per turn. An operator round always
+        // carries at least the base seven, so empty-tools is an unambiguous
+        // discriminator.
+        if !req.tools.is_empty() {
+            self.offered
+                .lock()
+                .unwrap()
+                .push(req.tools.iter().map(|t| t.name.to_string()).collect());
+        }
         Ok(TurnOutcome {
             text: "noted".to_string(),
             blocks: vec![ContentBlock::text("noted")],
@@ -1385,9 +1422,13 @@ async fn consent_a_grant_and_the_manifest_agreeing_puts_the_verb_on_the_turn() {
     for base in BASE_TOOLS {
         assert!(offered.contains(&base.to_string()), "{base} left the base set: {offered:?}");
     }
-    // E-4: the git verb lands AFTER the base seven, never interleaved, so the
+    // E-4: the git verb lands AFTER the base set, never interleaved, so the
     // cached prompt prefix is the same bytes whether or not a turn is granted.
-    assert_eq!(offered[..7], BASE_TOOLS.map(str::to_string), "{offered:?}");
+    assert_eq!(
+        offered[..BASE_TOOLS.len()],
+        BASE_TOOLS.map(str::to_string),
+        "{offered:?}"
+    );
 }
 
 #[tokio::test]
@@ -1508,6 +1549,19 @@ impl ModelProvider for WriteThenSpeak {
         _sink: mpsc::Sender<String>,
         _cancel: watch::Receiver<bool>,
     ) -> Result<TurnOutcome, ProviderError> {
+        // The title daemon's pre-round offers no tools — a model can only
+        // call what a round offers, so answer it with prose and keep it out
+        // of the round count. Without this, the daemon consumes round 1 and
+        // the scripted tool_use never reaches the operator's turn.
+        if _req.tools.is_empty() {
+            return Ok(TurnOutcome {
+                text: "a title".to_string(),
+                blocks: vec![ContentBlock::text("a title")],
+                stop_reason: Some("end_turn".to_string()),
+                stopped: false,
+                model: "write-then-speak".to_string(),
+            });
+        }
         let round = {
             let mut calls = self.calls.lock().unwrap();
             *calls += 1;

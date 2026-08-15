@@ -46,6 +46,12 @@ pub const DURABLE_TYPES: &[&str] = &[
     "instance_archived",
     "instance_unarchived",
     "instance_renamed",
+    // The daemon's heartbeat (observability design, 2026-08-19 D2): written
+    // after EVERY daemon run, whether or not anything changed — "checked and
+    // unchanged" is a record, not a non-event. Threaded `daemon-*`, so the
+    // projection's thread filter keeps it out of model context; the
+    // `inspect_daemons` verb is the surface that reads it back.
+    "daemon_pulse",
 ];
 
 /// Who REQUESTED an action, when that differs from what performed it.

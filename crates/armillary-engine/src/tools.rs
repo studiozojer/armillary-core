@@ -411,6 +411,28 @@ pub fn registry() -> &'static [Tool] {
                     )
                 },
             },
+            Tool {
+                def: ToolDef {
+                    name: "inspect_daemons",
+                    description: "Inspect the daemons attached to this session — background \
+                                  functions the engine runs alongside the conversation, like \
+                                  the title daemon that keeps the session's title current. \
+                                  Returns structured state grouped by daemon: current title, \
+                                  run count, dispositions over time, and recent history. Call \
+                                  this when the operator asks what the daemons are doing, or \
+                                  to check whether a daemon is running, stuck, or erroring."
+                        .to_string(),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                    }),
+                },
+                run: |_input, ctx| {
+                    inspect_daemons(ctx.instance_events.as_deref().unwrap_or(&[]))
+                        .map(ToolOutcome::text)
+                },
+            },
         ]
     })
 }
@@ -542,6 +564,12 @@ pub struct ToolCtx {
     pub may_write_composition: bool,
     /// Who this turn is, for the one verb that writes an identity down.
     pub turn: TurnIdentity,
+    /// The instance's event log as of the turn's start, for the one verb
+    /// that inspects session state (`inspect_daemons`). `None` everywhere
+    /// else — deliberately `Option`, so the absence is the guard that keeps
+    /// other tool bodies from growing log dependencies, and a fixture test
+    /// can pass `None` without inventing a log.
+    pub instance_events: Option<Vec<crate::log::envelope::EventEnvelope>>,
 }
 
 /// The acting identity of the turn a tool body runs inside.
@@ -855,6 +883,113 @@ fn get_composition(root: &Path) -> Result<String, ToolError> {
 
     serde_json::to_string_pretty(&body)
         .map_err(|e| ToolError::new("composition_unreadable", e.to_string()))
+}
+
+/// The inspect verb (observability design 2026-08-19 D3): a pure read over
+/// the instance's log — filter the `daemon-*` threaded pulses, group by the
+/// pulse's `data.daemon` discriminator, summarize. No model call, no side
+/// effects, and testable with a `Vec<EventEnvelope>` fixture alone.
+///
+/// `instance_renamed` events share the daemon's thread but carry no `daemon`
+/// field, so the group-by skips them by construction: the pulse is the
+/// heartbeat, the rename is the domain event, and only heartbeats count runs.
+fn inspect_daemons(
+    events: &[crate::log::envelope::EventEnvelope],
+) -> Result<String, ToolError> {
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    let mut by_daemon: HashMap<&str, Vec<&crate::log::envelope::EventEnvelope>> = HashMap::new();
+    for ev in events {
+        let daemon_threaded = ev
+            .thread
+            .as_deref()
+            .is_some_and(|t| t.starts_with("daemon-"));
+        if !daemon_threaded || ev.event_type != "daemon_pulse" {
+            continue;
+        }
+        if let Some(name) = ev.data.get("daemon").and_then(|v| v.as_str()) {
+            by_daemon.entry(name).or_default().push(ev);
+        }
+    }
+
+    // Sorted by name so the rendering is deterministic — a HashMap-ordered
+    // answer would differ between identical calls for no reason a model or a
+    // test could see.
+    let mut names: Vec<&&str> = by_daemon.keys().collect();
+    names.sort();
+
+    let mut daemons = Vec::new();
+    for name in names {
+        let mut pulses: Vec<&&crate::log::envelope::EventEnvelope> =
+            by_daemon[*name].iter().collect();
+        pulses.sort_by_key(|e| e.seq);
+
+        let last = pulses.last().expect("group is never empty by construction");
+
+        let mut runs_by_disposition: HashMap<&str, u64> = HashMap::new();
+        for p in &pulses {
+            if let Some(d) = p.data.get("disposition").and_then(|v| v.as_str()) {
+                *runs_by_disposition.entry(d).or_insert(0) += 1;
+            }
+        }
+
+        let recent: Vec<serde_json::Value> = pulses
+            .iter()
+            .rev()
+            .take(5)
+            .map(|p| {
+                let mut j = json!({
+                    "ts": p.ts,
+                    "disposition": p.data.get("disposition"),
+                });
+                if let Some(t) = p.data.get("title").and_then(|v| v.as_str()) {
+                    if !t.is_empty() {
+                        j["title"] = json!(t);
+                    }
+                }
+                if let Some(e) = p.data.get("error") {
+                    j["error"] = e.clone();
+                }
+                j
+            })
+            .collect();
+
+        // The last pulse that carried a non-empty title — an errored or empty
+        // run records "" and must not erase what the daemon last affirmed.
+        let current_title = pulses.iter().rev().find_map(|p| {
+            p.data
+                .get("title")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        });
+
+        // Pulses do not carry `token_cost` yet (TurnOutcome surfaces no usage
+        // frames) — summed here so the day they do, the verb already reports.
+        let total_token_cost: i64 = pulses
+            .iter()
+            .filter_map(|p| p.data.get("token_cost").and_then(|v| v.as_i64()))
+            .sum();
+
+        let mut entry = json!({
+            "daemon": name,
+            "active": true,
+            "total_runs": pulses.len(),
+            "last_run": last.ts,
+            "runs_by_disposition": runs_by_disposition,
+            "recent_pulses": recent,
+        });
+        if let Some(t) = current_title {
+            entry["current_title"] = json!(t);
+        }
+        if total_token_cost > 0 {
+            entry["total_token_cost"] = json!(total_token_cost);
+        }
+        daemons.push(entry);
+    }
+
+    serde_json::to_string_pretty(&json!({ "daemons": daemons }))
+        .map_err(|e| ToolError::new("inspect_unrenderable", e.to_string()))
 }
 
 /// A directory listing is a thing a phone renders and a thing a model pays
@@ -1271,6 +1406,7 @@ mod tests {
             root: root.to_path_buf(),
             may_write_composition: false,
             turn: TurnIdentity::default(),
+            instance_events: None,
         }
     }
 
@@ -1455,7 +1591,7 @@ mod tests {
             names,
             [
                 "get_composition", "list_directory", "read_file", "find_files",
-                "search", "write_file", "edit_file"
+                "search", "write_file", "edit_file", "inspect_daemons"
             ]
         );
         for t in registry() {
@@ -1957,6 +2093,7 @@ mod tests {
                 operator: "tycho".to_string(),
                 model: "zen/deepseek-v4-flash".to_string(),
             },
+            instance_events: None,
         }
     }
 
@@ -2286,5 +2423,120 @@ mod tests {
                 },
             })
         );
+    }
+
+    // ---- inspect_daemons ----
+
+    /// One `daemon_pulse` envelope, threaded `daemon-title`, the way
+    /// `daemon.rs` writes it.
+    fn pulse(seq: u64, id: &str, disposition: &str, title: &str, previous_title: &str) -> crate::log::envelope::EventEnvelope {
+        crate::log::envelope::EventEnvelope {
+            stream: "s1".to_string(),
+            id: id.to_string(),
+            seq,
+            ts: format!("2026-08-15T00:00:0{seq}.000Z"),
+            actor: crate::log::envelope::Actor {
+                role: crate::log::envelope::Role::Machine,
+                instance: None,
+                principal: None,
+            },
+            event_type: "daemon_pulse".to_string(),
+            thread: Some("daemon-title".to_string()),
+            parent: None,
+            version: 1,
+            cost: None,
+            data: serde_json::json!({
+                "daemon": "title",
+                "disposition": disposition,
+                "title": title,
+                "previous_title": previous_title,
+            }),
+        }
+    }
+
+    #[test]
+    fn inspect_daemons_returns_structured_state() {
+        let events = vec![
+            pulse(1, "p1", "updated", "Planning the move", ""),
+            pulse(2, "p2", "unchanged", "Planning the move", "Planning the move"),
+            pulse(3, "p3", "unchanged", "Planning the move", "Planning the move"),
+        ];
+
+        let out = inspect_daemons(&events).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+        let daemons = parsed["daemons"].as_array().unwrap();
+        assert_eq!(daemons.len(), 1);
+
+        let title_daemon = &daemons[0];
+        assert_eq!(title_daemon["daemon"], "title");
+        assert_eq!(title_daemon["current_title"], "Planning the move");
+        assert_eq!(title_daemon["total_runs"], 3);
+        assert_eq!(title_daemon["runs_by_disposition"]["updated"], 1);
+        assert_eq!(title_daemon["runs_by_disposition"]["unchanged"], 2);
+        assert_eq!(title_daemon["recent_pulses"].as_array().unwrap().len(), 3);
+        assert_eq!(title_daemon["last_run"], "2026-08-15T00:00:03.000Z");
+    }
+
+    #[test]
+    fn inspect_daemons_on_an_empty_log_returns_an_empty_list() {
+        let out = inspect_daemons(&[]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed["daemons"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn inspect_daemons_counts_errors_without_erasing_the_last_good_title() {
+        let mut errored = pulse(2, "p2", "error", "", "Debugging auth");
+        errored.data["error"] = serde_json::json!("NoApiKey");
+        let events = vec![pulse(1, "p1", "updated", "Debugging auth", ""), errored];
+
+        let out = inspect_daemons(&events).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let daemon = &parsed["daemons"].as_array().unwrap()[0];
+
+        assert_eq!(daemon["runs_by_disposition"]["updated"], 1);
+        assert_eq!(daemon["runs_by_disposition"]["error"], 1);
+        // An errored run records "" — the last non-empty title survives it.
+        assert_eq!(daemon["current_title"], "Debugging auth");
+        // The error text rides on the recent history for the model to read.
+        assert_eq!(daemon["recent_pulses"][0]["error"], "NoApiKey");
+    }
+
+    #[test]
+    fn inspect_daemons_ignores_the_rename_events_sharing_the_daemon_thread() {
+        // `instance_renamed` lives on the same `daemon-title` thread but is
+        // the domain event, not the heartbeat — it must not count as a run.
+        let mut rename = pulse(2, "r1", "", "", "");
+        rename.event_type = "instance_renamed".to_string();
+        rename.data = serde_json::json!({"title": "T", "previous_title": null});
+        let events = vec![pulse(1, "p1", "updated", "T", ""), rename];
+
+        let out = inspect_daemons(&events).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let daemon = &parsed["daemons"].as_array().unwrap()[0];
+        assert_eq!(daemon["total_runs"], 1);
+    }
+
+    #[test]
+    fn inspect_daemons_through_the_registry_reads_ctx_events() {
+        // The tool wiring itself: a ctx carrying events answers from them, and
+        // a ctx carrying None answers with an empty list rather than an error.
+        let dir = tempfile::tempdir().unwrap();
+        let mut with_events = ctx(dir.path());
+        with_events.instance_events = Some(vec![pulse(1, "p1", "updated", "T", "")]);
+
+        let tool = registry()
+            .iter()
+            .find(|t| t.def.name == "inspect_daemons")
+            .unwrap();
+        let out = (tool.run)(&serde_json::json!({}), &with_events).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out.text).unwrap();
+        assert_eq!(parsed["daemons"].as_array().unwrap().len(), 1);
+
+        let without = ctx(dir.path());
+        let out = (tool.run)(&serde_json::json!({}), &without).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out.text).unwrap();
+        assert!(parsed["daemons"].as_array().unwrap().is_empty());
     }
 }
