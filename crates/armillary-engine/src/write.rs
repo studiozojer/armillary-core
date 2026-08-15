@@ -445,6 +445,7 @@ mod tests {
             root: dir.path().to_path_buf(),
             may_write_composition,
             turn: crate::tools::TurnIdentity::default(),
+            instance_events: None,
         }
     }
 

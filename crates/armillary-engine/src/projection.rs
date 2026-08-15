@@ -225,6 +225,7 @@ const HANDLED_TYPES: &[&str] = &[
     "instance_archived",
     "instance_unarchived",
     "instance_renamed",
+    "daemon_pulse",
 ];
 
 /// Resolve a boot event's `data.path` under `root`, through the same guard
@@ -912,8 +913,11 @@ pub fn project_context(
             // Daemon-owned events (thread: "daemon-*"). Durable, replayed,
             // but MUST NOT appear in the model's context window. Filtered by
             // thread prefix, not by type — a daemon may emit multiple event
-            // types and one rule handles all of them.
-            "instance_renamed" => {}
+            // types and one rule handles all of them. `daemon_pulse` is the
+            // daemon's heartbeat (observability design 2026-08-19); its arm
+            // satisfies P-3 totality and deliberately contributes nothing,
+            // since `is_daemon_event` above already keeps it out.
+            "instance_renamed" | "daemon_pulse" => {}
 
             // Never silent (P-3): visible in the transcript rather than
             // dropped, so a gap in coverage shows up where a human or the
@@ -1829,6 +1833,13 @@ mod tests {
                 "instance_archived" => json!({}),
                 "instance_unarchived" => json!({}),
                 "instance_renamed" => json!({"title": "Test session", "previous_title": null}),
+                "daemon_pulse" => json!({
+                    "daemon": "title",
+                    "disposition": "unchanged",
+                    "title": "Test session",
+                    "previous_title": "Test session",
+                    "token_cost": 10,
+                }),
                 other => panic!("test fixture missing a data payload for durable type {other}"),
             };
             events.push(ev(seq, &id, t, data));
@@ -1908,6 +1919,51 @@ mod tests {
         assert!(!rendered.contains("file_changed"), "{rendered}");
         assert!(!rendered.contains("unhandled event type"), "{rendered}");
         assert!(!rendered.contains("todo.md"), "{rendered}");
+    }
+
+    #[test]
+    fn daemon_pulse_is_durable_and_has_an_explicit_reducer_arm() {
+        // MUTATION-CHECKED, same P-3 posture as `file_changed` above.
+        assert!(DURABLE_TYPES.contains(&"daemon_pulse"));
+        assert!(HANDLED_TYPES.contains(&"daemon_pulse"));
+    }
+
+    #[test]
+    fn a_daemon_pulse_event_contributes_nothing_to_the_projection() {
+        // The pulse is daemon-threaded, so `is_daemon_event` keeps it out of
+        // model context before its arm is ever consulted — this asserts the
+        // whole path: no rendered pulse, no unhandled marker, and the
+        // conversation itself untouched.
+        let pulse = EventEnvelope {
+            stream: "s1".to_string(),
+            id: "p1".to_string(),
+            seq: 2,
+            ts: "2026-08-15T00:00:00Z".to_string(),
+            actor: Actor {
+                role: Role::Machine,
+                instance: None,
+                principal: None,
+            },
+            event_type: "daemon_pulse".to_string(),
+            thread: Some("daemon-title".to_string()),
+            parent: None,
+            version: 1,
+            cost: None,
+            data: json!({
+                "daemon": "title",
+                "disposition": "unchanged",
+                "title": "Test session",
+                "previous_title": "Test session",
+            }),
+        };
+        let events = vec![ev(1, "u1", "user_message", json!({"text": "hello"})), pulse];
+
+        let turn = project_context(&events, Path::new(".")).unwrap();
+        let rendered = format!("{:?}", turn.messages);
+
+        assert!(!rendered.contains("daemon_pulse"), "{rendered}");
+        assert!(!rendered.contains("unhandled event type"), "{rendered}");
+        assert!(rendered.contains("hello"), "{rendered}");
     }
 
     #[test]
