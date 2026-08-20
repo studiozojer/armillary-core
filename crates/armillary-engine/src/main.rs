@@ -95,6 +95,9 @@ enum Command {
     /// List principals: name, grants, minted-at. Never tokens — the
     /// registry never holds one to print.
     Principals,
+    /// Model Context Protocol (MCP) server mode over stdio.
+    /// Exposes tools, prompts, resources and event-sourced logging for Claude Code CLI.
+    Mcp,
 }
 
 /// Parse a grant list, naming the first bad word.
@@ -183,6 +186,9 @@ fn run_command(cmd: &Command) -> Result<(), Box<dyn std::error::Error>> {
                 let grants: Vec<&str> = p.grants.iter().map(|g| g.as_str()).collect();
                 println!("{:<16} {:<12} {}", p.name, grants.join(","), p.minted);
             }
+        }
+        Command::Mcp => {
+            unreachable!("Command::Mcp is intercepted in main()");
         }
     }
     Ok(())
@@ -356,11 +362,29 @@ fn default_zen_key_file() -> PathBuf {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    // Registry management runs instead of serving, regardless of what
-    // --bind says — enroll/revoke/principals are local host administration,
-    // not a network-facing mode, so they must work even against a --bind
-    // value that would otherwise be refused below.
+    // Registry management or MCP server mode runs instead of HTTP serving.
     if let Some(cmd) = &args.command {
+        if let Command::Mcp = cmd {
+            let declared_root = args
+                .root
+                .unwrap_or_else(|| PathBuf::from("."));
+            let root = declared_root
+                .canonicalize()
+                .map_err(|e| format!("--root {} is not readable: {e}", declared_root.display()))?;
+            let boot = declared_boot(&root);
+            let data_dir = args
+                .data_dir
+                .clone()
+                .unwrap_or_else(|| root.join(".armillary"));
+            let store = LogStore::open(&data_dir).map_err(|e| {
+                format!(
+                    "failed to open data dir {} — sessions cannot be logged: {e}",
+                    data_dir.display()
+                )
+            })?;
+            let sessions = Arc::new(Sessions::new(store));
+            return armillary_engine::mcp::run_stdio(&root, sessions, boot);
+        }
         return run_command(cmd);
     }
 
