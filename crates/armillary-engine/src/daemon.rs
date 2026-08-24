@@ -133,7 +133,22 @@ pub async fn daemon_turn(
     // the provider returns.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let cancel = tokio::sync::watch::channel(false).1;
+    // **The sender must outlive the call.** Nothing cancels a daemon turn —
+    // it is uninterruptible by design — but "nobody will ever signal" is NOT
+    // the same shape as "the signal channel is gone." Both real providers open
+    // their stream loop with `biased; changed = cancel.changed()`, and a watch
+    // receiver whose sender has dropped returns `Err` from `changed()`
+    // IMMEDIATELY — so taking `.1` and letting the sender die at the end of
+    // the statement made every daemon turn take the cancel branch before
+    // reading a single byte, and hand back an empty accumulator. The model
+    // was called, billed, and never heard: 27 consecutive `empty` pulses,
+    // zero renames, across every operator (found 2026-08-24). Binding the
+    // sender for the scope is the whole fix.
+    //
+    // `ScriptedProvider` only reads `*cancel.borrow()` and never calls
+    // `changed()`, which is why the suite stayed green through all of it —
+    // the double now mirrors the real contract (`provider.rs`).
+    let (_cancel_tx, cancel) = tokio::sync::watch::channel(false);
 
     let outcome = match provider.run_turn(req, tx, cancel).await {
         Ok(outcome) => outcome,

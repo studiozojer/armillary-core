@@ -1714,3 +1714,58 @@ async fn evict_with_an_event_id_not_in_the_stream_is_404_unknown_event() {
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
     assert_eq!(response.text().await.unwrap(), "unknown_event");
 }
+
+// --- the title daemon reaches the provider ---
+
+/// **The daemon's turn must actually be answered.** This is the axis nothing
+/// covered: every daemon test until now asserted the *shape* of what the
+/// daemon wrote, and a daemon that got an empty string back still writes a
+/// well-formed `daemon_pulse` — so the suite stayed green through 27
+/// consecutive production runs that never once renamed anything.
+///
+/// The failure it pins: `daemon_turn` built its cancel channel as
+/// `watch::channel(false).1`, dropping the sender on the spot. Both real
+/// providers open their stream loop with `biased; changed = cancel.changed()`,
+/// and `changed()` on a receiver whose sender is gone returns `Err`
+/// immediately — the turn bailed before reading a byte and returned an empty
+/// accumulator, every time. Asserting `updated` (not merely "a pulse exists")
+/// is what makes this test able to fail.
+#[tokio::test]
+async fn the_title_daemon_gets_an_answer_and_renames_the_instance() {
+    let data_dir = tempfile::tempdir().unwrap().keep();
+    let provider = Arc::new(ScriptedProvider::new(vec!["Debugging the auth flow"]));
+    let (addr, sessions) = spawn(&data_dir, provider).await;
+    let client = authed_client();
+    let id = create_instance(&client, addr).await;
+
+    let response = client
+        .post(format!("http://{addr}/instances/{id}/send"))
+        .json(&serde_json::json!({ "text": "the auth flow is 401ing", "clientKey": "c1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+
+    // The daemon runs at the head of `run_turn`, so an assistant message
+    // means it has already had its turn and written its pulse.
+    wait_for_assistant_message(&sessions, &id, 1).await;
+
+    let events = sessions.store().read_from(&id, 0).unwrap();
+
+    let pulse = events
+        .iter()
+        .find(|e| e.event_type == "daemon_pulse")
+        .expect("the title daemon must leave a pulse");
+    assert_eq!(
+        pulse.data["disposition"], "updated",
+        "the daemon reached the provider and got a title back: {:?}",
+        pulse.data
+    );
+
+    let renamed = events
+        .iter()
+        .find(|e| e.event_type == "instance_renamed")
+        .expect("a first title must be written, not just pulsed about");
+    assert_eq!(renamed.data["title"], "Debugging the auth flow");
+    assert_eq!(renamed.thread.as_deref(), Some("daemon-title"));
+}
