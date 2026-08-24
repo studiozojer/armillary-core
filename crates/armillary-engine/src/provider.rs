@@ -960,6 +960,23 @@ impl ModelProvider for ScriptedProvider {
     ) -> Result<TurnOutcome, ProviderError> {
         let mut last_sent = String::new();
 
+        // A CLOSED cancel channel is a stop, exactly as it is for the real
+        // providers — their `biased; changed = cancel.changed()` arm treats
+        // `Err` (sender dropped) as a cancel. The double read only the
+        // current value, so a caller that dropped its sender looked healthy
+        // here and returned nothing in production; the title daemon shipped
+        // that way (see `daemon.rs`). A test double that answers a request
+        // the real provider would abandon is not a test.
+        if cancel.has_changed().is_err() {
+            return Ok(TurnOutcome {
+                blocks: Vec::new(),
+                text: String::new(),
+                stop_reason: None,
+                stopped: true,
+                model: "scripted".to_string(),
+            });
+        }
+
         for (i, fragment) in self.fragments.iter().enumerate() {
             if *cancel.borrow() {
                 return Ok(TurnOutcome {
