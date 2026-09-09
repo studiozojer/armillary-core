@@ -251,10 +251,20 @@ pub fn resolve(root: &Path, user_path: &str) -> Result<PathBuf, GuardError> {
     }
 
     let root_canonical = root.canonicalize().map_err(|_| GuardError::NotFound)?;
-    let canonical = root_canonical
-        .join(rel)
-        .canonicalize()
-        .map_err(|_| GuardError::NotFound)?;
+    let canonical = match root_canonical.join(rel).canonicalize() {
+        Ok(c) => c,
+        Err(_) => {
+            // If the file does not exist on disk, still check if the user asked for a credential or noise.
+            for component in rel.components() {
+                if let Component::Normal(name) = component {
+                    if let Some(refusal) = judge(&name.to_string_lossy()) {
+                        return Err(refusal);
+                    }
+                }
+            }
+            return Err(GuardError::NotFound);
+        }
+    };
 
     let inside = canonical
         .strip_prefix(&root_canonical)
@@ -266,6 +276,15 @@ pub fn resolve(root: &Path, user_path: &str) -> Result<PathBuf, GuardError> {
     // hard link does not: it has no target to resolve to, so this judges the
     // link's own name — see the module doc for what that leaves open.
     for component in inside.components() {
+        if let Component::Normal(name) = component {
+            if let Some(refusal) = judge(&name.to_string_lossy()) {
+                return Err(refusal);
+            }
+        }
+    }
+
+    // Also judge the requested component names in case of case differences on case-sensitive filesystems.
+    for component in rel.components() {
         if let Component::Normal(name) = component {
             if let Some(refusal) = judge(&name.to_string_lossy()) {
                 return Err(refusal);

@@ -17,6 +17,7 @@ pub mod guard;
 pub mod hash;
 pub mod loop_;
 pub mod log;
+pub mod mcp;
 pub mod models;
 pub mod principals;
 pub mod projection;
