@@ -524,6 +524,37 @@ async fn credential_is_refused_as_a_credential_not_as_an_unknown_type() {
 }
 
 #[tokio::test]
+async fn tray_is_empty_not_404_on_a_machine_with_no_arrivals() {
+    // A fresh machine has no local/tray/. That is an empty feed, and the tab
+    // must render it the same way it renders an emptied one.
+    let (status, body) = get_json(app_over(|_| {}), "/tray").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["entries"], serde_json::json!([]));
+    assert_eq!(body["skipped"], 0);
+}
+
+#[tokio::test]
+async fn tray_lists_the_augur_drop_with_its_path_promoted() {
+    let setup = |root: &PathBuf| {
+        std::fs::create_dir_all(root.join("local/tray")).unwrap();
+        std::fs::write(
+            root.join("local/tray/1789367400000-augur-2026-09-14.json"),
+            r#"{"date":"2026-09-14","summary":"quiet","report_path":"operators/augur/field/2026-09-14.md","host":"stjerneborg","event_count":0,"sender":"augur","kind":"field","created_at":"2026-09-14T06:30:00-07:00"}"#,
+        )
+        .unwrap();
+    };
+    let (status, body) = get_json(app_over(setup), "/tray").await;
+    assert_eq!(status, StatusCode::OK);
+    let e = &body["entries"][0];
+    assert_eq!(e["sender"], "augur");
+    assert_eq!(e["path"], "operators/augur/field/2026-09-14.md");
+    assert_eq!(e["host"], "stjerneborg");
+    assert_eq!(e["event_count"], 0);
+    assert_eq!(e["id"], "local/tray/1789367400000-augur-2026-09-14.json");
+    assert!(e.get("report_path").is_none());
+}
+
+#[tokio::test]
 async fn voicenotes_is_404_when_the_protocol_is_not_declared() {
     // The default fixture declares no voicenotes protocol at all.
     let (status, _) = get_json(app_over(|_| {}), "/voicenotes").await;
