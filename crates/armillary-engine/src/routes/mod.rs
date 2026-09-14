@@ -7,6 +7,7 @@ pub mod models;
 pub mod repos;
 pub mod session_ops;
 pub mod subscribe;
+pub mod tray;
 pub mod tree;
 pub mod voicenotes;
 pub mod whoami;

@@ -53,6 +53,7 @@ pub fn app(state: AppState) -> Router {
         .route("/tree", get(routes::tree::tree))
         .route("/file", get(routes::file::file))
         .route("/voicenotes", get(routes::voicenotes::voicenotes))
+        .route("/tray", get(routes::tray::tray))
         .route("/instances", get(routes::instances::list).post(routes::instances::create))
         .route("/instances/{id}", get(routes::instances::attach))
         .route("/instances/{id}/send", post(routes::session_ops::send))
