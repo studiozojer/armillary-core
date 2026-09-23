@@ -727,6 +727,11 @@ impl ProviderFor for KeyedProviders {
                 None => Arc::new(KeylessProvider),
             },
             ProviderChoice::Zen { slug } => match &self.zen_key {
+                Some(key) if zen_uses_responses(&slug) => Arc::new(crate::provider_responses::ResponsesProvider {
+                    base_url: "https://opencode.ai/zen/v1".to_string(),
+                    model: slug,
+                    api_key: key.clone(),
+                }),
                 Some(key) => Arc::new(crate::provider_openai::OpenAiCompatProvider {
                     base_url: "https://opencode.ai/zen/v1".to_string(),
                     // The BARE slug crosses the wire; the prefixed spelling
@@ -738,6 +743,10 @@ impl ProviderFor for KeyedProviders {
             },
         }
     }
+}
+
+fn zen_uses_responses(slug: &str) -> bool {
+    matches!(slug, "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna")
 }
 
 /// One provider for every model — the test seam. Wraps a single provider
@@ -1582,6 +1591,12 @@ mod tests {
 
     #[test]
     fn keyed_providers_selects_by_prefix_and_falls_keyless_without_a_key() {
+        for slug in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
+            assert!(zen_uses_responses(slug));
+        }
+        for slug in ["deepseek-v4.1-flash", "deepseek-v4-flash", "kimi-k3"] {
+            assert!(!zen_uses_responses(slug));
+        }
         let both = KeyedProviders {
             anthropic_key: Some("a".to_string()),
             zen_key: Some("z".to_string()),
@@ -1590,6 +1605,9 @@ mod tests {
         // slug while the prefixed spelling stays in the log (core#19's rule).
         assert_eq!(both.provider_for("claude-sonnet-5").describe(), "anthropic:claude-sonnet-5");
         assert_eq!(both.provider_for("zen/kimi-k3").describe(), "opencode-zen:kimi-k3");
+        assert_eq!(both.provider_for("zen/gpt-6-astra").describe(), "opencode-zen:gpt-6-astra");
+        assert_eq!(both.provider_for("zen/gpt-6-sol").describe(), "opencode-zen:gpt-6-sol");
+        assert_eq!(both.provider_for("zen/gpt-6-luna").describe(), "opencode-zen:gpt-6-luna");
 
         // Decision 3's posture, and the whole reason it costs no new error
         // path: an unpilotable model resolves to the provider that already
