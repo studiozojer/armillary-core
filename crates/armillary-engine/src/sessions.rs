@@ -83,6 +83,8 @@ struct StreamState {
     /// loop) — installed by `begin_turn`, cleared by `end_turn`. `interrupt`
     /// is a no-op when this is `None`: no turn running is still 204.
     turn: Option<TurnHandle>,
+    title_cancel: Option<watch::Sender<bool>>,
+    title_started: Option<tokio::time::Instant>,
 }
 
 impl StreamState {
@@ -90,6 +92,8 @@ impl StreamState {
         StreamState {
             tx: broadcast::channel(CHANNEL_CAPACITY).0,
             turn: None,
+            title_cancel: None,
+            title_started: None,
         }
     }
 }
@@ -220,6 +224,18 @@ impl Sessions {
         parent: Option<String>,
         thread: Option<String>,
     ) -> Result<EventEnvelope, SessionError> {
+        let mut inner = self.inner.lock().unwrap();
+        self.append_locked(&mut inner, stream, partial, parent, thread)
+    }
+
+    fn append_locked(
+        &self,
+        inner: &mut HashMap<String, StreamState>,
+        stream: &str,
+        partial: NewEvent,
+        parent: Option<String>,
+        thread: Option<String>,
+    ) -> Result<EventEnvelope, SessionError> {
         // Everything through here is durable by construction — `seq` is
         // `head + 1`, never 0 — so its type belongs on the durable list. The
         // exhaustiveness guard in `projection.rs` compares two hand-maintained
@@ -234,8 +250,6 @@ impl Sessions {
              `project_context` an arm, or it reaches the model as an unhandled marker",
             partial.event_type
         );
-
-        let mut inner = self.inner.lock().unwrap();
 
         let seq = self.store.head_seq(stream)? + 1;
         let ev = EventEnvelope {
@@ -263,6 +277,56 @@ impl Sessions {
         let _ = state.tx.send(ev.clone());
 
         Ok(ev)
+    }
+
+    pub(crate) fn begin_title(
+        &self,
+        stream: &str,
+        has_title: bool,
+        interval: std::time::Duration,
+    ) -> Option<watch::Receiver<bool>> {
+        let mut inner = self.inner.lock().unwrap();
+        let state = inner.entry(stream.to_string()).or_insert_with(StreamState::new);
+        if state.turn.is_some()
+            || state.title_cancel.is_some()
+            || (has_title && state.title_started.is_some_and(|started| started.elapsed() < interval))
+        {
+            return None;
+        }
+        let (sender, receiver) = watch::channel(false);
+        state.title_cancel = Some(sender);
+        state.title_started = Some(tokio::time::Instant::now());
+        Some(receiver)
+    }
+
+    pub(crate) fn end_title(&self, stream: &str) {
+        if let Some(state) = self.inner.lock().unwrap().get_mut(stream) {
+            state.title_cancel = None;
+        }
+    }
+
+    pub(crate) fn append_title_if_current(
+        &self,
+        stream: &str,
+        expected_user: Option<&str>,
+        expected_title: Option<&str>,
+        event: NewEvent,
+    ) -> Result<Option<EventEnvelope>, SessionError> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.get(stream).is_some_and(|state| {
+            state.turn.is_some() || state.title_cancel.as_ref().is_some_and(|cancel| *cancel.borrow())
+        }) {
+            return Ok(None);
+        }
+        let events = self.store.read_from(stream, 0)?;
+        let latest_user = events.iter().rev().find(|event| event.event_type == "user_message");
+        if latest_user.map(|event| event.id.as_str()) != expected_user
+            || crate::loop_::title_from_events(&events).as_deref() != expected_title
+        {
+            return Ok(None);
+        }
+        self.append_locked(&mut inner, stream, event, None, Some("daemon-title".to_string()))
+            .map(Some)
     }
 
     /// Broadcasts a transient hint — `ev.seq` MUST be `0` (I-4: a hint is
@@ -304,6 +368,9 @@ impl Sessions {
             return Err(SessionError::TurnInProgress);
         }
         let generation = handle.generation.clone();
+        if let Some(cancel) = &state.title_cancel {
+            let _ = cancel.send(true);
+        }
         state.turn = Some(handle);
         // Sent under the same lock that made the claim, so no observer can see
         // the slot filled without the signal that filled it.

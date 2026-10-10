@@ -73,11 +73,17 @@ pub(crate) async fn append_blocking(
 struct EndTurnGuard {
     sessions: Arc<Sessions>,
     stream: String,
+    title: Option<(SharedState, String, String)>,
 }
 
 impl Drop for EndTurnGuard {
     fn drop(&mut self) {
         self.sessions.end_turn(&self.stream);
+        if !std::thread::panicking() {
+            if let Some((state, operator, model)) = self.title.take() {
+                crate::daemon::schedule(state, self.stream.clone(), operator, model);
+            }
+        }
     }
 }
 
@@ -499,9 +505,11 @@ pub async fn run_turn(
     caller: Option<String>,
     agent_tools: Vec<crate::principals::Grant>,
 ) {
-    let _end_turn_guard = EndTurnGuard {
+    let mut timing = crate::timing::TurnTiming::new(&stream, &generation);
+    let mut _end_turn_guard = EndTurnGuard {
         sessions: state.sessions.clone(),
         stream: stream.clone(),
+        title: None,
     };
 
     let events = match read_all(&state.sessions, &stream).await {
@@ -536,11 +544,6 @@ pub async fn run_turn(
     // therefore the shape of a turn nobody asked for, and holds nothing.
     let principal = caller.map(|name| ActorPrincipal { name });
 
-    let daemon_result = crate::daemon::daemon_turn(&state, &stream, &operator, &model, &events).await;
-    if daemon_result.is_none() {
-        eprintln!("daemon_title: no_title_produced stream={stream:?}");
-    }
-
     // Text produced by rounds already finished. The provider restarts its own
     // accumulator on every call, so without this the phone's bubble would jump
     // backwards at each round boundary. I-4 still holds: every transient
@@ -557,6 +560,7 @@ pub async fn run_turn(
 
     loop {
         round += 1;
+        timing.rounds = round;
 
         // A stop that arrives between rounds is observed here. Inside a round
         // the provider owns the signal; between them nothing else was watching.
@@ -565,10 +569,14 @@ pub async fn run_turn(
             return;
         }
 
+        let projection_started = tokio::time::Instant::now();
         let turn = match project_healing(&state, &stream, &operator, &generation, &model).await {
             Some(turn) => turn,
             None => return, // fail_turn already recorded the reason
         };
+        timing.projection_ms += projection_started.elapsed().as_millis();
+        let context_messages = turn.messages.len();
+        let context_content_bytes = crate::timing::context_content_bytes(&turn);
 
         // At a bound the tools come off and `tool_choice: none` forces prose,
         // so the person always gets an answer instead of a turn that stops
@@ -618,12 +626,18 @@ pub async fn run_turn(
         let relay_operator = operator.clone();
         let relay_generation = generation.clone();
         let prefix = turn_text.clone();
+        let provider_started = tokio::time::Instant::now();
         let relay = tokio::spawn(async move {
+            let mut first_text_ms = None;
             while let Some(chunk) = rx.recv().await {
+                if !chunk.is_empty() && first_text_ms.is_none() {
+                    first_text_ms = Some(provider_started.elapsed().as_millis());
+                }
                 let snapshot = format!("{prefix}{chunk}");
                 let ev = transient_delta_envelope(&relay_stream, &relay_operator, &relay_generation, &snapshot);
                 relay_sessions.broadcast_transient(&relay_stream, ev);
             }
+            first_text_ms
         });
 
         let outcome = state
@@ -631,7 +645,17 @@ pub async fn run_turn(
             .provider_for(&model)
             .run_turn(req, tx, cancel_rx.clone())
             .await;
-        let _ = relay.await;
+        let first_text_ms = relay.await.unwrap_or(None);
+        let provider_ms = provider_started.elapsed().as_millis();
+        timing.provider_ms += provider_ms;
+        if timing.first_text_ms.is_none() {
+            timing.first_text_ms = first_text_ms.map(|elapsed| provider_started.duration_since(timing.started).as_millis() + elapsed);
+        }
+        eprintln!("round_timing {}", serde_json::json!({
+            "stream": stream, "generation": generation, "round": round,
+            "provider_ms": provider_ms, "first_text_ms": first_text_ms,
+            "context_messages": context_messages, "context_content_bytes": context_content_bytes,
+        }));
 
         let outcome = match outcome {
             Ok(o) => o,
@@ -749,6 +773,7 @@ pub async fn run_turn(
         };
 
         if calls.is_empty() {
+            _end_turn_guard.title = Some((state.clone(), operator.clone(), model.clone()));
             return; // the model spoke; the turn is over
         }
 
@@ -770,6 +795,7 @@ pub async fn run_turn(
         // a filter rather than a positional walk.
         let mut produced_content = false;
         for (id, name, input) in &calls {
+            let tool_started = tokio::time::Instant::now();
             let use_ev = NewEvent {
                 actor: assistant_actor(&operator),
                 event_type: "tool_use".to_string(),
@@ -974,6 +1000,12 @@ pub async fn run_turn(
                 eprintln!("log_write_failed appending tool_result for stream {stream:?}: {e:?}");
                 return;
             }
+            let tool_ms = tool_started.elapsed().as_millis();
+            timing.tool_ms += tool_ms;
+            eprintln!("tool_timing {}", serde_json::json!({
+                "stream": stream, "generation": generation, "round": round,
+                "tool": name, "status": status, "elapsed_ms": tool_ms,
+            }));
         }
 
         stalled = if produced_content { 0 } else { stalled + 1 };
@@ -1804,11 +1836,10 @@ mod tests {
         )
         .await;
 
-        // [0] is the daemon's empty-tools round; [1] is the first operator round.
         assert!(
-            provider.offered.lock().unwrap()[1].contains(&"commit_repo".to_string()),
+            provider.offered.lock().unwrap()[0].contains(&"commit_repo".to_string()),
             "the verb must have been genuinely OFFERED, or this proves nothing: {:?}",
-            provider.offered.lock().unwrap()[1]
+            provider.offered.lock().unwrap()[0]
         );
 
         let events = sessions.store().read_from(&id, 0).unwrap();
@@ -1828,8 +1859,6 @@ mod tests {
             vec![
                 "instance_created",
                 "user_message",
-                "instance_renamed",
-                "daemon_pulse",
                 "assistant_message",
                 "tool_use",
                 "tool_result",
@@ -2153,12 +2182,6 @@ mod tests {
         // Order is asserted, not incidental: `file_changed` precedes
         // `tool_result` because the effect preceded the report of it, and a
         // replay should read that way.
-        //
-        // UPDATED 2026-08-14: the daemon's empty-tools model call prepends an
-        // empty offer to the offered list and RoundScript returns "forced to
-        // speak" (the no-tools fallback), producing an `instance_renamed`
-        // event. The main loop's first round then consumes the first real
-        // scripted response unchanged.
         let data_dir = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("modules.toml"), "[[repos]]\nname='r'\npath='p'\n")
@@ -2193,8 +2216,6 @@ mod tests {
             vec![
                 "instance_created",
                 "user_message",
-                "instance_renamed",
-                "daemon_pulse",
                 "assistant_message",
                 "tool_use",
                 "file_changed",
@@ -2326,10 +2347,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_tool_call_is_executed_and_answered_and_the_turn_continues() {
-        // UPDATED 2026-08-14: the daemon's empty-tools model call prepends
-        // RoundScript's no-tools fallback ("forced to speak"), producing an
-        // `instance_renamed` event. The main loop's first round then gets
-        // the first real scripted response unchanged.
         let data_dir = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("modules.toml"), "[[repos]]\nname='r'\npath='p'\n")
@@ -2358,8 +2375,6 @@ mod tests {
             vec![
                 "instance_created",
                 "user_message",
-                "instance_renamed",
-                "daemon_pulse",
                 "assistant_message",
                 "tool_use",
                 "tool_result",

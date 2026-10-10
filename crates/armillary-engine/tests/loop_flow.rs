@@ -326,7 +326,9 @@ impl ModelProvider for RecordingProvider {
         sink: mpsc::Sender<String>,
         cancel: watch::Receiver<bool>,
     ) -> Result<TurnOutcome, ProviderError> {
-        *self.last_turn.lock().unwrap() = Some(req.turn.clone());
+        if !req.tools.is_empty() || req.tool_choice.is_some() {
+            *self.last_turn.lock().unwrap() = Some(req.turn.clone());
+        }
         self.inner.run_turn(req, sink, cancel).await
     }
 }
@@ -649,6 +651,7 @@ async fn interrupt_mid_script_records_interrupt_then_a_partial_assistant_message
     let (addr, sessions) = spawn(&data_dir, provider).await;
     let client = authed_client();
     let id = create_instance(&client, addr).await;
+    let mut live = sessions.subscribe_live(&id);
 
     client
         .post(format!("http://{addr}/instances/{id}/send"))
@@ -657,27 +660,15 @@ async fn interrupt_mid_script_records_interrupt_then_a_partial_assistant_message
         .await
         .unwrap();
 
-    // The title daemon's own provider call runs the SAME paused script to
-    // completion before the operator's round begins, and its cancel channel
-    // is private — an interrupt landing during the daemon's run would leave
-    // the operator's round cancelled before its first fragment, recording an
-    // EMPTY partial. Wait for the daemon's pulse (its always-written last
-    // event) so the sleep below lands mid-way through the operator's script.
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let events = sessions.store().read_from(&id, 0).unwrap();
-            if events.iter().any(|e| e.event_type == "daemon_pulse") {
+            if live.recv().await.unwrap().event_type == "assistant_delta" {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("the daemon's pulse never landed");
-
-    // Give the turn time to emit its first snapshot, then interrupt while
-    // still mid-script (pauses are 50ms; fragment 4 of 4 is well past this).
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    .expect("the first assistant snapshot never landed");
     let response = client
         .post(format!("http://{addr}/instances/{id}/interrupt"))
         .send()
@@ -764,6 +755,17 @@ async fn evicted_message_is_absent_from_the_next_turns_projection() {
     assert!(last_turn.messages.iter().any(|m| message_contains(m, "second turn")));
 }
 
+async fn wait_for_title_pulse(sessions: &Arc<Sessions>, id: &str) {
+    tokio::time::timeout(READ_TIMEOUT, async {
+        loop {
+            if sessions.store().read_from(id, 0).unwrap().iter().any(|event| event.event_type == "daemon_pulse") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("title daemon did not finish in time");
+}
+
 async fn wait_for_assistant_message(sessions: &Arc<Sessions>, id: &str, count: usize) {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -824,12 +826,13 @@ async fn crash_resume_the_log_survives_dropping_and_rebuilding_the_whole_process
         .await
         .unwrap();
     wait_for_assistant_message(&sessions, &id, 1).await;
+    wait_for_title_pulse(&sessions, &id).await;
 
     let head_before = sessions.store().head_seq(&id).unwrap();
     assert_eq!(
         head_before, 6,
-        "instance_created, composition, user_message, instance_renamed, \
-         daemon_pulse, assistant_message — the title daemon's two events \
+        "instance_created, composition, user_message, assistant_message, \
+         instance_renamed, daemon_pulse — the title daemon's two events \
          are part of the log this test proves durable"
     );
 
@@ -852,11 +855,11 @@ async fn crash_resume_the_log_survives_dropping_and_rebuilding_the_whole_process
     assert_eq!(replayed[1].event_type, "composition");
     assert_eq!(replayed[2].event_type, "user_message");
     assert_eq!(replayed[2].data["text"], "hello");
-    assert_eq!(replayed[3].event_type, "instance_renamed");
-    assert_eq!(replayed[4].event_type, "daemon_pulse");
-    assert_eq!(replayed[4].data["disposition"], "updated");
-    assert_eq!(replayed[5].event_type, "assistant_message");
-    assert_eq!(replayed[5].data["text"], "done");
+    assert_eq!(replayed[3].event_type, "assistant_message");
+    assert_eq!(replayed[3].data["text"], "done");
+    assert_eq!(replayed[4].event_type, "instance_renamed");
+    assert_eq!(replayed[5].event_type, "daemon_pulse");
+    assert_eq!(replayed[5].data["disposition"], "updated");
 
     // And over HTTP, via a brand-new server built on the SAME data dir and a
     // brand-new AppState — attach reports the identical headSeq.
@@ -1746,9 +1749,8 @@ async fn the_title_daemon_gets_an_answer_and_renames_the_instance() {
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::CREATED);
 
-    // The daemon runs at the head of `run_turn`, so an assistant message
-    // means it has already had its turn and written its pulse.
     wait_for_assistant_message(&sessions, &id, 1).await;
+    wait_for_title_pulse(&sessions, &id).await;
 
     let events = sessions.store().read_from(&id, 0).unwrap();
 
@@ -1768,4 +1770,75 @@ async fn the_title_daemon_gets_an_answer_and_renames_the_instance() {
         .expect("a first title must be written, not just pulsed about");
     assert_eq!(renamed.data["title"], "Debugging the auth flow");
     assert_eq!(renamed.thread.as_deref(), Some("daemon-title"));
+}
+
+struct HangingTitle {
+    started: tokio::sync::Notify,
+    dropped: Arc<tokio::sync::Notify>,
+}
+
+struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for HangingTitle {
+    async fn run_turn(
+        &self,
+        request: provider::TurnRequest,
+        sink: mpsc::Sender<String>,
+        _cancel: watch::Receiver<bool>,
+    ) -> Result<TurnOutcome, ProviderError> {
+        if request.tools.is_empty() {
+            let _guard = NotifyOnDrop(self.dropped.clone());
+            self.started.notify_one();
+            std::future::pending::<()>().await;
+        }
+        sink.send("ready".to_string()).await.unwrap();
+        Ok(TurnOutcome {
+            text: "ready".to_string(),
+            blocks: vec![ContentBlock::Text("ready".to_string())],
+            stop_reason: Some("end_turn".to_string()),
+            stopped: false,
+            model: "scripted".to_string(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn hanging_title_does_not_delay_reply_or_block_next_send_and_is_cancelled() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(HangingTitle {
+        started: tokio::sync::Notify::new(),
+        dropped: Arc::new(tokio::sync::Notify::new()),
+    });
+    let (addr, sessions) = spawn(data_dir.path(), provider.clone()).await;
+    let client = authed_client();
+    let id = create_instance(&client, addr).await;
+    let mut live = sessions.subscribe_live(&id);
+
+    let first = client.post(format!("http://{addr}/instances/{id}/send"))
+        .json(&serde_json::json!({"text": "first", "clientKey": "first"}))
+        .send().await.unwrap();
+    assert_eq!(first.status(), reqwest::StatusCode::CREATED);
+    wait_for_assistant_message(&sessions, &id, 1).await;
+    tokio::time::timeout(READ_TIMEOUT, provider.started.notified()).await.unwrap();
+    tokio::time::timeout(READ_TIMEOUT, async {
+        while live.recv().await.unwrap().event_type != "turn_ended" {}
+    }).await.unwrap();
+    assert_eq!(attach(&client, addr, &id).await["instance"]["turnInProgress"], false);
+
+    let second = client.post(format!("http://{addr}/instances/{id}/send"))
+        .json(&serde_json::json!({"text": "second", "clientKey": "second"}))
+        .send().await.unwrap();
+    assert_eq!(second.status(), reqwest::StatusCode::CREATED);
+    tokio::time::timeout(READ_TIMEOUT, provider.dropped.notified()).await.unwrap();
+    wait_for_assistant_message(&sessions, &id, 2).await;
+    let events = sessions.store().read_from(&id, 0).unwrap();
+    assert!(!events.iter().any(|event| event.event_type == "instance_renamed"));
+    assert!(events.iter().any(|event| event.event_type == "daemon_pulse" && event.data["disposition"] == "cancelled"));
 }

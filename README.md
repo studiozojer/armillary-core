@@ -60,6 +60,14 @@ Deployment recipe: `zojercommons/setup/armillary-engine-deploy.md` (studio-local
 cargo test            # conformance fixtures, guard, routes
 ```
 
+## Reply latency and diagnostics
+
+Session titles are best-effort background work after a successful foreground turn, not a model call the reply must wait for. Each stream allows one title request at a time, with a 15-second provider timeout. A new foreground turn cancels an active title request. Before renaming, the engine checks under the session write lock that neither the latest user message nor the current title has changed. Existing titles are checked at most once per 60 seconds; untitled sessions can retry on the next eligible successful turn. This is turn-triggered work, not a periodic scheduler, and restart resets the in-memory throttle.
+
+Engine stderr includes JSON records prefixed `turn_timing`, `round_timing`, `tool_timing`, and `title_timing`. They record elapsed milliseconds, stream/generation identifiers, round counts, projection/provider/tool time, first nonempty streamed text, and context size. Turn-level first-text time starts at foreground turn entry; round-level first-text time starts at the provider call and includes relay scheduling. A missing first-text value is `null`, not zero. Provider time includes draining the stream relay; tool time includes recording its events. These measurements do not cover client/network delay before turn entry, and stage totals need not sum to the whole turn duration.
+
+`context_content_bytes` counts UTF-8 system/message content and serialized tool inputs, not tokens or total request size; tool definitions and wire framing are excluded. The new timing records contain no prompts, replies, tool arguments, tool results, or credentials. Existing diagnostic logging is unchanged. Background title time is reported separately rather than charged to foreground reply latency. These measurements provide a baseline for subsequent context and tool-loop optimization; this change does not enable remote shell execution or broaden grants.
+
 ## Status
 
 **v0.1 — standard seeded 2026-07-24, machinery added 2026-07-26, public 2026-07-26.**

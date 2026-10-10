@@ -2,13 +2,68 @@ use crate::log::envelope::{Actor, EventEnvelope, Role};
 use crate::loop_::title_from_events;
 use crate::sessions::NewEvent;
 use crate::state::SharedState;
+use std::sync::Arc;
+use std::time::Duration;
 
 const TITLE_DAEMON_WINDOW: usize = 10;
+const TITLE_INTERVAL: Duration = Duration::from_secs(60);
+const TITLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+struct TitleGuard {
+    sessions: Arc<crate::sessions::Sessions>,
+    stream: String,
+}
+
+impl Drop for TitleGuard {
+    fn drop(&mut self) {
+        self.sessions.end_title(&self.stream);
+    }
+}
+
+pub(crate) fn schedule(state: SharedState, stream: String, operator: String, model: String) {
+    tokio::spawn(async move {
+        let sessions = state.sessions.clone();
+        let event_stream = stream.clone();
+        let events =
+            match tokio::task::spawn_blocking(move || sessions.store().read_from(&event_stream, 0))
+                .await
+            {
+                Ok(Ok(events)) => events,
+                _ => {
+                    eprintln!("daemon_title: snapshot_failed stream={stream:?}");
+                    return;
+                }
+            };
+        let Some(cancel) = state.sessions.begin_title(
+            &stream,
+            title_from_events(&events).is_some(),
+            TITLE_INTERVAL,
+        ) else {
+            return;
+        };
+        let _guard = TitleGuard {
+            sessions: state.sessions.clone(),
+            stream: stream.clone(),
+        };
+        let started = tokio::time::Instant::now();
+        daemon_turn(&state, &stream, &operator, &model, &events, cancel).await;
+        eprintln!(
+            "title_timing {}",
+            serde_json::json!({"stream": stream, "elapsed_ms": started.elapsed().as_millis()})
+        );
+    });
+}
 
 fn build_title_prompt(events: &[EventEnvelope], current_title: Option<&str>) -> String {
     let recent: Vec<&EventEnvelope> = events
         .iter()
         .rev()
+        .filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "user_message" | "assistant_message"
+            )
+        })
         .take(TITLE_DAEMON_WINDOW)
         .collect::<Vec<_>>()
         .into_iter()
@@ -86,7 +141,10 @@ fn append_pulse(
         event_type: "daemon_pulse".to_string(),
         data,
     };
-    match state.sessions.append_threaded(stream, pulse, "daemon-title") {
+    match state
+        .sessions
+        .append_threaded(stream, pulse, "daemon-title")
+    {
         Ok(_) => {
             eprintln!("daemon_title: pulse stream={stream:?} disposition={disposition}");
         }
@@ -102,6 +160,7 @@ pub async fn daemon_turn(
     operator: &str,
     model: &str,
     events: &[EventEnvelope],
+    mut cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Option<String> {
     eprintln!("daemon_title: starting stream={stream:?}");
     let current_title = title_from_events(events);
@@ -133,29 +192,35 @@ pub async fn daemon_turn(
     // the provider returns.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    // **The sender must outlive the call.** Nothing cancels a daemon turn —
-    // it is uninterruptible by design — but "nobody will ever signal" is NOT
-    // the same shape as "the signal channel is gone." Both real providers open
-    // their stream loop with `biased; changed = cancel.changed()`, and a watch
-    // receiver whose sender has dropped returns `Err` from `changed()`
-    // IMMEDIATELY — so taking `.1` and letting the sender die at the end of
-    // the statement made every daemon turn take the cancel branch before
-    // reading a single byte, and hand back an empty accumulator. The model
-    // was called, billed, and never heard: 27 consecutive `empty` pulses,
-    // zero renames, across every operator (found 2026-08-24). Binding the
-    // sender for the scope is the whole fix.
-    //
-    // `ScriptedProvider` only reads `*cancel.borrow()` and never calls
-    // `changed()`, which is why the suite stayed green through all of it —
-    // the double now mirrors the real contract (`provider.rs`).
-    let (_cancel_tx, cancel) = tokio::sync::watch::channel(false);
-
-    let outcome = match provider.run_turn(req, tx, cancel).await {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            eprintln!(
-                "daemon_title: model_call_failed stream={stream:?} error={e:?}"
+    if *cancel.borrow() {
+        return None;
+    }
+    let provider_cancel = cancel.clone();
+    let result = tokio::select! {
+        biased;
+        _ = cancel.changed() => {
+            append_pulse(state, stream, operator, "cancelled", "", current_title.as_deref().unwrap_or_default(), None);
+            return None;
+        }
+        result = tokio::time::timeout(TITLE_TIMEOUT, provider.run_turn(req, tx, provider_cancel)) => result,
+    };
+    let outcome = match result {
+        Err(_) => {
+            append_pulse(
+                state,
+                stream,
+                operator,
+                "error",
+                "",
+                current_title.as_deref().unwrap_or_default(),
+                Some("title_timeout".to_string()),
             );
+            return None;
+        }
+        Ok(Ok(outcome)) if !outcome.stopped => outcome,
+        Ok(Ok(_)) => return None,
+        Ok(Err(e)) => {
+            eprintln!("daemon_title: model_call_failed stream={stream:?} error={e:?}");
             // The heartbeat fires on failure too — an errored run that left
             // no pulse would be indistinguishable from a run that never
             // happened, which is the exact gap this event exists to close.
@@ -226,12 +291,18 @@ pub async fn daemon_turn(
         }),
     };
 
-    let sessions = &state.sessions;
-    match sessions.append_threaded(stream, ev, "daemon-title") {
-        Ok(_) => {
-            eprintln!(
-                "daemon_title: wrote stream={stream:?} title={title:?}"
-            );
+    let expected_user = events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "user_message");
+    match state.sessions.append_title_if_current(
+        stream,
+        expected_user.map(|event| event.id.as_str()),
+        previous_title.as_deref(),
+        ev,
+    ) {
+        Ok(Some(_)) => {
+            eprintln!("daemon_title: wrote stream={stream:?} title={title:?}");
             append_pulse(
                 state,
                 stream,
@@ -243,11 +314,227 @@ pub async fn daemon_turn(
             );
             Some(title)
         }
-        Err(e) => {
-            eprintln!(
-                "daemon_title: append_instance_renamed_failed stream={stream:?} error={e:?}"
+        Ok(None) => {
+            append_pulse(
+                state,
+                stream,
+                operator,
+                "stale",
+                "",
+                previous_title.as_deref().unwrap_or_default(),
+                None,
             );
             None
         }
+        Err(e) => {
+            eprintln!("daemon_title: append_instance_renamed_failed stream={stream:?} error={e:?}");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{self, ModelProvider, ProviderError, TurnOutcome, TurnRequest};
+    use crate::sessions::{Sessions, TurnHandle};
+    use crate::state::{AppState, ModelConfig};
+    use tokio::sync::{mpsc, watch};
+
+    fn event(kind: &str, data: serde_json::Value) -> NewEvent {
+        NewEvent {
+            actor: Actor {
+                role: Role::Machine,
+                instance: None,
+                principal: None,
+            },
+            event_type: kind.to_string(),
+            data,
+        }
+    }
+
+    fn fixture(provider: Arc<dyn ModelProvider>) -> (tempfile::TempDir, SharedState) {
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState {
+            root: directory.path().canonicalize().unwrap(),
+            sessions: Arc::new(Sessions::new(
+                crate::log::store::LogStore::open(directory.path()).unwrap(),
+            )),
+            model: ModelConfig {
+                model: "scripted".to_string(),
+            },
+            providers: provider::fixed(provider),
+            models_path: directory.path().join("models.toml"),
+            hostname: "test-host".to_string(),
+            registry_dir: directory.path().join("registry"),
+            anthropic_key_present: false,
+            zen_key_present: false,
+            boot: None,
+        });
+        state
+            .sessions
+            .append(
+                "session",
+                event("user_message", serde_json::json!({"text": "question"})),
+            )
+            .unwrap();
+        (directory, state)
+    }
+
+    struct NeverAnswers;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for NeverAnswers {
+        async fn run_turn(
+            &self,
+            _request: TurnRequest,
+            _sink: mpsc::Sender<String>,
+            _cancel: watch::Receiver<bool>,
+        ) -> Result<TurnOutcome, ProviderError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn title_timeout_records_failure_and_releases_slot() {
+        let (_directory, state) = fixture(Arc::new(NeverAnswers));
+        let events = state.sessions.store().read_from("session", 0).unwrap();
+        let cancel = state
+            .sessions
+            .begin_title("session", false, TITLE_INTERVAL)
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        {
+            let _guard = TitleGuard {
+                sessions: state.sessions.clone(),
+                stream: "session".to_string(),
+            };
+            assert_eq!(
+                daemon_turn(&state, "session", "operator", "scripted", &events, cancel).await,
+                None
+            );
+        }
+        assert_eq!(started.elapsed(), TITLE_TIMEOUT);
+        let events = state.sessions.store().read_from("session", 0).unwrap();
+        let pulse = events.last().unwrap();
+        assert_eq!(pulse.event_type, "daemon_pulse");
+        assert_eq!(pulse.data["error"], "title_timeout");
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "instance_renamed"));
+        assert!(state
+            .sessions
+            .begin_title("session", false, TITLE_INTERVAL)
+            .is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn titles_are_single_flight_throttled_and_yield_to_foreground() {
+        let (_directory, state) = fixture(Arc::new(NeverAnswers));
+        let sessions = &state.sessions;
+        let cancel = sessions
+            .begin_title("session", false, TITLE_INTERVAL)
+            .unwrap();
+        assert!(sessions
+            .begin_title("session", false, TITLE_INTERVAL)
+            .is_none());
+        let (sender, _receiver) = watch::channel(false);
+        sessions
+            .begin_turn(
+                "session",
+                TurnHandle {
+                    cancel: sender,
+                    generation: "next".to_string(),
+                },
+            )
+            .unwrap();
+        assert!(*cancel.borrow());
+        sessions.end_title("session");
+        assert!(sessions
+            .begin_title("session", false, TITLE_INTERVAL)
+            .is_none());
+        sessions.end_turn("session");
+        assert!(sessions
+            .begin_title("session", true, TITLE_INTERVAL)
+            .is_none());
+        tokio::time::advance(TITLE_INTERVAL).await;
+        assert!(sessions
+            .begin_title("session", true, TITLE_INTERVAL)
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_title_cannot_overwrite_new_user_or_manual_title() {
+        let (_directory, state) =
+            fixture(Arc::new(provider::ScriptedProvider::new(vec!["new title"])));
+        let sessions = &state.sessions;
+        let events = sessions.store().read_from("session", 0).unwrap();
+        let first_user = &events[0].id;
+        let second = sessions
+            .append(
+                "session",
+                event("user_message", serde_json::json!({"text": "next"})),
+            )
+            .unwrap();
+        let rename = || {
+            event(
+                "instance_renamed",
+                serde_json::json!({"title": "generated"}),
+            )
+        };
+        assert!(sessions
+            .append_title_if_current("session", Some(first_user), None, rename())
+            .unwrap()
+            .is_none());
+        sessions
+            .append(
+                "session",
+                event("instance_renamed", serde_json::json!({"title": "manual"})),
+            )
+            .unwrap();
+        assert!(sessions
+            .append_title_if_current("session", Some(&second.id), None, rename())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            title_from_events(&sessions.store().read_from("session", 0).unwrap()).as_deref(),
+            Some("manual")
+        );
+        assert!(sessions
+            .append_title_if_current("session", Some(&second.id), Some("manual"), rename())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn title_prompt_keeps_recent_dialogue_despite_tool_noise() {
+        let (_directory, state) = fixture(Arc::new(NeverAnswers));
+        for index in 0..12 {
+            state
+                .sessions
+                .append(
+                    "session",
+                    event(
+                        "assistant_message",
+                        serde_json::json!({"text": format!("answer-{index:02}")}),
+                    ),
+                )
+                .unwrap();
+            for _ in 0..12 {
+                state
+                    .sessions
+                    .append(
+                        "session",
+                        event("tool_result", serde_json::json!({"content": "tool noise"})),
+                    )
+                    .unwrap();
+            }
+        }
+        let events = state.sessions.store().read_from("session", 0).unwrap();
+        let prompt = build_title_prompt(&events, None);
+        assert!(!prompt.contains("answer-01"));
+        assert!(prompt.contains("answer-02"));
+        assert!(prompt.contains("answer-11"));
+        assert!(!prompt.contains("tool noise"));
     }
 }
